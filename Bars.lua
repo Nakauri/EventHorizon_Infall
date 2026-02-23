@@ -946,7 +946,7 @@ local function CreateCooldownBar(spellID, index)
         cd:SetDrawBling(false)
         cd:SetDrawEdge(false)
         cd:SetHideCountdownNumbers(true)
-        cd:Show()
+        cd:SetAlpha(0)
         cd.timerType = timerType
         cd.rowSpellID = rowRef.spellID
 
@@ -1600,15 +1600,14 @@ UpdateChargeState = function(row)
     local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
     local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
 
-    -- Cache DurObjs for OnUpdate (avoids re-fetching the same APIs per frame)
-    row._cachedCdDurObj = cdDurObj
-    row._cachedChargeDurObj = chargeDurObj
-
-    -- Feed hidden frames for past slide edge detection (event-driven, not per-frame)
-    -- Don't GCD-filter when a charge is recharging (the CD is real, not just GCD)
-    local hiddenCdObj = cdDurObj
-    if isOnGCD and not chargeDurObj then hiddenCdObj = nil end
-    FeedHiddenCooldown(row, "cd", hiddenCdObj)
+    -- Feed hidden frames for past slide edge detection (event-driven, not per-frame).
+    -- CD: skip during GCD — let hidden_cd retain its previous state. GCD noise never
+    -- reaches the hidden frame, so GCD past slides never spawn. After GCD, feed the
+    -- real CD DurObj or nil (to clear when CD ends). OnCooldownDone handles natural expiry.
+    -- Charge: always feed. GetSpellChargeDuration has no GCD contamination.
+    if not isOnGCD then
+        FeedHiddenCooldown(row, "cd", cdDurObj)
+    end
     FeedHiddenCooldown(row, "charge", chargeDurObj)
 
     -- GCD filter for icon swirl only
@@ -1995,16 +1994,17 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
             -- Curve-driven charge bar display via wrapper frame alpha.
             if row.isChargeSpell and row.depletedWrapper then
-                -- DurObjs cached from UpdateChargeState (event-driven)
-                local cdDurObj = row._cachedCdDurObj
-                local chargeDurObj = row._cachedChargeDurObj
+                -- Fresh DurObjs per frame for wrapper alpha and fill animation.
+                -- Hidden frame feeds stay event-driven in UpdateChargeState (Evoker CDR fix).
+                local cdOk, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
+                local chargeOk, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
+                if not cdOk then cdDurObj = nil end
+                if not chargeOk then chargeDurObj = nil end
 
-                -- GCD filter: only when no charge is recharging (CD would be just GCD)
-                if not chargeDurObj and gcdActive then
-                    local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
-                    local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
-                    if isOnGCD then cdDurObj = nil end
-                end
+                -- GCD filter: when isOnGCD the cdDurObj is just GCD noise
+                local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
+                local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
+                if isOnGCD then cdDurObj = nil end
 
                 -- Wrapper alpha: depleted vs not-depleted
                 if cdDurObj and AlphaCurve and InvertedAlphaCurve then
@@ -2254,8 +2254,6 @@ local function ResetBarState(bar)
     bar.lastPtr_charge = nil
     bar.lastPtr_buff = nil
     bar.lastPtr_overlay = nil
-    bar._cachedCdDurObj = nil
-    bar._cachedChargeDurObj = nil
 
     if bar.hidden_cd then bar.hidden_cd:SetCooldown(0, 0) end
     if bar.hidden_charge then bar.hidden_charge:SetCooldown(0, 0) end
@@ -3262,8 +3260,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 row.lastPtr_charge = nil
                 row.lastPtr_buff = nil
                 row.lastPtr_overlay = nil
-                row._cachedCdDurObj = nil
-                row._cachedChargeDurObj = nil
 
                 -- readable out of combat
                 if row.isChargeSpell then
