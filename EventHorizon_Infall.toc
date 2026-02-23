@@ -1,0 +1,26 @@
+## Interface: 120000
+## Title: EventHorizon Infall
+## Notes: Event Horizon for Midnight, cooldown timeline bars driven by ECM
+## Author: Infall
+## Version: 1.0
+## IconTexture: Interface\Icons\Spell_animamaw_orb
+## SavedVariables: InfallDB
+
+Core.lua
+
+ClassConfig\DeathKnight.lua
+ClassConfig\DemonHunter.lua
+ClassConfig\Druid.lua
+ClassConfig\Evoker.lua
+ClassConfig\Hunter.lua
+ClassConfig\Mage.lua
+ClassConfig\Monk.lua
+ClassConfig\Paladin.lua
+ClassConfig\Priest.lua
+ClassConfig\Rogue.lua
+ClassConfig\Shaman.lua
+ClassConfig\Warlock.lua
+ClassConfig\Warrior.lua
+
+Settings.lua
+Bars.lua
