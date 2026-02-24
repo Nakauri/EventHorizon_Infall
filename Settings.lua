@@ -1598,13 +1598,7 @@ local function BuildSettings()
                             slot.icon:Show()
                             self.pairedCooldownID = buffCdID
 
-                            local buffUnit = "player"
-                            if bSpellID and C_Spell.IsSpellHarmful then
-                                local hOk, isHarmful = pcall(C_Spell.IsSpellHarmful, bSpellID)
-                                if hOk and isHarmful then buffUnit = "target" end
-                            end
-
-                            local defaultColor = (buffUnit == "target") and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
+                            local defaultColor = DeepCopy(CONFIG.buffColor)
                             if slotIndex == 2 then defaultColor[4] = 0.3 end
                             self.pairedColor = defaultColor
 
@@ -1615,7 +1609,6 @@ local function BuildSettings()
                             CONFIG.buffMappings[cooldownID] = CONFIG.buffMappings[cooldownID] or {}
                             local mapping = {
                                 buffCooldownIDs = {buffCdID},
-                                unit = buffUnit,
                                 color = defaultColor,
                             }
                             if slotIndex == 1 then
@@ -1905,13 +1898,6 @@ local function BuildSettings()
                     stackSlot.icon:Show()
                     self.pairedCooldownID = buffCdID
 
-                    -- Auto-detect unit
-                    local stackUnit = "player"
-                    if sSpellID and C_Spell.IsSpellHarmful then
-                        local hOk, isHarmful = pcall(C_Spell.IsSpellHarmful, sSpellID)
-                        if hOk and isHarmful then stackUnit = "target" end
-                    end
-
                     local defaultColor = DeepCopy(CONFIG.stackTextColor)
                     self.pairedColor = defaultColor
                     stackColorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
@@ -1920,7 +1906,6 @@ local function BuildSettings()
                     CONFIG.stackMappings = CONFIG.stackMappings or {}
                     CONFIG.stackMappings[cooldownID] = {
                         buffCooldownID = buffCdID,
-                        unit = stackUnit,
                         color = defaultColor,
                     }
                     ns.SaveCurrentProfile()
