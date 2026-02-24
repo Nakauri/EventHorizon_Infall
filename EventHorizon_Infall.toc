@@ -1,6 +1,6 @@
-## Interface: 120000
+## Interface: 120000, 120001
 ## Title: EventHorizon Infall
-## Notes: Event Horizon for Midnight, cooldown timeline bars driven by ECM
+## Notes: Event Horizon for Midnight, cooldown timeline bars driven by CDM
 ## Author: Infall
 ## Version: 1.0
 ## IconTexture: Interface\Icons\Spell_animamaw_orb
