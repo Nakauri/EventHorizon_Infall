@@ -701,8 +701,6 @@ local function ApplyIconMode(row)
     end
 
     row.cdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-    row.chargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-    if row.chargeHelperBar then row.chargeHelperBar:SetVertexColor(unpack(CONFIG.cooldownColor)) end
     if row.castTex then row.castTex:SetVertexColor(unpack(CONFIG.castColor)) end
     row.gcdBar:SetStatusBarColor(unpack(CONFIG.gcdColor))
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
@@ -720,7 +718,6 @@ local function ApplyBuffLayer(row)
     if CONFIG.buffLayerAbove then
         -- Buff above cooldown
         row.cdBar:SetFrameLevel(baseLevel + 1)
-        row.chargeBar:SetFrameLevel(baseLevel + 1)
         row.buffBar:SetFrameLevel(baseLevel + 3)
         row.buffBarOverlay:SetFrameLevel(baseLevel + 4)
         row.castBar:SetFrameLevel(baseLevel + 5)
@@ -730,7 +727,6 @@ local function ApplyBuffLayer(row)
         row.buffBar:SetFrameLevel(baseLevel + 1)
         row.buffBarOverlay:SetFrameLevel(baseLevel + 2)
         row.cdBar:SetFrameLevel(baseLevel + 3)
-        row.chargeBar:SetFrameLevel(baseLevel + 3)
         row.castBar:SetFrameLevel(baseLevel + 5)
         row.gcdBar:SetFrameLevel(baseLevel + 6)
     end
@@ -776,7 +772,6 @@ end
 local function UpdateAllMinMax()
     for _, row in ipairs(cooldownBars) do
         if row.cdBar then row.cdBar:SetMinMaxValues(0, CONFIG.future) end
-        if row.chargeBar then row.chargeBar:SetMinMaxValues(0, CONFIG.future) end
         if row.buffBar then row.buffBar:SetMinMaxValues(0, CONFIG.future) end
         if row.buffBarOverlay then row.buffBarOverlay:SetMinMaxValues(0, CONFIG.future) end
         if row.gcdBar then row.gcdBar:SetMinMaxValues(0, CONFIG.future) end
@@ -926,7 +921,7 @@ local function CreateCooldownBar(spellID, index)
         return clip
     end
     
-    row.pastCdClip = CreatePastClip(baseLevel + 1)       -- matches cdBar/chargeBar initial level
+    row.pastCdClip = CreatePastClip(baseLevel + 1)       -- matches cdBar initial level
     row.pastBuffClip = CreatePastClip(baseLevel + 3)      -- matches buffBar initial level
     row.pastOverlayClip = CreatePastClip(baseLevel + 4)   -- matches buffBarOverlay initial level
     row.pastCastClip = CreatePastClip(baseLevel + 5)      -- matches castBar initial level
@@ -1031,29 +1026,6 @@ local function CreateCooldownBar(spellID, index)
     row.lastPtr_overlay = nil
     row.wasOnGCD = false
 
-    -- Charge bar (bottom half), anchored to row directly.
-    row.chargeBar = CreateFrame("StatusBar", nil, row)
-    row.chargeBar:SetSize(futureWidth, (CONFIG.height / 2) - 0.5)
-    row.chargeBar:SetPoint("TOPLEFT", row, "TOPLEFT", nowOffset, -((CONFIG.height / 2) - 0.5 + 1))
-    row.chargeBar:SetStatusBarTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
-    row.chargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-    row.chargeBar:SetMinMaxValues(0, CONFIG.future)
-    row.chargeBar:SetOrientation("HORIZONTAL")
-    row.chargeBar:GetStatusBarTexture():SetHorizTile(false)
-    row.chargeBar:GetStatusBarTexture():SetVertTile(false)
-    CrispBar(row.chargeBar)
-    row.chargeBar:SetFrameLevel(row:GetFrameLevel() + 1)
-    
-    row.chargeBar:Hide()
-    
-    -- Charge helper bar (static block representing one queued recharge at 0 charges).
-    row.chargeHelperBar = row.cdBar:CreateTexture(nil, "ARTWORK")
-    row.chargeHelperBar:SetSize(1, (CONFIG.height / 2) - 0.5)
-    row.chargeHelperBar:SetPoint("TOPLEFT", row, "TOPLEFT", nowOffset, -((CONFIG.height / 2) - 0.5 + 1))
-    row.chargeHelperBar:SetTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
-    row.chargeHelperBar:SetVertexColor(unpack(CONFIG.cooldownColor))
-    row.chargeHelperBar:Hide()
-    
     -- Cast bar texture (not StatusBar, so it can straddle the now line).
     row.castFrame = CreateFrame("Frame", nil, row)
     row.castFrame:SetAllPoints(row)
@@ -1185,10 +1157,6 @@ ResizeContainer = function()
             row.cdBar.fullHeight = dynamicBarHeight
             local maxC = row.maxCharges or 2
             row.cdBar.laneHeight = (dynamicBarHeight - (maxC - 1)) / maxC
-            row.chargeBar:SetHeight(row.cdBar.laneHeight)
-            if row.chargeHelperBar then
-                row.chargeHelperBar:SetHeight(row.cdBar.laneHeight)
-            end
 
             if row.isChargeSpell then
                 local lH = row.cdBar.laneHeight
@@ -1257,10 +1225,6 @@ ResizeContainer = function()
             row.cdBar.fullHeight = CONFIG.height
             local maxC = row.maxCharges or 2
             row.cdBar.laneHeight = (CONFIG.height - (maxC - 1)) / maxC
-            row.chargeBar:SetHeight(row.cdBar.laneHeight)
-            if row.chargeHelperBar then
-                row.chargeHelperBar:SetHeight(row.cdBar.laneHeight)
-            end
 
             if row.isChargeSpell then
                 local lH = row.cdBar.laneHeight
@@ -1543,7 +1507,7 @@ local function MirrorECMState(row, cooldownViewerFrames)
     -- Charge text (secret passthrough via SetText)
     if row.hasCharges then
         local chargeOk, chargeCount = pcall(function() return ecmFrame.cooldownChargesCount end)
-        if chargeOk and chargeCount ~= nil then
+        if chargeOk and chargeCount then
             row.chargeText:SetText(chargeCount)
             row.chargeText:Show()
         else
@@ -1602,11 +1566,6 @@ end
 -- Bar display is curve-driven in OnUpdate via wrapper frame alpha.
 UpdateChargeState = function(row)
     if not row.isChargeSpell then
-        row.chargeBar:Hide()
-        if row.chargeHelperBar then
-            row.chargeHelperBar:Hide()
-
-        end
         return
     end
 
@@ -1938,7 +1897,7 @@ UpdateDesaturation = function(row)
         if ok and result then
             row.icon:SetDesaturation(result)
         else
-            row.icon:SetDesaturation(1)
+            row.icon:SetDesaturation(0)
         end
     else
         row.icon:SetDesaturation(0)
@@ -2108,8 +2067,10 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     if row.middleLanes then
                         for j = 1, #row.middleLanes do
                             local ml = row.middleLanes[j]
-                            ml.depletedChargeBar:SetAlpha(0)
-                            ml.depletedHelperBar:SetAlpha(0)
+                            if ml then
+                                ml.depletedChargeBar:SetAlpha(0)
+                                ml.depletedHelperBar:SetAlpha(0)
+                            end
                         end
                     end
                 end
@@ -2122,7 +2083,8 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                         row.normalChargeBar:SetValue(remaining, interp)
                         if row.middleLanes then
                             for j = 1, #row.middleLanes do
-                                row.middleLanes[j].depletedChargeBar:SetValue(remaining, interp)
+                                local ml = row.middleLanes[j]
+                                if ml then ml.depletedChargeBar:SetValue(remaining, interp) end
                             end
                         end
                     end
@@ -2317,10 +2279,8 @@ local function ResetBarState(bar)
     
     bar.icon:SetDesaturation(0)
     bar.cdBar:Hide()
-    bar.chargeBar:Hide()
     bar.buffBar:Hide()
     if bar.buffBarOverlay then bar.buffBarOverlay:Hide() end
-    if bar.chargeHelperBar then bar.chargeHelperBar:Hide() end
     if bar.cooldownFrame then bar.cooldownFrame:Hide() end
     if bar.castTex then bar.castTex:Hide() end
     HideEmpowerStageTex(bar)
@@ -2472,8 +2432,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     end
     
     bar.cdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-    bar.chargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-    
+
     if isChargeSpell then
         bar.cdBar:SetHeight(bar.cdBar.laneHeight)
     else
@@ -2662,13 +2621,15 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             if ml then
                 ml.depletedChargeBar:Hide()
                 ml.depletedHelperBar:Hide()
+                if ml.activeSlide then
+                    DetachPastSlide(ml.activeSlide)
+                    ml.activeSlide = nil
+                end
             end
         end
 
         -- wrappers take over
         bar.cdBar:Hide()
-        bar.chargeBar:Hide()
-        bar.chargeHelperBar:Hide()
     
     else
         if bar.depletedWrapper then
@@ -3145,7 +3106,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 end
             end
             if not isMatch and CONFIG.extraCasts then
-                local extras = CONFIG.extraCasts[row.cooldownID] or CONFIG.extraCasts[row.baseSpellID]
+                local extras = CONFIG.extraCasts[row.cooldownID] or CONFIG.extraCasts[row.baseSpellID] or CONFIG.extraCasts[row.spellID]
                 if extras then
                     for _, extraID in ipairs(extras) do
                         if extraID == spellID then isMatch = true; break end
