@@ -68,6 +68,7 @@ function ns.SeedProfileFromClassConfig(specKey)
         stackMappings = {},
         hiddenCooldownIDs = {},
         chargesDisabled = {},
+        chargeResetBy = {},
         castColors = {},
     }
 
@@ -96,6 +97,9 @@ function ns.SeedProfileFromClassConfig(specKey)
     end
     if CONFIG.chargesDisabled then
         profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled)
+    end
+    if CONFIG.chargeResetBy then
+        profile.chargeResetBy = DeepCopy(CONFIG.chargeResetBy)
     end
     if CONFIG.castColors then
         profile.castColors = DeepCopy(CONFIG.castColors)
@@ -156,6 +160,9 @@ function ns.ApplyProfile(profile)
     if profile.chargesDisabled then
         CONFIG.chargesDisabled = DeepCopy(profile.chargesDisabled)
     end
+    if profile.chargeResetBy then
+        CONFIG.chargeResetBy = DeepCopy(profile.chargeResetBy)
+    end
     if profile.castColors then
         CONFIG.castColors = DeepCopy(profile.castColors)
     end
@@ -211,6 +218,7 @@ function ns.SaveCurrentProfile()
     profile.stackMappings = DeepCopy(CONFIG.stackMappings or {})
     profile.hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {})
     profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {})
+    profile.chargeResetBy = DeepCopy(CONFIG.chargeResetBy or {})
     profile.castColors = DeepCopy(CONFIG.castColors or {})
 
     -- Save current frame position (per-character)
@@ -234,6 +242,7 @@ ns.classConfigDefaults = {
     stackMappings = DeepCopy(CONFIG.stackMappings or {}),
     hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {}),
     chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {}),
+    chargeResetBy = DeepCopy(CONFIG.chargeResetBy or {}),
     castColors = DeepCopy(CONFIG.castColors or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
@@ -1346,8 +1355,10 @@ local function BuildSettings()
                     row.cast2ColorBtn = CreateSlotColorBtn(row, row.cast2Slot)
                     row.stackSlot = CreateSlotFrame(row, row.cast2ColorBtn, "RIGHT", 12)
                     row.stackColorBtn = CreateSlotColorBtn(row, row.stackSlot)
+                    row.resetBySlot = CreateSlotFrame(row, row.stackColorBtn, "RIGHT", 12)
+                    row.resetBySlot:Hide()
                     row.chargeCheck = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
-                    row.chargeCheck:SetPoint("LEFT", row.stackColorBtn, "RIGHT", 16, 0)
+                    row.chargeCheck:SetPoint("LEFT", row.resetBySlot, "RIGHT", 8, 0)
                     row.chargeCheck:SetSize(22, 22)
                     row.chargeCheck.text:SetFontObject(GameFontHighlightSmall)
                     row.chargeCheck.text:SetText("Show Charge")
@@ -1448,9 +1459,104 @@ local function BuildSettings()
                         GameTooltip:Show()
                     end)
                     chargeCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+                    -- "Reset by" slot (only when charges enabled)
+                    local resetBySlot = row.resetBySlot
+                    if not isDisabled then
+                        resetBySlot:Show()
+
+                        local savedResetID = CONFIG.chargeResetBy and CONFIG.chargeResetBy[cooldownID]
+                        if savedResetID then
+                            local resetIcon = C_Spell.GetSpellTexture(savedResetID) or 134400
+                            resetBySlot.icon:SetTexture(resetIcon)
+                            resetBySlot.icon:Show()
+                        else
+                            resetBySlot.icon:Hide()
+                        end
+
+                        resetBySlot:SetScript("OnClick", function(self, button)
+                            if button == "RightButton" and savedResetID then
+                                CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
+                                CONFIG.chargeResetBy[cooldownID] = nil
+                                self.icon:Hide()
+                                ns.SaveCurrentProfile()
+                                LoadEssentialCooldowns()
+                                RefreshCooldownRows()
+                                return
+                            end
+
+                            MenuUtil.CreateContextMenu(self, function(owner, rootDescription)
+                                rootDescription:CreateTitle("Pick the ability that resets charges")
+                                rootDescription:CreateButton("None (clear)", function()
+                                    CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
+                                    CONFIG.chargeResetBy[cooldownID] = nil
+                                    self.icon:Hide()
+                                    ns.SaveCurrentProfile()
+                                    LoadEssentialCooldowns()
+                                    RefreshCooldownRows()
+                                end)
+                                rootDescription:CreateDivider()
+
+                                local cdIDs = {}
+                                local foundSrc = false
+                                if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
+                                    local dp = CooldownViewerSettings:GetDataProvider()
+                                    if dp and dp.GetOrderedCooldownIDsForCategory then
+                                        local displayed = dp:GetOrderedCooldownIDsForCategory(0)
+                                        if displayed and #displayed > 0 then
+                                            cdIDs = displayed
+                                            foundSrc = true
+                                        end
+                                    end
+                                end
+                                if not foundSrc then
+                                    local ok, result = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, 0, false)
+                                    if ok and result then cdIDs = result end
+                                end
+
+                                for _, cdID in ipairs(cdIDs) do
+                                    if cdID ~= cooldownID then
+                                        local iOk, iInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
+                                        if iOk and iInfo and iInfo.spellID then
+                                            local sName = C_Spell.GetSpellName(iInfo.spellID) or ("ID:" .. iInfo.spellID)
+                                            rootDescription:CreateButton(sName, function()
+                                                CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
+                                                CONFIG.chargeResetBy[cooldownID] = iInfo.spellID
+                                                self.icon:SetTexture(C_Spell.GetSpellTexture(iInfo.spellID) or 134400)
+                                                self.icon:Show()
+                                                ns.SaveCurrentProfile()
+                                                LoadEssentialCooldowns()
+                                                RefreshCooldownRows()
+                                            end)
+                                        end
+                                    end
+                                end
+                            end)
+                        end)
+
+                        resetBySlot:SetScript("OnEnter", function(self)
+                            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                            if savedResetID then
+                                local rName = C_Spell.GetSpellName(savedResetID) or ("ID:" .. savedResetID)
+                                GameTooltip:SetText("Reset by: " .. rName, 1, 0.82, 0)
+                                GameTooltip:AddLine("Left click: change", 0.5, 0.8, 0.5)
+                                GameTooltip:AddLine("Right click: remove", 1, 0.5, 0.5)
+                            else
+                                GameTooltip:SetText("Charge Reset (empty)", 0.6, 0.6, 0.6)
+                                GameTooltip:AddLine("Click to pick an ability that fully resets this spell's charges.", 0.7, 0.7, 0.7, true)
+                            end
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("Workaround for a charge bar display bug. Only use for abilities that instantly restore ALL charges (IE Combustion for Fire Blast).", 0.5, 0.5, 0.5, true)
+                            GameTooltip:Show()
+                        end)
+                        resetBySlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    else
+                        resetBySlot:Hide()
+                    end
                 else
                     chargeCheck:SetChecked(false)
                     chargeCheck:Hide()
+                    row.resetBySlot:Hide()
                 end
 
                 -- Tooltips for Buff 1
