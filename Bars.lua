@@ -15,10 +15,12 @@ CONFIG.stackMappings = CONFIG.stackMappings or {}
 CONFIG.castColors = CONFIG.castColors or {}
 CONFIG.hiddenCooldownIDs = CONFIG.hiddenCooldownIDs or {}
 CONFIG.chargesDisabled = CONFIG.chargesDisabled or {}
+CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
 
 local activeCast
 local cachedGcdDurObj
 local shownSetupHint = false
+local chargeResetLookup = {}
 
 local function GetEmpowerStageColor(stage)
     if stage == 1 then return CONFIG.empowerStage1Color
@@ -2004,6 +2006,42 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
                 if isOnGCD then cdDurObj = nil end
 
+                -- Charge reset correction: reset ability was cast, fix visual state
+                if row._chargeResetPending then
+                    row._chargeResetPending = nil
+                    row.chargesAvailable = row.maxCharges
+
+                    if row.activeChargeSlide then
+                        DetachPastSlide(row.activeChargeSlide)
+                        row.activeChargeSlide = nil
+                    end
+                    if row.activeDepletedSlide then
+                        DetachPastSlide(row.activeDepletedSlide)
+                        row.activeDepletedSlide = nil
+                    end
+                    if row.middleLanes then
+                        for j = 1, #row.middleLanes do
+                            local ml = row.middleLanes[j]
+                            if ml and ml.activeSlide then
+                                DetachPastSlide(ml.activeSlide)
+                                ml.activeSlide = nil
+                            end
+                        end
+                    end
+
+                    if row.hidden_charge then
+                        row.hidden_charge:SetCooldown(0, 0)
+                        row.lastPtr_charge = chargeDurObj
+                    end
+                    if row.hidden_cd then
+                        row.hidden_cd:SetCooldown(0, 0)
+                        row.lastPtr_cd = cdDurObj
+                    end
+
+                    chargeDurObj = nil
+                    cdDurObj = nil
+                end
+
                 -- Feed hidden frames per-frame (pointer dedup in FeedHiddenCooldown)
                 if chargeDurObj then FeedHiddenCooldown(row, "charge", chargeDurObj) end
                 if cdDurObj then FeedHiddenCooldown(row, "cd", cdDurObj) end
@@ -2264,6 +2302,7 @@ local function ResetBarState(bar)
     bar.lastPtr_buff = nil
     bar.lastPtr_overlay = nil
     bar.wasOnGCD = false
+    bar._chargeResetPending = nil
     if bar.hidden_cd then bar.hidden_cd:SetCooldown(0, 0) end
     if bar.hidden_charge then bar.hidden_charge:SetCooldown(0, 0) end
     if bar.hidden_buff then bar.hidden_buff:SetCooldown(0, 0) end
@@ -2749,6 +2788,18 @@ LoadEssentialCooldowns = function()
         if bar.variantNameText then bar.variantNameText:Hide() end
     end
 
+    -- Build reverse lookup: resetSpellID → {bar, bar, ...}
+    wipe(chargeResetLookup)
+    for _, bar in ipairs(cooldownBars) do
+        if bar.isChargeSpell and CONFIG.chargeResetBy then
+            local resetID = CONFIG.chargeResetBy[bar.cooldownID]
+            if resetID then
+                chargeResetLookup[resetID] = chargeResetLookup[resetID] or {}
+                table.insert(chargeResetLookup[resetID], bar)
+            end
+        end
+    end
+
     ApplyLayoutToAllBars()
 
     C_Timer.After(0.5, UpdateBars)
@@ -3096,6 +3147,16 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
+
+        -- Charge reset detection: flag bars whose charges are reset by this spell
+        local resetTargets = chargeResetLookup[spellID]
+        if resetTargets then
+            for _, row in ipairs(resetTargets) do
+                if row.isChargeSpell then
+                    row._chargeResetPending = true
+                end
+            end
+        end
 
         for _, row in ipairs(cooldownBars) do
             local isMatch = (row.spellID == spellID or row.baseSpellID == spellID)
