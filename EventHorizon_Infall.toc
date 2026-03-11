@@ -22,5 +22,6 @@ ClassConfig\Shaman.lua
 ClassConfig\Warlock.lua
 ClassConfig\Warrior.lua
 
+Serializer.lua
 Settings.lua
 Bars.lua
