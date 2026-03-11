@@ -13,7 +13,7 @@ The settings panel has five tabs:
 - **Display** has sliders for bar width, height, spacing, padding, scale, timeline length, icon size, and more. Click any slider's number to type an exact value.
 - **Colours** lets you change every colour in the addon, plus font settings and text anchor positions.
 - **Toggles** has on/off switches for all features, plus Reload Bars and Reset Position buttons.
-- **Profiles** lets you save, load, and delete named profiles. Your settings are automatically saved per character and per spec, but named profiles let you share a setup across characters or keep backups.
+- **Profiles** lets you save, load, and delete named profiles. Your settings are automatically saved per character and per spec, but named profiles let you share a setup across characters or keep backups. The Import / Export section at the bottom lets you export your active spec or all specs as a shareable string, and import strings from other characters of the same class.
 
 Most users will never need to edit files directly. The Settings GUI handles everything.
 
@@ -281,15 +281,6 @@ Abilities with multiple charges (IE Fire Blast, Barbed Shot) normally display as
 Open the Settings GUI (Bars tab). Abilities with charges show a "Show Charge" checkbox on their row. Uncheck it to switch to a single bar. Check it again to go back to split bars. This setting saves to your profile.
 
 When charge bars are disabled for a spell, the bar renders as one solid bar instead of the split layout. The charge count text still shows on the icon so you can see how many charges are available.
-
-
-## Charge Reset Workaround
-
-Some abilities instantly reset all charges of another spell (IE Combustion resets Fire Blast, Bestial Wrath resets Barbed Shot). When this happens, the charge bar display can show stale cooldown bars because the game engine doesn't provide a reliable signal for charge resets during combat.
-
-To fix this, open the Settings GUI (Bars tab). Abilities with charges show a "Reset by" slot next to the charge checkbox. Click it and select the ability that resets this spell's charges. When that ability is cast, Infall immediately clears the stale bars and corrects the charge count.
-
-Only use this for abilities that instantly restore ALL charges. Normal charge recovery (charges refilling over time) works automatically and doesn't need this.
 
 
 ## Changing Colours
@@ -786,7 +777,7 @@ Stack counts for target debuffs (like tracking debuff stacks on a boss) may not 
 
 ### Charge Bar Display on External Resets
 
-When an ability instantly resets all charges of another spell (like Combustion resetting Fire Blast), the charge bar display may briefly show stale cooldown bars until you leave combat. This is a game engine limitation that affects all addons. Use the "Reset by" pairing in the Settings GUI (Bars tab) to work around this for known reset abilities. See the Charge Reset Workaround section above.
+When an ability instantly resets all charges of another spell (like Combustion resetting Fire Blast), the charge bar display may briefly show stale cooldown bars until you leave combat. This is a game engine limitation that affects all addons. The charge system uses engine mediated threshold detectors that catch resets within one frame in most cases, but edge cases may still exist.
 
 
 ## Quick Reference: All Settings
