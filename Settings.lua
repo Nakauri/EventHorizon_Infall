@@ -68,7 +68,6 @@ function ns.SeedProfileFromClassConfig(specKey)
         stackMappings = {},
         hiddenCooldownIDs = {},
         chargesDisabled = {},
-        chargeResetBy = {},
         castColors = {},
     }
 
@@ -97,9 +96,6 @@ function ns.SeedProfileFromClassConfig(specKey)
     end
     if CONFIG.chargesDisabled then
         profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled)
-    end
-    if CONFIG.chargeResetBy then
-        profile.chargeResetBy = DeepCopy(CONFIG.chargeResetBy)
     end
     if CONFIG.castColors then
         profile.castColors = DeepCopy(CONFIG.castColors)
@@ -160,9 +156,6 @@ function ns.ApplyProfile(profile)
     if profile.chargesDisabled then
         CONFIG.chargesDisabled = DeepCopy(profile.chargesDisabled)
     end
-    if profile.chargeResetBy then
-        CONFIG.chargeResetBy = DeepCopy(profile.chargeResetBy)
-    end
     if profile.castColors then
         CONFIG.castColors = DeepCopy(profile.castColors)
     end
@@ -218,7 +211,6 @@ function ns.SaveCurrentProfile()
     profile.stackMappings = DeepCopy(CONFIG.stackMappings or {})
     profile.hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {})
     profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {})
-    profile.chargeResetBy = DeepCopy(CONFIG.chargeResetBy or {})
     profile.castColors = DeepCopy(CONFIG.castColors or {})
 
     -- Save current frame position (per-character)
@@ -242,7 +234,6 @@ ns.classConfigDefaults = {
     stackMappings = DeepCopy(CONFIG.stackMappings or {}),
     hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {}),
     chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {}),
-    chargeResetBy = DeepCopy(CONFIG.chargeResetBy or {}),
     castColors = DeepCopy(CONFIG.castColors or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
@@ -1355,10 +1346,8 @@ local function BuildSettings()
                     row.cast2ColorBtn = CreateSlotColorBtn(row, row.cast2Slot)
                     row.stackSlot = CreateSlotFrame(row, row.cast2ColorBtn, "RIGHT", 12)
                     row.stackColorBtn = CreateSlotColorBtn(row, row.stackSlot)
-                    row.resetBySlot = CreateSlotFrame(row, row.stackColorBtn, "RIGHT", 12)
-                    row.resetBySlot:Hide()
                     row.chargeCheck = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
-                    row.chargeCheck:SetPoint("LEFT", row.resetBySlot, "RIGHT", 8, 0)
+                    row.chargeCheck:SetPoint("LEFT", row.stackColorBtn, "RIGHT", 20, 0)
                     row.chargeCheck:SetSize(22, 22)
                     row.chargeCheck.text:SetFontObject(GameFontHighlightSmall)
                     row.chargeCheck.text:SetText("Show Charge")
@@ -1459,104 +1448,9 @@ local function BuildSettings()
                         GameTooltip:Show()
                     end)
                     chargeCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-                    -- "Reset by" slot (only when charges enabled)
-                    local resetBySlot = row.resetBySlot
-                    if not isDisabled then
-                        resetBySlot:Show()
-
-                        local savedResetID = CONFIG.chargeResetBy and CONFIG.chargeResetBy[cooldownID]
-                        if savedResetID then
-                            local resetIcon = C_Spell.GetSpellTexture(savedResetID) or 134400
-                            resetBySlot.icon:SetTexture(resetIcon)
-                            resetBySlot.icon:Show()
-                        else
-                            resetBySlot.icon:Hide()
-                        end
-
-                        resetBySlot:SetScript("OnClick", function(self, button)
-                            if button == "RightButton" and savedResetID then
-                                CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
-                                CONFIG.chargeResetBy[cooldownID] = nil
-                                self.icon:Hide()
-                                ns.SaveCurrentProfile()
-                                LoadEssentialCooldowns()
-                                RefreshCooldownRows()
-                                return
-                            end
-
-                            MenuUtil.CreateContextMenu(self, function(owner, rootDescription)
-                                rootDescription:CreateTitle("Pick the ability that resets charges")
-                                rootDescription:CreateButton("None (clear)", function()
-                                    CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
-                                    CONFIG.chargeResetBy[cooldownID] = nil
-                                    self.icon:Hide()
-                                    ns.SaveCurrentProfile()
-                                    LoadEssentialCooldowns()
-                                    RefreshCooldownRows()
-                                end)
-                                rootDescription:CreateDivider()
-
-                                local cdIDs = {}
-                                local foundSrc = false
-                                if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
-                                    local dp = CooldownViewerSettings:GetDataProvider()
-                                    if dp and dp.GetOrderedCooldownIDsForCategory then
-                                        local displayed = dp:GetOrderedCooldownIDsForCategory(0)
-                                        if displayed and #displayed > 0 then
-                                            cdIDs = displayed
-                                            foundSrc = true
-                                        end
-                                    end
-                                end
-                                if not foundSrc then
-                                    local ok, result = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, 0, false)
-                                    if ok and result then cdIDs = result end
-                                end
-
-                                for _, cdID in ipairs(cdIDs) do
-                                    if cdID ~= cooldownID then
-                                        local iOk, iInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
-                                        if iOk and iInfo and iInfo.spellID then
-                                            local sName = C_Spell.GetSpellName(iInfo.spellID) or ("ID:" .. iInfo.spellID)
-                                            rootDescription:CreateButton(sName, function()
-                                                CONFIG.chargeResetBy = CONFIG.chargeResetBy or {}
-                                                CONFIG.chargeResetBy[cooldownID] = iInfo.spellID
-                                                self.icon:SetTexture(C_Spell.GetSpellTexture(iInfo.spellID) or 134400)
-                                                self.icon:Show()
-                                                ns.SaveCurrentProfile()
-                                                LoadEssentialCooldowns()
-                                                RefreshCooldownRows()
-                                            end)
-                                        end
-                                    end
-                                end
-                            end)
-                        end)
-
-                        resetBySlot:SetScript("OnEnter", function(self)
-                            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                            if savedResetID then
-                                local rName = C_Spell.GetSpellName(savedResetID) or ("ID:" .. savedResetID)
-                                GameTooltip:SetText("Reset by: " .. rName, 1, 0.82, 0)
-                                GameTooltip:AddLine("Left click: change", 0.5, 0.8, 0.5)
-                                GameTooltip:AddLine("Right click: remove", 1, 0.5, 0.5)
-                            else
-                                GameTooltip:SetText("Charge Reset (empty)", 0.6, 0.6, 0.6)
-                                GameTooltip:AddLine("Click to pick an ability that fully resets this spell's charges.", 0.7, 0.7, 0.7, true)
-                            end
-                            GameTooltip:AddLine(" ")
-                            GameTooltip:AddLine("Workaround for a charge bar display bug. Only use for abilities that instantly restore ALL charges (IE Combustion for Fire Blast).", 0.5, 0.5, 0.5, true)
-                            GameTooltip:Show()
-                        end)
-                        resetBySlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
-                    else
-                        resetBySlot:Hide()
-                    end
                 else
                     chargeCheck:SetChecked(false)
                     chargeCheck:Hide()
-                    row.resetBySlot:Hide()
                 end
 
                 -- Tooltips for Buff 1
@@ -3526,6 +3420,195 @@ local function BuildSettings()
 
     profY = profY + 32
 
+    -- ========================================================================
+    -- IMPORT / EXPORT
+    -- ========================================================================
+
+    profY = profY + 10
+    local ieHeader = CreateSectionHeader(profContent, "Import / Export")
+    ieHeader:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    profY = profY + 22
+
+    local ieHint = profContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    ieHint:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    ieHint:SetWidth(500)
+    ieHint:SetJustifyH("LEFT")
+    ieHint:SetSpacing(2)
+    ieHint:SetText("Share your settings as a string. Export your active spec or all specs at once. Includes colours, buff pairings, toggles, and frame position. Can be imported on any character of the same class.")
+    profY = profY + ieHint:GetStringHeight() + 10
+
+    -- Multi-line editbox inside a scroll frame with backdrop
+    local ieBoxFrame = CreateFrame("Frame", nil, profContent, "BackdropTemplate")
+    ieBoxFrame:SetSize(480, 80)
+    ieBoxFrame:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    ieBoxFrame:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8x8",
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
+        edgeSize = 1,
+        insets = { left = 1, right = 1, top = 1, bottom = 1 },
+    })
+    ieBoxFrame:SetBackdropColor(0.1, 0.1, 0.1, 0.95)
+    ieBoxFrame:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+    local ieScroll = CreateFrame("ScrollFrame", nil, ieBoxFrame, "UIPanelScrollFrameTemplate")
+    ieScroll:SetPoint("TOPLEFT", 4, -4)
+    ieScroll:SetPoint("BOTTOMRIGHT", -22, 4)
+
+    local ieEditBox = CreateFrame("EditBox", nil, ieScroll)
+    ieEditBox:SetMultiLine(true)
+    ieEditBox:SetAutoFocus(false)
+    ieEditBox:SetFontObject("ChatFontNormal")
+    ieEditBox:SetWidth(450)
+    ieEditBox:SetMaxLetters(0)
+    ieEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    ieScroll:SetScrollChild(ieEditBox)
+
+    profY = profY + 88
+
+    local exportBtn = CreateFrame("Button", nil, profContent, "UIPanelButtonTemplate")
+    exportBtn:SetSize(80, 24)
+    exportBtn:SetText("Export")
+    exportBtn:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    exportBtn:SetScript("OnClick", function()
+        if not ns.ExportProfile then
+            print("|cff00ff00[Infall]|r Export not available.")
+            return
+        end
+        ns.SaveCurrentProfile()
+        local specKey = ns.currentSpecKey
+        if not specKey or not InfallDB.profiles[specKey] then
+            print("|cff00ff00[Infall]|r No profile to export.")
+            return
+        end
+        local str = ns.ExportProfile(InfallDB.profiles[specKey])
+        if str then
+            ieEditBox:SetText(str)
+            ieEditBox:HighlightText()
+            ieEditBox:SetFocus()
+            print("|cff00ff00[Infall]|r Profile exported. Copy the string above.")
+        else
+            print("|cff00ff00[Infall]|r Export failed (serialization error).")
+        end
+    end)
+    exportBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Export Profile")
+        GameTooltip:AddLine("Export your active spec as a shareable string.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    exportBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local exportAllBtn = CreateFrame("Button", nil, profContent, "UIPanelButtonTemplate")
+    exportAllBtn:SetSize(120, 24)
+    exportAllBtn:SetText("Export All Specs")
+    exportAllBtn:SetPoint("LEFT", exportBtn, "RIGHT", 8, 0)
+    exportAllBtn:SetScript("OnClick", function()
+        if not ns.ExportProfile then
+            print("|cff00ff00[Infall]|r Export not available.")
+            return
+        end
+        ns.SaveCurrentProfile()
+        local name = UnitName("player")
+        local realm = GetRealmName()
+        if not name or not realm then
+            print("|cff00ff00[Infall]|r Could not determine character.")
+            return
+        end
+        local prefix = name .. "-" .. realm .. "-"
+        local specs = {}
+        local count = 0
+        for key, profile in pairs(InfallDB.profiles) do
+            if key:sub(1, #prefix) == prefix then
+                local specID = tonumber(key:sub(#prefix + 1))
+                if specID and specID > 0 then
+                    specs[specID] = profile
+                    count = count + 1
+                end
+            end
+        end
+        if count == 0 then
+            print("|cff00ff00[Infall]|r No profiles found to export.")
+            return
+        end
+        local data = { _multi = true, specs = specs }
+        local str = ns.ExportProfile(data)
+        if str then
+            ieEditBox:SetText(str)
+            ieEditBox:HighlightText()
+            ieEditBox:SetFocus()
+            print("|cff00ff00[Infall]|r Exported " .. count .. " spec(s). Copy the string above.")
+        else
+            print("|cff00ff00[Infall]|r Export failed (serialization error).")
+        end
+    end)
+    exportAllBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Export All Specs")
+        GameTooltip:AddLine("Export all specs for this character in one string.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    exportAllBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local importBtn = CreateFrame("Button", nil, profContent, "UIPanelButtonTemplate")
+    importBtn:SetSize(80, 24)
+    importBtn:SetText("Import")
+    importBtn:SetPoint("LEFT", exportAllBtn, "RIGHT", 8, 0)
+    importBtn:SetScript("OnClick", function()
+        if not ns.ImportProfile then
+            print("|cff00ff00[Infall]|r Import not available.")
+            return
+        end
+        local text = ieEditBox:GetText()
+        if not text or text:match("^%s*$") then
+            print("|cff00ff00[Infall]|r Paste a profile string into the box first.")
+            return
+        end
+        local data, err = ns.ImportProfile(text)
+        if not data then
+            print("|cff00ff00[Infall]|r Import failed: " .. (err or "unknown error"))
+            return
+        end
+        if data._multi and data.specs then
+            local name = UnitName("player")
+            local realm = GetRealmName()
+            if not name or not realm then
+                print("|cff00ff00[Infall]|r Could not determine character.")
+                return
+            end
+            local specIndex = GetSpecialization()
+            local currentSpecID = specIndex and GetSpecializationInfo(specIndex)
+            local count = 0
+            for specID, profile in pairs(data.specs) do
+                local numID = tonumber(specID) or specID
+                local specKey = name .. "-" .. realm .. "-" .. numID
+                InfallDB.profiles[specKey] = DeepCopy(profile)
+                if currentSpecID and numID == currentSpecID then
+                    ns.ApplyProfile(profile)
+                end
+                count = count + 1
+            end
+            ns.SaveCurrentProfile()
+            ieEditBox:SetText("")
+            ieEditBox:ClearFocus()
+            print("|cff00ff00[Infall]|r Imported " .. count .. " spec(s). /reload to see all changes.")
+        else
+            ns.ApplyProfile(data)
+            ns.SaveCurrentProfile()
+            ieEditBox:SetText("")
+            ieEditBox:ClearFocus()
+            print("|cff00ff00[Infall]|r Profile imported and applied. /reload to see buff and cooldown changes.")
+        end
+    end)
+    importBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Import Profile")
+        GameTooltip:AddLine("Apply a profile string. Auto detects single or multi spec. Overwrites current settings.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    importBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    profY = profY + 34
+
     profContent:SetHeight(profY + 20)
 
     refreshSettingsUI = function()
@@ -3554,8 +3637,11 @@ local function BuildSettings()
 end
 
 -- ============================================================================
--- OPEN SETTINGS
+-- SETTINGS API
 -- ============================================================================
+
+-- Called at PLAYER_LOGIN to register the panel in the ESC menu
+ns.InitSettings = BuildSettings
 
 function ns.OpenSettings()
     BuildSettings()
