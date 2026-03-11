@@ -1,8 +1,8 @@
 # EventHorizon Infall
 
-Cooldown timeline bars for World of Warcraft: Midnight (12.0). Reads your Cooldown Manager and mirrors it as horizontal bars showing cooldowns, casts, buffs, and debuffs sliding across a relative timeline.
+Cooldown timeline bars for World of Warcraft: Midnight (12.0). Reads your Cooldown Manager and mirrors it as horizontal bars showing cooldowns, casts, buffs, and debuffs sliding across a relative timeline. Original by Brusalk and Calen under "EventHorizon" and "EventHorizon Continued" (for previous expansions). 
 
-Built for the Midnight secret value system from the ground up.
+Built for the Midnight secret value system.
 
 ## Install
 
