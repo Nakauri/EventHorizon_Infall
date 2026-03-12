@@ -38,6 +38,7 @@ local COLOR_KEYS = {
     "chargeTextColor", "stackTextColor",
     "variantTextColor",
     "empowerStage1Color", "empowerStage2Color", "empowerStage3Color", "empowerStage4Color",
+    "disintegrateChainColor",
 }
 
 local function DeepCopy(v)
@@ -2820,6 +2821,16 @@ local function BuildSettings()
     end)
     AddColourWidget(empowerStage4Swatch)
 
+    -- Channel Colours
+    AddColourHeader("Channel Colours")
+    AddColourDescription("Colour for the chain window at the tail of a Disintegrate channel, showing when it's safe to clip and recast.")
+
+    local disintChainSwatch = CreateColorSwatch(colourContent, "Disintegrate Chain Window", DeepCopy(CONFIG.disintegrateChainColor), function(c)
+        CONFIG.disintegrateChainColor = c
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(disintChainSwatch)
+
     -- Text Colours
     AddColourHeader("Text Colours")
     AddColourDescription("Default colours for charge and stack text on bars. Per-slot colours set in the Bars tab take priority over these.")
@@ -2977,6 +2988,7 @@ local function BuildSettings()
         if CONFIG.empowerStage2Color then empowerStage2Swatch:SetColor(DeepCopy(CONFIG.empowerStage2Color)) end
         if CONFIG.empowerStage3Color then empowerStage3Swatch:SetColor(DeepCopy(CONFIG.empowerStage3Color)) end
         if CONFIG.empowerStage4Color then empowerStage4Swatch:SetColor(DeepCopy(CONFIG.empowerStage4Color)) end
+        if CONFIG.disintegrateChainColor then disintChainSwatch:SetColor(DeepCopy(CONFIG.disintegrateChainColor)) end
         if CONFIG.chargeTextColor then chargeTextColourSwatch:SetColor(DeepCopy(CONFIG.chargeTextColor)) end
         if CONFIG.stackTextColor then stackTextColourSwatch:SetColor(DeepCopy(CONFIG.stackTextColor)) end
         if CONFIG.variantTextColor then variantTextColourSwatch:SetColor(DeepCopy(CONFIG.variantTextColor)) end
@@ -3629,7 +3641,10 @@ local function BuildSettings()
         panel:SetMovable(true)
         panel:SetClampedToScreen(true)
         panel:RegisterForDrag("LeftButton")
-        panel:HookScript("OnDragStart", function(self) self:StartMoving() end)
+        panel:HookScript("OnDragStart", function(self)
+            if InCombatLockdown() then return end
+            self:StartMoving()
+        end)
         panel:HookScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     end
 
