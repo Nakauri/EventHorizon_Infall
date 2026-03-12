@@ -33,11 +33,16 @@ local function GetEmpowerStageColor(stage)
     return CONFIG.empowerStage4Color
 end
 
-local function HideEmpowerStageTex(row)
-    if row and row.empowerStageTex then
+local function HideCastOverlays(row)
+    if not row then return end
+    if row.castTex then row.castTex:Hide() end
+    if row.empowerStageTex then
         for _, tex in ipairs(row.empowerStageTex) do
             tex:Hide()
         end
+    end
+    if row.chainWindowTex then
+        row.chainWindowTex:Hide()
     end
 end
 
@@ -81,7 +86,10 @@ if AlphaCurve then
     AlphaCurve:AddPoint(300, 1)       -- stays visible for any positive duration
 end
 
-local pastSlideAlpha = (CONFIG.cooldownColor and CONFIG.cooldownColor[4]) or 0.5
+-- pastSlideAlpha: read inline from CONFIG.cooldownColor[4] so profile changes apply immediately
+
+-- Reused per-frame for charge threshold cache; wipe() instead of allocating new table each iteration
+local detShown = {}
 
 -- BuffFillCurve: 0s remaining → CONFIG.future (permanent buff, full bar), >0s → passthrough.
 local BuffFillCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
@@ -201,8 +209,7 @@ local function CleanupActiveCast(excludeRow)
         DetachPastSlide(activeCast.pastSlide)
     end
     if activeCast.row and activeCast.row ~= excludeRow then
-        activeCast.row.castTex:Hide()
-        HideEmpowerStageTex(activeCast.row)
+        HideCastOverlays(activeCast.row)
     end
 end
 
@@ -266,7 +273,7 @@ local function UpdateCastBar(event)
                 local startSec = startTimeMS / 1000
                 local durSec = (endTimeMS - startTimeMS) / 1000
                 activeCast.isChannel = isChannel
-                if isEmpowered then
+                if isEmpowered or activeCast.isDisintegrate then
                     activeCast.startTimeSec = startSec
                 end
                 if C_DurationUtil and durSec > 0 then
@@ -359,10 +366,28 @@ local function UpdateCastBar(event)
             activeCast.pastSlide = SpawnPastSlide(targetRow, targetRow.pastCastClip, slideColor)
 
             if not isEmpowered then
-                -- Non-empowered: show castTex, hide any leftover stage textures
-                HideEmpowerStageTex(targetRow)
+                -- Non-empowered: show castTex, hide any leftover overlays
+                HideCastOverlays(targetRow)
                 targetRow.castTex:SetVertexColor(unpack(color))
                 targetRow.castTex:Show()
+
+                -- Disintegrate chain window: coloured tail segment
+                if spellID == 356995 then
+                    activeCast.isDisintegrate = true
+                    activeCast.startTimeSec = startSec
+                    local maxTicks = C_SpellBook.IsSpellKnown(1219723) and 5 or 4
+                    activeCast.chainWindowFraction = 1 / (maxTicks - 1)
+
+                    if not targetRow.chainWindowTex then
+                        local tex = targetRow.castFrame:CreateTexture(nil, "ARTWORK", nil, 1)
+                        tex:SetTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
+                        tex:SetSnapToPixelGrid(false)
+                        tex:SetTexelSnappingBias(0)
+                        targetRow.chainWindowTex = tex
+                    end
+                    targetRow.chainWindowTex:SetVertexColor(unpack(CONFIG.disintegrateChainColor))
+                    targetRow.chainWindowTex:Show()
+                end
             end
         else
             -- Casting an untracked spell, clean up any previous tracked cast
@@ -435,25 +460,85 @@ local function UpdateActiveCastBar()
                 activeCast.pastSlide.color = c
             end
         else
-            -- Non-empowered: single castTex from now to remaining
-            local rightPx = TimeToPixel(remaining)
-            local leftPx = nowPx
-            local texLeft = barOffset + leftPx
-            local texWidth = rightPx - leftPx
-            if texWidth < 1 then texWidth = 1 end
+            -- Non-empowered cast/channel
+            if activeCast.isDisintegrate and row.chainWindowTex then
+                -- Disintegrate: split into main segment + chain window tail
+                local elapsed = GetTime() - activeCast.startTimeSec
+                local totalDur = remaining + elapsed
+                local chainStartFromNow = totalDur * (1 - activeCast.chainWindowFraction) - elapsed
 
-            row.castTex:ClearAllPoints()
-            row.castTex:SetPoint("TOPLEFT", row, "TOPLEFT", texLeft, 0)
-            row.castTex:SetSize(texWidth, rowH)
-            row.castTex:Show()
+                if chainStartFromNow <= 0 then
+                    -- Fully inside chain window: only chain colour in the future
+                    row.castTex:Hide()
+                    local cwRightPx = TimeToPixel(remaining)
+                    local cwWidth = cwRightPx - nowPx
+                    if cwWidth < 1 then cwWidth = 1 end
+                    row.chainWindowTex:ClearAllPoints()
+                    row.chainWindowTex:SetPoint("TOPLEFT", row, "TOPLEFT", barOffset + nowPx, 0)
+                    row.chainWindowTex:SetSize(cwWidth, rowH)
+                    row.chainWindowTex:Show()
+
+                    -- Transition: detach green past slide, spawn teal one
+                    if not activeCast.chainWindowPastStarted then
+                        activeCast.chainWindowPastStarted = true
+                        if activeCast.pastSlide then
+                            DetachPastSlide(activeCast.pastSlide)
+                        end
+                        activeCast.pastSlide = SpawnPastSlide(row, row.pastCastClip, CONFIG.disintegrateChainColor)
+                    end
+                elseif chainStartFromNow >= remaining then
+                    -- Chain window not visible yet, full cast colour
+                    row.chainWindowTex:Hide()
+                    local rightPx = TimeToPixel(remaining)
+                    local texLeft = barOffset + nowPx
+                    local texWidth = rightPx - nowPx
+                    if texWidth < 1 then texWidth = 1 end
+                    row.castTex:ClearAllPoints()
+                    row.castTex:SetPoint("TOPLEFT", row, "TOPLEFT", texLeft, 0)
+                    row.castTex:SetSize(texWidth, rowH)
+                    row.castTex:Show()
+                else
+                    -- Split: main portion + chain window
+                    local splitPx = TimeToPixel(chainStartFromNow)
+
+                    -- Main cast portion: now to chain window start
+                    local mainLeft = barOffset + nowPx
+                    local mainWidth = splitPx - nowPx
+                    if mainWidth < 1 then mainWidth = 1 end
+                    row.castTex:ClearAllPoints()
+                    row.castTex:SetPoint("TOPLEFT", row, "TOPLEFT", mainLeft, 0)
+                    row.castTex:SetSize(mainWidth, rowH)
+                    row.castTex:Show()
+
+                    -- Chain window: chain start to end
+                    local cwRightPx = TimeToPixel(remaining)
+                    local cwWidth = cwRightPx - splitPx
+                    if cwWidth < 1 then cwWidth = 1 end
+                    row.chainWindowTex:ClearAllPoints()
+                    row.chainWindowTex:SetPoint("TOPLEFT", row, "TOPLEFT", barOffset + splitPx, 0)
+                    row.chainWindowTex:SetSize(cwWidth, rowH)
+                    row.chainWindowTex:Show()
+                end
+            else
+                -- Standard non-empowered: single castTex from now to remaining
+                local rightPx = TimeToPixel(remaining)
+                local leftPx = nowPx
+                local texLeft = barOffset + leftPx
+                local texWidth = rightPx - leftPx
+                if texWidth < 1 then texWidth = 1 end
+
+                row.castTex:ClearAllPoints()
+                row.castTex:SetPoint("TOPLEFT", row, "TOPLEFT", texLeft, 0)
+                row.castTex:SetSize(texWidth, rowH)
+                row.castTex:Show()
+            end
         end
     else
         -- Cast completed, detach past slide
         if activeCast.pastSlide then
             DetachPastSlide(activeCast.pastSlide)
         end
-        activeCast.row.castTex:Hide()
-        HideEmpowerStageTex(activeCast.row)
+        HideCastOverlays(activeCast.row)
         activeCast = nil
     end
 end
@@ -1376,11 +1461,13 @@ ScanViewerFrames = function()
         local iter, pool, first = ScanViewer(viewerName)
         if iter then
             for frame in iter, pool, first do
-                if frame.cooldownID then
-                    cachedCooldownViewerFrames[frame.cooldownID] = frame
+                local ok, cdID = pcall(function() return frame:GetObjectType() and frame.cooldownID end)
+                if ok and cdID then
+                    cachedCooldownViewerFrames[cdID] = frame
                     -- Category 0 hasAura: make active auras available for buff tracking
-                    if frame.auraInstanceID then
-                        cachedBuffViewerFrames[frame.cooldownID] = frame
+                    local aOk, aID = pcall(function() return frame.auraInstanceID end)
+                    if aOk and aID then
+                        cachedBuffViewerFrames[cdID] = frame
                     end
                 end
             end
@@ -1392,8 +1479,9 @@ ScanViewerFrames = function()
         local iter, pool, first = ScanViewer(viewerName)
         if iter then
             for frame in iter, pool, first do
-                if frame.cooldownID then
-                    cachedBuffViewerFrames[frame.cooldownID] = frame
+                local ok, cdID = pcall(function() return frame:GetObjectType() and frame.cooldownID end)
+                if ok and cdID then
+                    cachedBuffViewerFrames[cdID] = frame
                 end
             end
         end
@@ -1428,8 +1516,10 @@ local function MirrorECMState(row, cooldownViewerFrames)
     end
 
     -- Mirror ECM icon texture
-    if not CONFIG.hideIcons and ecmFrame.Icon then
-        local texOk, tex = pcall(ecmFrame.Icon.GetTexture, ecmFrame.Icon)
+    if not CONFIG.hideIcons then
+        local texOk, tex = pcall(function()
+            return ecmFrame.Icon and ecmFrame.Icon:GetTexture()
+        end)
         if texOk and tex then
             row.icon:SetTexture(tex)
         end
@@ -1483,9 +1573,9 @@ local function UpdateRowCooldown(row)
         row.cdBar:Hide()
         row.lastCdDurObj = nil
         if row.cooldownFrame then row.cooldownFrame:Hide() end
-        -- If only GCD is active and hidden_cd is still ticking from a previous CD,
-        -- clear it. Handles proc resets mid-GCD (IE Black Arrow).
-        if isOnGCD and row.hidden_cd and row.hidden_cd:IsShown() then
+        -- Clear stale hidden_cd timer: handles proc resets mid-GCD (IE Black Arrow)
+        -- AND spell transforms mid-cooldown (old spell timer would persist as ghost past slide)
+        if row.hidden_cd and row.hidden_cd:IsShown() then
             row.hidden_cd:SetCooldown(0, 0)
             row.lastPtr_cd = nil
         end
@@ -1614,7 +1704,7 @@ UpdateBuffState = function(row, buffViewerFrames)
                                 unit = unitHint,
                                 secretAuraSpellId = secretAuraSpellId
                             }
-                            if mapIdx == 1 and not primaryBuff then
+                            if mapIdx == 1 then
                                 primaryBuff = entry
                             elseif mapIdx == 2 and not overlayBuff then
                                 overlayBuff = entry
@@ -1654,8 +1744,7 @@ UpdateBuffState = function(row, buffViewerFrames)
             end
         else
             local durSuccess, durObj, resolvedUnit = GetAuraDurationWithRetry(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.auraDataUnit)
-            if resolvedUnit ~= primaryBuff.unit then primaryBuff.unit = resolvedUnit end
-
+            if resolvedUnit and resolvedUnit ~= primaryBuff.unit then primaryBuff.unit = resolvedUnit end
             if durSuccess and durObj then
                 row.activeBuffDuration = durObj
 
@@ -1720,8 +1809,7 @@ UpdateBuffState = function(row, buffViewerFrames)
             FeedHiddenCooldown(row, "overlay", nil)
         else
             local durSuccess2, durObj2, resolvedUnit2 = GetAuraDurationWithRetry(overlayBuff.unit, overlayBuff.frame.auraInstanceID, overlayBuff.frame.auraDataUnit)
-            if resolvedUnit2 ~= overlayBuff.unit then overlayBuff.unit = resolvedUnit2 end
-
+            if resolvedUnit2 and resolvedUnit2 ~= overlayBuff.unit then overlayBuff.unit = resolvedUnit2 end
             if durSuccess2 and durObj2 then
                 row.activeBuffOverlayDuration = durObj2
                 FeedHiddenCooldown(row, "overlay", durObj2)
@@ -1853,6 +1941,7 @@ UpdateDesaturation = function(row)
 end
 
 local lastUpdateBarsTime = 0
+local buffViewerWarningShown = false
 
 local function UpdateBars()
     local now = GetTime()
@@ -1860,6 +1949,17 @@ local function UpdateBars()
     lastUpdateBarsTime = now
 
     local cooldownViewerFrames, buffViewerFrames = ScanViewerFrames()
+
+    -- One-time warning if buff viewers have no frames but mappings exist
+    if not buffViewerWarningShown and CONFIG.buffMappings and next(CONFIG.buffMappings) then
+        local hasBuff = next(buffViewerFrames) ~= nil
+        if not hasBuff and _G["BuffIconCooldownViewer"] then
+            buffViewerWarningShown = true
+            print("|cff00ff00[Infall]|r Buff tracking requires the Cooldown Manager buff viewer to be visible. Set it to Always in CDM settings, then use /infall ecm to hide it.")
+        elseif hasBuff then
+            buffViewerWarningShown = true
+        end
+    end
 
     for _, row in ipairs(cooldownBars) do
         MirrorECMState(row, cooldownViewerFrames)
@@ -1914,8 +2014,16 @@ local function GcdBarAndSpark(durObj, gcdBar, gcdSpark, row, future, interp)
 end
 
 local updateTimer = 0
+local buffPollTimer = 0
 EH_Parent:SetScript("OnUpdate", function(self, elapsed)
     updateTimer = updateTimer + elapsed
+
+    -- 10Hz buff data polling: re-reads CDM frames for aura changes (target swap, dot refresh)
+    buffPollTimer = buffPollTimer + elapsed
+    if buffPollTimer >= 0.1 then
+        buffPollTimer = 0
+        UpdateBars()
+    end
 
     if updateTimer >= 0.033 then
         local interp = GetInterpolation()
@@ -1993,7 +2101,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 local isDepleted = indTex and not indTex:IsShown()
 
                 -- Charge threshold cache: detShown[T] = true when charges >= T
-                local detShown = {}
+                wipe(detShown)
                 detShown[1] = indTex and indTex:IsShown()
                 if row.chargeDetectors then
                     for T, det in pairs(row.chargeDetectors) do
@@ -2100,7 +2208,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                         row.pastCdClip, CONFIG.cooldownColor, laneH, 0)
                     row._depletedSpawnTime = GetTime()
                 elseif row.activeDepletedSlide and not row.activeDepletedSlide.detachTime and not topTexShown then
-                    row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or pastSlideAlpha)
+                    row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
                     DetachPastSlide(row.activeDepletedSlide)
                     row.activeDepletedSlide = nil
                     row._depletedSpawnTime = nil
@@ -2114,7 +2222,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                         laneH, barH - laneH)
                     row._chargeSpawnTime = GetTime()
                 elseif row.activeChargeSlide and not row.activeChargeSlide.detachTime and not bottomTexShown then
-                    row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or pastSlideAlpha)
+                    row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
                     DetachPastSlide(row.activeChargeSlide)
                     row.activeChargeSlide = nil
                     row._chargeSpawnTime = nil
@@ -2144,7 +2252,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 local maxSlideDur = (row.maxCharges or 2) * (row.chargeDurationConstant or 12) + 2
                 if row._depletedSpawnTime and GetTime() - row._depletedSpawnTime > maxSlideDur then
                     if row.activeDepletedSlide then
-                        row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or pastSlideAlpha)
+                        row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
                     end
                     DetachPastSlide(row.activeDepletedSlide)
                     row.activeDepletedSlide = nil
@@ -2152,7 +2260,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 end
                 if row._chargeSpawnTime and GetTime() - row._chargeSpawnTime > maxSlideDur then
                     if row.activeChargeSlide then
-                        row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or pastSlideAlpha)
+                        row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
                     end
                     DetachPastSlide(row.activeChargeSlide)
                     row.activeChargeSlide = nil
@@ -2286,8 +2394,7 @@ local function ResetBarState(bar)
     bar.buffBar:Hide()
     if bar.buffBarOverlay then bar.buffBarOverlay:Hide() end
     if bar.cooldownFrame then bar.cooldownFrame:Hide() end
-    if bar.castTex then bar.castTex:Hide() end
-    HideEmpowerStageTex(bar)
+    HideCastOverlays(bar)
     if bar.depletedWrapper then bar.depletedWrapper:Hide() end
     if bar.notDepletedWrapper then bar.notDepletedWrapper:Hide() end
     if bar.middleLanes then
@@ -2855,6 +2962,7 @@ local ecmFrameNames = {
 }
 
 local function ApplyECMVisibility()
+    if InCombatLockdown() then return end
     for _, name in ipairs(ecmFrameNames) do
         local frame = _G[name]
         if frame then
@@ -2878,6 +2986,51 @@ local function ApplyECMVisibility()
     end
 end
 ns.ApplyECMVisibility = ApplyECMVisibility
+
+local function ForceViewersAlways()
+    local CDM_VIS_SETTING = 6
+    local VIS_ALWAYS = 0
+    local CDM_HIDE_INACTIVE = 8
+    local changed = false
+    local mgr = EditModeManagerFrame
+    if not mgr or not mgr.OnSystemSettingChange then return false end
+
+    -- Preset layouts (Modern/Classic) don't persist changes
+    local isPreset = false
+    if mgr.GetActiveLayoutInfo then
+        local ok, layoutInfo = pcall(mgr.GetActiveLayoutInfo, mgr)
+        if ok and layoutInfo and layoutInfo.layoutType then
+            isPreset = (layoutInfo.layoutType == (Enum.EditModeLayoutType and Enum.EditModeLayoutType.Preset))
+        end
+    end
+
+    for _, name in ipairs(ecmFrameNames) do
+        local viewer = _G[name]
+        if viewer then
+            if viewer.visibleSetting and viewer.visibleSetting ~= VIS_ALWAYS then
+                pcall(mgr.OnSystemSettingChange, mgr, viewer, CDM_VIS_SETTING, VIS_ALWAYS)
+                changed = true
+            end
+            -- BuffIcon viewer: force HideWhenInactive off so buff frames stay populated
+            if name == "BuffIconCooldownViewer" then
+                local hideOk, hideVal = pcall(function()
+                    return viewer:GetSettingValue(CDM_HIDE_INACTIVE)
+                end)
+                if hideOk and hideVal and hideVal ~= 0 then
+                    pcall(mgr.OnSystemSettingChange, mgr, viewer, CDM_HIDE_INACTIVE, 0)
+                    changed = true
+                end
+            end
+        end
+    end
+    if changed and mgr.SaveLayouts then
+        pcall(mgr.SaveLayouts, mgr)
+    end
+    if changed and isPreset then
+        print("|cff00ff00[Infall]|r Warning: You are using a preset Edit Mode layout. CDM viewer changes may not persist. Create a custom layout for permanent settings.")
+    end
+    return changed
+end
 
 local function ApplyCastBarVisibility()
     if InCombatLockdown() then return end
@@ -2917,6 +3070,12 @@ loginInitFrame:SetScript("OnEvent", function()
         print("|cff00ff00[Infall]|r Enabled the Cooldown Manager. Infall requires it to function.")
     end
 
+    -- Force all CDM viewers to "Always" visibility so frames are always populated
+    -- Infall uses SetAlpha(0) to hide them when hideBlizzECM is true
+    if ForceViewersAlways() then
+        print("|cff00ff00[Infall]|r Cooldown viewer visibility set to Always. Use |cffffff00/infall ecm|r to toggle visibility.")
+    end
+
     PreCacheChargeSpells()
 
     EH_Parent:SetMovable(true)
@@ -2941,59 +3100,25 @@ loginInitFrame:SetScript("OnEvent", function()
     
     ApplyECMVisibility()
 
+    local setAlphaGuard = {}
     for _, name in ipairs(ecmFrameNames) do
         local frame = _G[name]
         if frame then
             hooksecurefunc(frame, "SetAlpha", function(self, alpha)
+                if InCombatLockdown() then return end
+                if setAlphaGuard[self] then return end
+                if issecretvalue and issecretvalue(alpha) then return end
                 if CONFIG.hideBlizzECM and alpha > 0 then
+                    setAlphaGuard[self] = true
                     self:SetAlpha(0)
-                    pcall(function()
-                        for itemFrame in self.itemFramePool:EnumerateActive() do
-                            itemFrame:SetMouseMotionEnabled(false)
-                        end
-                    end)
+                    setAlphaGuard[self] = nil
                 end
             end)
         end
     end
 
-    -- Hook CDM buff item frames for instant aura updates on target switch
-    local hookedBuffFrames = {}
-    local buffHookPending = false
-    local function OnBuffFrameAuraSet()
-        if buffHookPending then return end
-        buffHookPending = true
-        C_Timer.After(0, function()
-            buffHookPending = false
-            if #cooldownBars > 0 then
-                UpdateBars()
-            end
-        end)
-    end
-
-    local function HookBuffViewerFrames()
-        for _, name in ipairs(buffViewerNames) do
-            local viewer = _G[name]
-            if viewer and viewer.itemFramePool then
-                pcall(function()
-                    for frame in viewer.itemFramePool:EnumerateActive() do
-                        if not hookedBuffFrames[frame] then
-                            hookedBuffFrames[frame] = true
-                            hooksecurefunc(frame, "SetAuraInstanceInfo", OnBuffFrameAuraSet)
-                        end
-                    end
-                end)
-            end
-        end
-    end
-
-    HookBuffViewerFrames()
-    for _, name in ipairs(buffViewerNames) do
-        local viewer = _G[name]
-        if viewer then
-            hooksecurefunc(viewer, "RefreshLayout", HookBuffViewerFrames)
-        end
-    end
+    -- Buff data polling at 10Hz in OnUpdate replaces all CDM buff frame hooks.
+    -- No SetAuraInstanceInfo, OnAcquireItemFrame, or RefreshLayout hooks needed.
 
     EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
         if InCombatLockdown() then return end
@@ -3007,7 +3132,7 @@ loginInitFrame:SetScript("OnEvent", function()
         end)
         
         -- Second pass in case the data provider hasn't committed the new order yet
-        C_Timer.After(0.2, function()
+        C_Timer.After(1.0, function()
             if InCombatLockdown() then return end
             if #cooldownBars > 0 then
                 SmartReorder()
@@ -3110,10 +3235,15 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             if #cooldownBars == 0 then LoadEssentialCooldowns() end
         end)
         C_Timer.After(2.5, UpdateVisibility)
-        -- viewers may recreate after zone transitions
-        if ns.ApplyECMVisibility then
-            C_Timer.After(2.5, ns.ApplyECMVisibility)
-        end
+        -- Viewers may recreate after zone transitions; re-force Always + re-hide
+        C_Timer.After(2.5, function()
+            if InCombatLockdown() then
+                ns._pendingECMReapply = true
+                return
+            end
+            ForceViewersAlways()
+            ApplyECMVisibility()
+        end)
         
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_CHARGES" then
         -- If bars haven't been loaded yet (first GCD before 2s timer), load now
@@ -3256,8 +3386,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         activeCast.pastSlide.active = false
                     end
                 end
-                activeCast.row.castTex:Hide()
-                HideEmpowerStageTex(activeCast.row)
+                HideCastOverlays(activeCast.row)
                 activeCast = nil
             end
         end
@@ -3303,33 +3432,25 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         if event == "PLAYER_REGEN_ENABLED" then
             for _, row in ipairs(cooldownBars) do
                 row.cachedPandemicIcon = nil
-                if row.pastSlides then
-                    for _, slide in ipairs(row.pastSlides) do
-                        slide.tex:Hide()
-                        slide.active = false
-                    end
+                -- Detach active slides so they drift off naturally
+                for _, key in ipairs({"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeDepletedSlide", "activeChargeSlide", "permanentBuffSlide"}) do
+                    if row[key] then DetachPastSlide(row[key]) end
+                    row[key] = nil
                 end
-                row.activeCdSlide = nil
-                row.activeBuffSlide = nil
-                row.activeOverlaySlide = nil
-                row.activeDepletedSlide = nil
-                row.activeChargeSlide = nil
-                row.permanentBuffSlide = nil
                 row._depletedSpawnTime = nil
                 row._chargeSpawnTime = nil
                 if row.middleLanes then
                     for _, ml in ipairs(row.middleLanes) do
+                        if ml.activeSlide then DetachPastSlide(ml.activeSlide) end
                         ml.activeSlide = nil
                     end
                 end
-                row.lastPtr_cd = nil
-                row.lastPtr_charge = nil
-                row.lastPtr_buff = nil
-                row.lastPtr_overlay = nil
-                if row.hidden_cd then row.hidden_cd:SetCooldown(0, 0) end
-                if row.hidden_charge then row.hidden_charge:SetCooldown(0, 0) end
-                if row.hidden_buff then row.hidden_buff:SetCooldown(0, 0) end
-                if row.hidden_overlay then row.hidden_overlay:SetCooldown(0, 0) end
+                for _, key in ipairs({"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay"}) do
+                    row[key] = nil
+                end
+                for _, key in ipairs({"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay"}) do
+                    if row[key] then row[key]:SetCooldown(0, 0) end
+                end
 
                 -- readable out of combat
                 if row.isChargeSpell then
@@ -3353,8 +3474,15 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
 
             end
+
+            -- Re-apply ECM visibility if PEW timer was blocked by combat
+            if ns._pendingECMReapply then
+                ns._pendingECMReapply = nil
+                ForceViewersAlways()
+                ApplyECMVisibility()
+            end
         end
-        
+
     elseif event == "PLAYER_TARGET_CHANGED" then
         -- Clear pandemic icon refs so OnUpdate doesn't poll stale target frames
         for _, row in ipairs(cooldownBars) do
@@ -3363,6 +3491,8 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         lastUnitAuraUpdate = 0
         UpdateBars()
         UpdateVisibility()
+        -- Deferred(0) = next frame, guarantees CDM has processed UNIT_TARGET by then
+        ScheduleDeferredUpdate(0)
         ScheduleDeferredUpdate(0.05)
         ScheduleDeferredUpdate(0.1)
         ScheduleDeferredUpdate(0.2)
@@ -3460,13 +3590,17 @@ SlashCmdList["INFALL"] = function(msg)
         end
         
     elseif msg == "ecm" then
+        if InCombatLockdown() then
+            print("|cff00ff00[Infall]|r Cannot toggle cooldown viewer in combat. Use /infall ecm after combat.")
+            return
+        end
         CONFIG.hideBlizzECM = not CONFIG.hideBlizzECM
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
-        
+
         if ns.ApplyECMVisibility then
             ns.ApplyECMVisibility()
         end
-        
+
         if CONFIG.hideBlizzECM then
             print("|cff00ff00[Infall]|r Blizzard cooldown viewer: |cffff0000HIDDEN|r")
         else
