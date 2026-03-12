@@ -42,6 +42,8 @@ ns.CONFIG = {
     empowerStage3Color = {1.00, 0.75, 0.00, 0.7},
     empowerStage4Color = {1.00, 0.95, 0.45, 0.7},
 
+    disintegrateChainColor = {0.3, 0.9, 0.9, 0.7},
+
     iconUsableColor = {1.0, 1.0, 1.0, 1.0},
     iconNotEnoughManaColor = {0.5, 0.5, 1.0, 1.0},
     iconNotUsableColor = {0.4, 0.4, 0.4, 1.0},
