@@ -88,8 +88,10 @@ end
 
 -- pastSlideAlpha: read inline from CONFIG.cooldownColor[4] so profile changes apply immediately
 
+-- Reused per-frame for charge threshold cache; wipe() instead of allocating new table each iteration
 local detShown = {}
 
+-- BuffFillCurve: 0s remaining → CONFIG.future (permanent buff, full bar), >0s → passthrough.
 local BuffFillCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
 if BuffFillCurve then
     BuffFillCurve:AddPoint(0.0, CONFIG.future)
@@ -3069,6 +3071,7 @@ loginInitFrame:SetScript("OnEvent", function()
     end
 
     -- Force all CDM viewers to "Always" visibility so frames are always populated
+    -- Infall uses SetAlpha(0) to hide them when hideBlizzECM is true
     if ForceViewersAlways() then
         print("|cff00ff00[Infall]|r Cooldown viewer visibility set to Always. Use |cffffff00/infall ecm|r to toggle visibility.")
     end
@@ -3114,6 +3117,8 @@ loginInitFrame:SetScript("OnEvent", function()
         end
     end
 
+    -- Buff data polling at 10Hz in OnUpdate replaces all CDM buff frame hooks.
+    -- No SetAuraInstanceInfo, OnAcquireItemFrame, or RefreshLayout hooks needed.
 
     EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
         if InCombatLockdown() then return end
