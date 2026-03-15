@@ -1864,11 +1864,12 @@ UpdateBuffState = function(row, buffViewerFrames)
             row.buffBar:Show()
             row.trackedBuffAuraInstanceID = primaryBuff.frame.auraInstanceID
             row.secretAuraSpellId = primaryBuff.secretAuraSpellId
-            FeedHiddenCooldown(row, "buff", nil)
-
-            -- Spawn past slide on first detection
-            if not row.permanentBuffSlide or not row.permanentBuffSlide.active then
-                row.permanentBuffSlide = SpawnPastSlide(row, row.pastBuffClip, row.resolvedBuffColor or CONFIG.buffColor)
+            if row.hidden_buff then
+                if not row._permBuffDurObj then
+                    row._permBuffDurObj = C_DurationUtil.CreateDuration()
+                end
+                row._permBuffDurObj:SetTimeFromStart(GetTime(), 86400)
+                FeedHiddenCooldown(row, "buff", row._permBuffDurObj)
             end
         else
             local durSuccess, durObj, resolvedUnit = GetAuraDurationWithRetry(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.auraDataUnit)
@@ -1916,12 +1917,6 @@ UpdateBuffState = function(row, buffViewerFrames)
             row.secretAuraSpellId = nil
         end
         FeedHiddenCooldown(row, "buff", nil)
-
-        -- Detach permanent buff past slide when buff drops
-        if row.permanentBuffSlide and row.permanentBuffSlide.active then
-            DetachPastSlide(row.permanentBuffSlide)
-            row.permanentBuffSlide = nil
-        end
     end
 
     -- Overlay lane → buffBarOverlay
@@ -1936,7 +1931,13 @@ UpdateBuffState = function(row, buffViewerFrames)
             row.buffBarOverlay:SetValue(CONFIG.future)
             row.buffBarOverlay:Show()
             row.trackedOverlayAuraInstanceID = overlayBuff.frame.auraInstanceID
-            FeedHiddenCooldown(row, "overlay", nil)
+            if row.hidden_overlay then
+                if not row._permOverlayDurObj then
+                    row._permOverlayDurObj = C_DurationUtil.CreateDuration()
+                end
+                row._permOverlayDurObj:SetTimeFromStart(GetTime(), 86400)
+                FeedHiddenCooldown(row, "overlay", row._permOverlayDurObj)
+            end
         else
             local durSuccess2, durObj2, resolvedUnit2 = GetAuraDurationWithRetry(overlayBuff.unit, overlayBuff.frame.auraInstanceID, overlayBuff.frame.auraDataUnit)
             if resolvedUnit2 and resolvedUnit2 ~= overlayBuff.unit then overlayBuff.unit = resolvedUnit2 end
@@ -2446,6 +2447,8 @@ local function ResetBarState(bar)
     bar.lastPtr_charge = nil
     bar.lastPtr_buff = nil
     bar.lastPtr_overlay = nil
+    bar._permBuffDurObj = nil
+    bar._permOverlayDurObj = nil
     bar.wasOnGCD = false
     if bar.hidden_cd then bar.hidden_cd:SetCooldown(0, 0) end
     if bar.hidden_charge then bar.hidden_charge:SetCooldown(0, 0) end
@@ -2459,8 +2462,6 @@ local function ResetBarState(bar)
     bar.trackedBuffAuraInstanceID = nil
     bar.trackedOverlayAuraInstanceID = nil
     bar.secretAuraSpellId = nil
-    bar.permanentBuffSlide = nil
-    
     bar.icon:SetDesaturation(0)
     bar.cdBar:Hide()
     bar.buffBar:Hide()
@@ -3562,15 +3563,13 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         row.activeBuffDuration = nil
                         row.trackedBuffAuraInstanceID = nil
                         row.buffBar:Hide()
-                        if row.permanentBuffSlide and row.permanentBuffSlide.active then
-                            DetachPastSlide(row.permanentBuffSlide)
-                            row.permanentBuffSlide = nil
-                        end
+                        FeedHiddenCooldown(row, "buff", nil)
                     end
                     if row.trackedOverlayAuraInstanceID == removedID then
                         row.activeBuffOverlayDuration = nil
                         row.trackedOverlayAuraInstanceID = nil
                         if row.buffBarOverlay then row.buffBarOverlay:Hide() end
+                        FeedHiddenCooldown(row, "overlay", nil)
                     end
                 end
             end
@@ -3594,7 +3593,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             for _, row in ipairs(cooldownBars) do
                 row.cachedPandemicIcon = nil
                 -- Detach active slides so they drift off naturally
-                for _, key in ipairs({"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeDepletedSlide", "activeChargeSlide", "permanentBuffSlide"}) do
+                for _, key in ipairs({"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeDepletedSlide", "activeChargeSlide"}) do
                     if row[key] then DetachPastSlide(row[key]) end
                     row[key] = nil
                 end
