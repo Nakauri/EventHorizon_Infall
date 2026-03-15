@@ -616,6 +616,10 @@ CONFIG.buffMappings = {
 
 The keys in `spellColorMap` are spellIDs for each outcome. When the buff is active, Infall reads the outcome's spellID and picks the matching colour.
 
+**Auto-detection:** If you pair a buff through the Settings GUI and that buff has linked spells in the Cooldown Manager, Infall automatically creates `spellColorMap` entries with distinct colours. You do not need to manually look up spellIDs for most abilities. Auto-detected colours can be customized afterwards through the colour picker popup.
+
+If you want to add variant colours manually (IE for a spell that auto-detection does not cover), add the `spellColorMap` table as shown above. When `spellColorMap` already exists, auto-detection is skipped and your manual colours are preserved.
+
 **Raid limitation:** Inside raid encounters, Blizzard restricts aura details (secret values). The bar colour falls back to the default `color` field during boss fights. The variant name label (see Variant Names below) still works everywhere because spell names pass through the combat protection system.
 
 
