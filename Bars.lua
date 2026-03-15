@@ -46,7 +46,7 @@ local function HideCastOverlays(row)
     end
 end
 
--- Offscreen because OnCooldownDone does not fire on zero alpha frames.
+-- Offscreen parent for hidden Cooldown frames.
 local hiddenCDParent = CreateFrame("Frame", nil, UIParent)
 hiddenCDParent:SetSize(1, 1)
 hiddenCDParent:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -2000, 2000)
@@ -86,10 +86,6 @@ if AlphaCurve then
     AlphaCurve:AddPoint(300, 1)       -- stays visible for any positive duration
 end
 
--- pastSlideAlpha: read inline from CONFIG.cooldownColor[4] so profile changes apply immediately
-
--- Reused per-frame for charge threshold cache; wipe() instead of allocating new table each iteration
-local detShown = {}
 
 -- BuffFillCurve: 0s remaining → CONFIG.future (permanent buff, full bar), >0s → passthrough.
 local BuffFillCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
@@ -684,6 +680,7 @@ local function UpdateAllIconStates()
 end
 
 local function HandleProcGlow(row, show)
+    row.isGlowing = show
     if not CONFIG.reactiveIcons then return end
     if CONFIG.hideIcons then return end
 
@@ -970,6 +967,71 @@ FeedChargeHiddenFrames = function(row)
     else FeedHiddenCooldown(row, "charge", nil) end
 end
 
+-- Event-driven charge bar fill via SetTimerDuration (OctoChargeBar pattern).
+-- Called on SPELL_UPDATE_CHARGES, SPELL_UPDATE_COOLDOWN, USCS, and OCD.
+-- Engine animates fill; OnUpdate only handles alpha, helpers, past slides.
+local IMM_INTERP = Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate
+local REMAIN_DIR = Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.RemainingTime
+FeedChargeBarTimers = function(row)
+    if not row.isChargeSpell or not row.depletedWrapper then return end
+
+    if row.baseSpellID then
+        local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, row.baseSpellID)
+        if ovOk and ovID and ovID ~= 0 then row.spellID = ovID end
+    end
+
+    local chargeOk, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
+    if not chargeOk then chargeDurObj = nil end
+    local cdOk, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
+    if not cdOk then cdDurObj = nil end
+    local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
+    local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
+    if isOnGCD then cdDurObj = nil end
+
+    -- Feed all charge-driven indicators with currentCharges
+    local chargesOk, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
+    if chargesOk and chargeInfo then
+        local cc = chargeInfo.currentCharges
+        row.depletedIndicator:SetValue(cc)
+        if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
+        if row.middleClipIndicators then
+            for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
+        end
+        if row.middleLanes then
+            for _, ml2 in ipairs(row.middleLanes) do
+                if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
+            end
+        end
+    end
+
+    row._chargeDurObj = chargeDurObj
+    row._cdDurObj = cdDurObj
+
+    FeedHiddenCooldown(row, "charge", chargeDurObj)
+    FeedHiddenCooldown(row, "cd", cdDurObj)
+
+    if chargeDurObj and IMM_INTERP and REMAIN_DIR then
+        pcall(row.depletedChargeBar.SetTimerDuration, row.depletedChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
+        pcall(row.normalChargeBar.SetTimerDuration, row.normalChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
+    else
+        row.depletedChargeBar:SetValue(0)
+        row.normalChargeBar:SetValue(0)
+    end
+
+    if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
+        for j = 1, row.maxCharges - 2 do
+            local ml = row.middleLanes[j]
+            if ml then
+                if chargeDurObj and IMM_INTERP and REMAIN_DIR then
+                    pcall(ml.depletedChargeBar.SetTimerDuration, ml.depletedChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
+                else
+                    ml.depletedChargeBar:SetValue(0)
+                end
+            end
+        end
+    end
+end
+
 local function CreateCooldownBar(spellID, index)
     local barOffset = GetBarOffset()
     
@@ -1241,8 +1303,12 @@ ResizeContainer = function()
             local bottomY = -(barHeight - lH)
             row.cdBar:SetHeight(lH)
             if row.depletedWrapper then
-                row.depletedWrapper:SetHeight(barHeight)
-                row.notDepletedWrapper:SetHeight(barHeight)
+                local futW = GetFutureWidth()
+                local nowOff = GetBarOffset() + GetNowPixelOffset()
+                row.depletedIndicator:SetSize(futW, barHeight)
+                row.notDepletedWrapper:ClearAllPoints()
+                row.notDepletedWrapper:SetPoint("TOPLEFT", row.depletedIndicator:GetStatusBarTexture(), "TOPLEFT")
+                row.notDepletedWrapper:SetPoint("BOTTOMRIGHT", row, "TOPLEFT", nowOff + futW, -barHeight)
                 row.depletedCdBar:SetHeight(lH)
                 row.depletedHelperBar:SetHeight(lH)
                 row.depletedHelperBar:ClearAllPoints()
@@ -1253,27 +1319,48 @@ ResizeContainer = function()
                 row.depletedChargeBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", (maxC - 1) * slotPx, bottomY)
                 row.normalChargeBar:SetHeight(lH)
                 row.normalChargeBar:ClearAllPoints()
-                row.normalChargeBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
-                row._lastNdHelperPx = nil
+                if row.ndHelperSpacer then
+                    row.ndHelperSpacer:SetSize(math.max(1, (maxC - 1) * slotPx), lH)
+                    row.ndHelperSpacer:ClearAllPoints()
+                    row.ndHelperSpacer:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+                    row.normalChargeBar:SetPoint("TOPLEFT", row.ndHelperSpacer:GetStatusBarTexture(), "TOPLEFT")
+                else
+                    row.normalChargeBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+                end
                 if row.notDepletedHelperBar then
-                    row.notDepletedHelperBar:SetHeight(lH)
                     row.notDepletedHelperBar:ClearAllPoints()
                     row.notDepletedHelperBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+                    if row.ndHelperSpacer then
+                        row.notDepletedHelperBar:SetPoint("BOTTOMRIGHT", row.ndHelperSpacer:GetStatusBarTexture(), "BOTTOMLEFT")
+                    else
+                        row.notDepletedHelperBar:SetHeight(lH)
+                    end
                 end
             end
             if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
                 local slotPx = row._chargeSlotPx or 0
                 for j = 1, row.maxCharges - 2 do
+                    if row.middleClipIndicators and row.middleClipIndicators[j] then
+                        row.middleClipIndicators[j]:SetSize(GetFutureWidth(), barHeight)
+                    end
                     local ml = row.middleLanes[j]
                     if ml then
                         local laneY = -(j * (lH + 1))
                         ml.depletedHelperBar:SetSize(math.max(1, j * slotPx), lH)
                         ml.depletedHelperBar:ClearAllPoints()
                         ml.depletedHelperBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", 0, laneY)
+                        if ml.helperSpacer then
+                            ml.helperSpacer:SetSize(math.max(1, j * slotPx), lH)
+                            ml.helperSpacer:ClearAllPoints()
+                            ml.helperSpacer:SetPoint("TOPLEFT", row.middleClipWrappers[j], "TOPLEFT", 0, laneY)
+                        end
                         ml.depletedChargeBar:SetHeight(lH)
                         ml.depletedChargeBar:ClearAllPoints()
-                        ml.depletedChargeBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", j * slotPx, laneY)
-                        ml._lastChargeOffset = nil
+                        if ml.helperSpacer then
+                            ml.depletedChargeBar:SetPoint("TOPLEFT", ml.helperSpacer:GetStatusBarTexture(), "TOPLEFT")
+                        else
+                            ml.depletedChargeBar:SetPoint("TOPLEFT", row.middleClipWrappers and row.middleClipWrappers[j] or row.depletedWrapper, "TOPLEFT", j * slotPx, laneY)
+                        end
                     end
                 end
             end
@@ -1447,6 +1534,19 @@ local function ScanViewer(viewerName)
     return nil
 end
 
+-- File-scope pcall extractors (no closure allocation per call)
+local function extractCooldownID(frame)
+    return frame:GetObjectType() and frame.cooldownID
+end
+
+local function extractAuraInstanceID(frame)
+    return frame.auraInstanceID
+end
+
+local function getIconTexture(f)
+    return f.Icon and f.Icon:GetTexture()
+end
+
 -- Cached tables reused by ScanViewerFrames to avoid per-call allocation
 local cachedCooldownViewerFrames = {}
 local cachedBuffViewerFrames = {}
@@ -1457,15 +1557,19 @@ ScanViewerFrames = function()
     wipe(cachedCooldownViewerFrames)
     wipe(cachedBuffViewerFrames)
 
+    if C_CVar and not C_CVar.GetCVarBool("cooldownViewerEnabled") then
+        return cachedCooldownViewerFrames, cachedBuffViewerFrames
+    end
+
     for _, viewerName in ipairs(cooldownViewerNames) do
         local iter, pool, first = ScanViewer(viewerName)
         if iter then
             for frame in iter, pool, first do
-                local ok, cdID = pcall(function() return frame:GetObjectType() and frame.cooldownID end)
+                local ok, cdID = pcall(extractCooldownID, frame)
                 if ok and cdID then
                     cachedCooldownViewerFrames[cdID] = frame
                     -- Category 0 hasAura: make active auras available for buff tracking
-                    local aOk, aID = pcall(function() return frame.auraInstanceID end)
+                    local aOk, aID = pcall(extractAuraInstanceID, frame)
                     if aOk and aID then
                         cachedBuffViewerFrames[cdID] = frame
                     end
@@ -1479,7 +1583,7 @@ ScanViewerFrames = function()
         local iter, pool, first = ScanViewer(viewerName)
         if iter then
             for frame in iter, pool, first do
-                local ok, cdID = pcall(function() return frame:GetObjectType() and frame.cooldownID end)
+                local ok, cdID = pcall(extractCooldownID, frame)
                 if ok and cdID then
                     cachedBuffViewerFrames[cdID] = frame
                 end
@@ -1517,19 +1621,17 @@ local function MirrorECMState(row, cooldownViewerFrames)
 
     -- Mirror ECM icon texture
     if not CONFIG.hideIcons then
-        local texOk, tex = pcall(function()
-            return ecmFrame.Icon and ecmFrame.Icon:GetTexture()
-        end)
+        local texOk, tex = pcall(getIconTexture, ecmFrame)
         if texOk and tex then
             row.icon:SetTexture(tex)
         end
     end
     
-    -- Charge text (secret passthrough via SetText)
+    -- Charge text via direct API (not CDM frame field — stale if viewer hidden)
     if row.hasCharges then
-        local chargeOk, chargeCount = pcall(function() return ecmFrame.cooldownChargesCount end)
-        if chargeOk and chargeCount then
-            row.chargeText:SetText(chargeCount)
+        local ok, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
+        if ok and chargeInfo then
+            row.chargeText:SetText(chargeInfo.currentCharges)
             row.chargeText:Show()
         else
             row.chargeText:Hide()
@@ -1610,6 +1712,9 @@ UpdateChargeState = function(row)
         row.cooldownFrame:Hide()
         row.lastChargeDurObj = nil
     end
+
+    -- Event-driven charge bar fill
+    FeedChargeBarTimers(row)
 end
 
 local function DetectPermanentBuff(unit, auraInstanceID, cdID)
@@ -1653,6 +1758,10 @@ local function GetAuraDurationWithRetry(unit, auraInstanceID, cdmUnit)
     return durSuccess, durObj, unit
 end
 
+-- Pre-allocated buff entry tables (reused per UpdateBuffState call)
+local _primaryBuffEntry = {}
+local _overlayBuffEntry = {}
+
 UpdateBuffState = function(row, buffViewerFrames)
     -- Each mapping entry owns a fixed lane: [1] = primary, [2] = overlay.
     local primaryBuff = nil
@@ -1662,12 +1771,13 @@ UpdateBuffState = function(row, buffViewerFrames)
         -- Self match: buff cooldownID == ability cooldownID
         local selfFrame = buffViewerFrames[row.cooldownID]
         if selfFrame and selfFrame.auraInstanceID then
-            primaryBuff = {
-                frame = selfFrame,
-                color = CONFIG.buffColor,
-                hasCustomColor = false,
-                unit = selfFrame.auraDataUnit or "player"
-            }
+            wipe(_primaryBuffEntry)
+            _primaryBuffEntry.frame = selfFrame
+            _primaryBuffEntry.color = CONFIG.buffColor
+            _primaryBuffEntry.hasCustomColor = false
+            _primaryBuffEntry.unit = selfFrame.auraDataUnit or "player"
+            _primaryBuffEntry.secretAuraSpellId = nil
+            primaryBuff = _primaryBuffEntry
         end
 
         -- Mapping matches: direct lookup by each buffCooldownID
@@ -1683,7 +1793,7 @@ UpdateBuffState = function(row, buffViewerFrames)
                             local hasCustomColor = mapData.color ~= nil
                             local secretAuraSpellId = nil
                             if mapData.spellColorMap and buffFrame.auraInstanceID then
-                                local aOk, aData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, buffFrame.auraDataUnit or unitHint, buffFrame.auraInstanceID)
+                                local aOk, aData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unitHint, buffFrame.auraInstanceID)
                                 if aOk and aData then
                                     secretAuraSpellId = aData.spellId
                                     local sOk, sColor = pcall(function()
@@ -1697,17 +1807,24 @@ UpdateBuffState = function(row, buffViewerFrames)
                                     end
                                 end
                             end
-                            local entry = {
-                                frame = buffFrame,
-                                color = matchedColor,
-                                hasCustomColor = hasCustomColor,
-                                unit = unitHint,
-                                secretAuraSpellId = secretAuraSpellId
-                            }
                             if mapIdx == 1 then
-                                primaryBuff = entry
+                                wipe(_primaryBuffEntry)
+                                _primaryBuffEntry.frame = buffFrame
+                                _primaryBuffEntry.color = matchedColor
+                                _primaryBuffEntry.hasCustomColor = hasCustomColor
+                                _primaryBuffEntry.unit = unitHint
+                                _primaryBuffEntry.secretAuraSpellId = secretAuraSpellId
+                                _primaryBuffEntry.requireGlow = mapData.requireGlow
+                                primaryBuff = _primaryBuffEntry
                             elseif mapIdx == 2 and not overlayBuff then
-                                overlayBuff = entry
+                                wipe(_overlayBuffEntry)
+                                _overlayBuffEntry.frame = buffFrame
+                                _overlayBuffEntry.color = matchedColor
+                                _overlayBuffEntry.hasCustomColor = hasCustomColor
+                                _overlayBuffEntry.unit = unitHint
+                                _overlayBuffEntry.secretAuraSpellId = secretAuraSpellId
+                                _overlayBuffEntry.requireGlow = mapData.requireGlow
+                                overlayBuff = _overlayBuffEntry
                             end
                             break
                         end
@@ -1716,7 +1833,18 @@ UpdateBuffState = function(row, buffViewerFrames)
             end
         end
     end
-    
+
+    -- Glow-gated: suppress buff bar but preserve secretAuraSpellId for variant text
+    row._glowGatedVariant = false
+    if primaryBuff and primaryBuff.requireGlow and not row.isGlowing then
+        row.secretAuraSpellId = primaryBuff.secretAuraSpellId
+        row._glowGatedVariant = true
+        primaryBuff = nil
+    end
+    if overlayBuff and overlayBuff.requireGlow and not row.isGlowing then
+        overlayBuff = nil
+    end
+
     -- Primary lane → buffBar
     if primaryBuff then
         local isPermanent = DetectPermanentBuff(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.cooldownID)
@@ -1784,7 +1912,9 @@ UpdateBuffState = function(row, buffViewerFrames)
         row.resolvedBuffColor = nil
         row.cachedPandemicIcon = nil
         row.trackedBuffAuraInstanceID = nil
-        row.secretAuraSpellId = nil
+        if not row._glowGatedVariant then
+            row.secretAuraSpellId = nil
+        end
         FeedHiddenCooldown(row, "buff", nil)
 
         -- Detach permanent buff past slide when buff drops
@@ -1839,7 +1969,8 @@ UpdateStackText = function(row, buffViewerFrames)
     local variantShown = false
     if row.variantNameText and CONFIG.showVariantNames then
         local mappings = CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
-        local hasVariants = mappings and mappings[1] and mappings[1].spellColorMap
+        local scm = mappings and mappings[1] and mappings[1].spellColorMap
+        local hasVariants = scm and next(scm, (next(scm)))
         if hasVariants and row.secretAuraSpellId then
             local name = C_Spell.GetSpellName(row.secretAuraSpellId)
             if name then
@@ -2072,137 +2203,98 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 if ok then row.buffBarOverlay:SetValue(val, interp) else row.buffBarOverlay:Hide() end
             end
 
-            -- Charge bar display
+            -- Charge bars
             if row.isChargeSpell and row.depletedWrapper then
-                -- Resolve current spell transform before API calls
-                if row.baseSpellID then
-                    local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, row.baseSpellID)
-                    if ovOk and ovID and ovID ~= 0 then
-                        row.spellID = ovID
+                local chargeDurObj = row._chargeDurObj
+
+                -- Feed all charge-driven indicators
+                local chOk, chInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
+                if chOk and chInfo then
+                    local cc = chInfo.currentCharges
+                    row.depletedIndicator:SetValue(cc)
+                    if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
+                    if row.middleClipIndicators then
+                        for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
                     end
-                end
-
-                local chargeOk, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
-                if not chargeOk then chargeDurObj = nil end
-
-                -- Clip boundary indicators
-                local chargesOk, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
-                if chargesOk and chargeInfo then
-                    row.depletedIndicator:SetValue(chargeInfo.currentCharges)
-                    if row.chargeDetectors then
-                        for _, det in pairs(row.chargeDetectors) do
-                            det:SetValue(chargeInfo.currentCharges)
+                    if row.middleLanes then
+                        for _, ml2 in ipairs(row.middleLanes) do
+                            if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
                         end
                     end
                 end
 
-                local isAllCharged = not chargeDurObj
-                local indTex = row.depletedIndicator and row.depletedIndicator:GetStatusBarTexture()
-                local isDepleted = indTex and not indTex:IsShown()
-
-                -- Charge threshold cache: detShown[T] = true when charges >= T
-                wipe(detShown)
-                detShown[1] = indTex and indTex:IsShown()
-                if row.chargeDetectors then
-                    for T, det in pairs(row.chargeDetectors) do
-                        local tex = det:GetStatusBarTexture()
-                        detShown[T] = tex and tex:IsShown()
-                    end
+                -- depletedCdBar fill
+                local cdDurObj
+                do
+                    local ok2, dur2 = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
+                    if ok2 then cdDurObj = dur2 end
+                    local ok3, inf3 = pcall(C_Spell.GetSpellCooldown, row.spellID)
+                    if ok3 and inf3 and inf3.isOnGCD then cdDurObj = nil end
                 end
 
-                -- Child bar alpha: visible when a charge is recharging
+                -- Charge bar alpha
                 if chargeDurObj and AlphaCurve then
                     local ok, chargeAlpha = pcall(chargeDurObj.EvaluateRemainingDuration, chargeDurObj, AlphaCurve)
                     if ok then
                         row.depletedChargeBar:SetAlpha(chargeAlpha)
                         row.normalChargeBar:SetAlpha(chargeAlpha)
-                        row.depletedHelperBar:SetAlpha(chargeAlpha)
-                        -- 3+ charge per-lane alpha via threshold detectors
-                        if row.maxCharges and row.maxCharges > 2 then
-                            -- Bottom lane helper visibility
-                            if row.notDepletedHelperBar then
-                                if not detShown[row.maxCharges - 1] then
-                                    row.notDepletedHelperBar:SetAlpha(chargeAlpha)
-                                else
-                                    row.notDepletedHelperBar:SetAlpha(0)
-                                end
-                            end
-                            -- Middle lanes: charge visible when this lane is depleted,
-                            -- helper visible when an EXTRA charge beyond this lane is depleted
-                            if row.middleLanes then
-                                for j = 1, row.maxCharges - 2 do
-                                    local ml = row.middleLanes[j]
-                                    if ml then
-                                        if not detShown[row.maxCharges - j] then
-                                            ml.depletedChargeBar:SetAlpha(chargeAlpha)
-                                        else
-                                            ml.depletedChargeBar:SetAlpha(0)
-                                        end
-                                        if not detShown[row.maxCharges - j - 1] then
-                                            ml.depletedHelperBar:SetAlpha(chargeAlpha)
-                                        else
-                                            ml.depletedHelperBar:SetAlpha(0)
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                elseif isAllCharged then
-                    row.depletedChargeBar:SetAlpha(0)
-                    row.normalChargeBar:SetAlpha(0)
-                    row.depletedHelperBar:SetAlpha(0)
-                    if row.notDepletedHelperBar then row.notDepletedHelperBar:SetAlpha(0) end
-                    if row.middleLanes then
-                        for j = 1, #row.middleLanes do
-                            local ml = row.middleLanes[j]
-                            if ml then
-                                ml.depletedChargeBar:SetAlpha(0)
-                                ml.depletedHelperBar:SetAlpha(0)
-                            end
-                        end
-                    end
-                end
-
-                -- Fill animation
-                if chargeDurObj then
-                    local ok, remaining = pcall(chargeDurObj.GetRemainingDuration, chargeDurObj)
-                    if ok then
-                        row.depletedChargeBar:SetValue(remaining, interp)
-                        row.normalChargeBar:SetValue(remaining, interp)
-                        if isDepleted then
-                            row.depletedCdBar:SetValue(remaining, interp)
-                        end
                         if row.middleLanes then
                             for j = 1, #row.middleLanes do
                                 local ml = row.middleLanes[j]
-                                if ml then
-                                    if not detShown[row.maxCharges - j] then
-                                        ml.depletedChargeBar:SetValue(remaining, interp)
-                                    else
-                                        ml.depletedChargeBar:SetValue(0)
-                                    end
-                                end
+                                if ml then ml.depletedChargeBar:SetAlpha(chargeAlpha) end
+                            end
+                        end
+                    end
+                else
+                    row.depletedChargeBar:SetAlpha(0)
+                    row.normalChargeBar:SetAlpha(0)
+                    if row.middleLanes then
+                        for j = 1, #row.middleLanes do
+                            local ml = row.middleLanes[j]
+                            if ml then ml.depletedChargeBar:SetAlpha(0) end
+                        end
+                    end
+                end
+
+                -- depletedCdBar alpha
+                if cdDurObj and AlphaCurve then
+                    local ok, a = pcall(cdDurObj.EvaluateRemainingDuration, cdDurObj, AlphaCurve)
+                    if ok then row.depletedCdBar:SetAlpha(a) end
+                else
+                    row.depletedCdBar:SetAlpha(0)
+                end
+
+                -- depletedCdBar fill
+                if cdDurObj then
+                    local ok, remaining = pcall(cdDurObj.GetRemainingDuration, cdDurObj)
+                    if ok then row.depletedCdBar:SetValue(remaining) end
+                else
+                    row.depletedCdBar:SetValue(0)
+                end
+
+                -- Helper bar alpha
+                local isRecharging = row.hidden_charge and row.hidden_charge:IsShown()
+                row.depletedHelperBar:SetAlpha(isRecharging and 1 or 0)
+                if row.maxCharges and row.maxCharges > 2 then
+                    if row.notDepletedHelperBar then
+                        row.notDepletedHelperBar:SetAlpha(isRecharging and 1 or 0)
+                    end
+                    if row.middleLanes then
+                        for j = 1, row.maxCharges - 2 do
+                            local ml = row.middleLanes[j]
+                            if ml then
+                                ml.depletedHelperBar:SetAlpha(isRecharging and 1 or 0)
                             end
                         end
                     end
                 end
-                if not isDepleted then
-                    row.depletedCdBar:SetValue(0)
-                end
 
-                -- Cache future bar texture states
-                local topTexShown = row.depletedCdBar
-                    and row.depletedCdBar:GetStatusBarTexture()
-                    and row.depletedCdBar:GetStatusBarTexture():IsShown()
-                local bottomTexShown = row.normalChargeBar
-                    and row.normalChargeBar:GetStatusBarTexture()
-                    and row.normalChargeBar:GetStatusBarTexture():IsShown()
-
-                -- Charge past slides
+                -- Past slides
+                local topTexShown = row.hidden_cd and row.hidden_cd:IsShown()
+                local bottomTexShown = isRecharging
                 local laneH = row.cdBar.laneHeight or ((CONFIG.height / 2) - 0.5)
 
-                -- Top lane: spawn when depletedCdBar has fill, detach when it doesn't
+                -- Top lane
                 if topTexShown and not row.activeDepletedSlide then
                     row.activeDepletedSlide = SpawnPastSlide(row,
                         row.pastCdClip, CONFIG.cooldownColor, laneH, 0)
@@ -2214,7 +2306,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row._depletedSpawnTime = nil
                 end
 
-                -- Bottom lane: spawn when normalChargeBar has fill, detach when it doesn't
+                -- Bottom lane
                 if bottomTexShown and not row.activeChargeSlide then
                     local barH = row.cdBar.fullHeight or CONFIG.height
                     row.activeChargeSlide = SpawnPastSlide(row,
@@ -2228,27 +2320,36 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row._chargeSpawnTime = nil
                 end
 
-                -- Middle lane past slides
+                -- Middle lane past slides (WIP — detach tied to bottom lane for now)
                 if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
                     for j = 1, row.maxCharges - 2 do
                         local ml = row.middleLanes[j]
                         if ml then
-                            local mlTexShown = ml.depletedChargeBar
-                                and ml.depletedChargeBar:GetStatusBarTexture()
-                                and ml.depletedChargeBar:GetStatusBarTexture():IsShown()
-                            if mlTexShown and not ml.activeSlide then
+                            local mlActive = false
+                            if row.middleClipWrappers and row.middleClipWrappers[j] then
+                                local wrapH = row.middleClipWrappers[j]:GetHeight()
+                                if not issecretvalue(wrapH) then
+                                    mlActive = wrapH > 0.5
+                                else
+                                    mlActive = isRecharging
+                                end
+                            end
+                            if mlActive and not ml.activeSlide then
                                 ml.activeSlide = SpawnPastSlide(row,
                                     row.pastCdClip, CONFIG.cooldownColor,
                                     laneH, j * (laneH + 1))
-                            elseif ml.activeSlide and not ml.activeSlide.detachTime and not mlTexShown then
+                                ml._slideSpawnTime = GetTime()
+                            elseif ml.activeSlide and not ml.activeSlide.detachTime and not mlActive then
+                                ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
                                 DetachPastSlide(ml.activeSlide)
                                 ml.activeSlide = nil
+                                ml._slideSpawnTime = nil
                             end
                         end
                     end
                 end
 
-                -- Safety timeout: detach stuck slides
+                -- Safety timeout
                 local maxSlideDur = (row.maxCharges or 2) * (row.chargeDurationConstant or 12) + 2
                 if row._depletedSpawnTime and GetTime() - row._depletedSpawnTime > maxSlideDur then
                     if row.activeDepletedSlide then
@@ -2266,47 +2367,18 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row.activeChargeSlide = nil
                     row._chargeSpawnTime = nil
                 end
-
-                -- 3+ charge lane repositioning via threshold detectors
-                if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
-                    local slotPx = row._chargeSlotPx or 0
-
-                    for j = 1, row.maxCharges - 2 do
+                if row.middleLanes then
+                    for j = 1, #row.middleLanes do
                         local ml = row.middleLanes[j]
-                        if ml then
-                            local helperVisible = not detShown[row.maxCharges - j - 1]
-                            local newOffset = helperVisible and (j * slotPx) or 0
-                            if ml._lastChargeOffset ~= newOffset then
-                                local laneY = -(j * (laneH + 1))
-                                ml.depletedChargeBar:ClearAllPoints()
-                                ml.depletedChargeBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", newOffset, laneY)
-                                ml._lastChargeOffset = newOffset
-                            end
-                        end
-                    end
-
-                    if row.notDepletedHelperBar then
-                        local ndHelperCount = 0
-                        for T = 1, row.maxCharges - 1 do
-                            if not detShown[T] then
-                                ndHelperCount = ndHelperCount + 1
-                            end
-                        end
-                        local ndHelperPx = ndHelperCount * slotPx
-                        if row._lastNdHelperPx ~= ndHelperPx then
-                            local barH = row.cdBar.fullHeight or CONFIG.height
-                            local bottomY = -(barH - laneH)
-                            if ndHelperPx > 0 then
-                                row.notDepletedHelperBar:SetSize(ndHelperPx, laneH)
-                            else
-                                row.notDepletedHelperBar:SetSize(1, laneH)
-                            end
-                            row.normalChargeBar:ClearAllPoints()
-                            row.normalChargeBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", ndHelperPx, bottomY)
-                            row._lastNdHelperPx = ndHelperPx
+                        if ml and ml.activeSlide and ml._slideSpawnTime and GetTime() - ml._slideSpawnTime > maxSlideDur then
+                            ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                            DetachPastSlide(ml.activeSlide)
+                            ml.activeSlide = nil
+                            ml._slideSpawnTime = nil
                         end
                     end
                 end
+
 
             end
 
@@ -2401,12 +2473,10 @@ local function ResetBarState(bar)
         for _, ml in ipairs(bar.middleLanes) do
             ml.depletedChargeBar:SetAlpha(0)
             ml.depletedHelperBar:SetAlpha(0)
-            ml._lastChargeOffset = nil
             ml.activeSlide = nil
         end
     end
     if bar.notDepletedHelperBar then bar.notDepletedHelperBar:SetAlpha(0) end
-    bar._lastNdHelperPx = nil
     if bar.pastSlides then
         for _, slide in ipairs(bar.pastSlides) do
             slide.tex:Hide()
@@ -2448,6 +2518,12 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, spellID)
     if ovOk and ovID and ovID ~= spellID then
         bar.spellID = ovID
+    end
+
+    -- Initialize glow state for requireGlow feature
+    if C_SpellActivationOverlay and C_SpellActivationOverlay.IsSpellOverlayed then
+        local gOk, isOverlayed = pcall(C_SpellActivationOverlay.IsSpellOverlayed, bar.spellID)
+        bar.isGlowing = gOk and isOverlayed or false
     end
 
     local isChargeSpell = false
@@ -2536,7 +2612,6 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.cdBar:SetHeight(bar.cdBar.fullHeight)
     end
 
-    -- Children inherit parent alpha for compound visibility
     if isChargeSpell then
         local futureWidth = GetFutureWidth()
         local nowPx = GetNowPixelOffset()
@@ -2546,19 +2621,16 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         local laneH = (barHeight - (maxC - 1)) / maxC
         bar.cdBar.laneHeight = laneH
 
-        -- slotPx: offset for stagger layout
+        -- slotPx: charge duration in pixels
         local slotPx = 0
         if bar.chargeDurationConstant then
             slotPx = (bar.chargeDurationConstant / CONFIG.future) * futureWidth
             slotPx = math.max(1, math.min(slotPx, futureWidth))
         end
         bar._chargeSlotPx = slotPx
+        local chargeDurPx = slotPx > 0 and slotPx or futureWidth
 
-        -- Create depletedIndicator + wrapper frames lazily
         if not bar.depletedIndicator then
-            -- depletedIndicator: invisible VERTICAL StatusBar. SetMinMaxValues(0,1)
-            -- with SetValue(currentCharges) gives binary: 0=depleted, 1+=not.
-            -- Engine clamps above max. Texture TOP edge = clip boundary.
             bar.depletedIndicator = CreateFrame("StatusBar", nil, bar)
             bar.depletedIndicator:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
             bar.depletedIndicator:GetStatusBarTexture():SetAlpha(0)
@@ -2566,27 +2638,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             bar.depletedIndicator:SetMinMaxValues(0, 1)
             CrispBar(bar.depletedIndicator)
         end
-        -- Charge threshold detectors for 3+ charge spells.
-        -- Hidden StatusBars with SetMinMaxValues(T-1, T).
-        -- SetValue(currentCharges) in, GetStatusBarTexture():IsShown() out.
-        -- IsShown() = true when charges >= T. Engine-mediated, works with secrets.
-        if maxC > 2 then
-            bar.chargeDetectors = bar.chargeDetectors or {}
-            for T = 2, maxC - 1 do
-                if not bar.chargeDetectors[T] then
-                    bar.chargeDetectors[T] = CreateFrame("StatusBar", nil, bar)
-                    bar.chargeDetectors[T]:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
-                    bar.chargeDetectors[T]:GetStatusBarTexture():SetAlpha(0)
-                    bar.chargeDetectors[T]:SetMinMaxValues(T - 1, T)
-                    bar.chargeDetectors[T]:SetSize(1, 1)
-                    bar.chargeDetectors[T]:SetPoint("TOPLEFT", bar, "TOPLEFT", 0, 0)
-                    bar.chargeDetectors[T]:Show()
-                    CrispBar(bar.chargeDetectors[T])
-                end
-            end
-        end
         if not bar.depletedWrapper then
-            -- depletedWrapper: clip frame, visible when indicator 0% (depleted)
             bar.depletedWrapper = CreateFrame("Frame", nil, bar)
             bar.depletedWrapper:SetFrameLevel(bar:GetFrameLevel() + 1)
             bar.depletedWrapper:SetClipsChildren(true)
@@ -2601,7 +2653,6 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             bar.depletedChargeBar = CreateStatusBar(bar.depletedWrapper)
             bar.depletedChargeBar:Show()
 
-            -- notDepletedWrapper: clip frame, visible when indicator 100% (not depleted)
             bar.notDepletedWrapper = CreateFrame("Frame", nil, bar)
             bar.notDepletedWrapper:SetFrameLevel(bar:GetFrameLevel() + 1)
             bar.notDepletedWrapper:SetClipsChildren(true)
@@ -2610,40 +2661,34 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             bar.normalChargeBar:Show()
         end
 
-        -- depletedIndicator: overlays the future zone for anchor computation
         bar.depletedIndicator:ClearAllPoints()
         bar.depletedIndicator:SetSize(futureWidth, CONFIG.height)
         bar.depletedIndicator:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
         bar.depletedIndicator:SetValue(0)
         bar.depletedIndicator:Show()
 
-        -- depletedWrapper: clip from bar TOP down to indicator texture TOP.
-        -- At 0/N (0% fill): texture TOP = indicator BOTTOM → clip = full height.
-        -- At 1+/N (100% fill): texture TOP = indicator TOP → clip = 0 height.
+        -- depletedWrapper: visible at 0 charges, notDepletedWrapper: visible at 1+ charges
         bar.depletedWrapper:ClearAllPoints()
         bar.depletedWrapper:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
         bar.depletedWrapper:SetPoint("BOTTOMRIGHT", bar.depletedIndicator:GetStatusBarTexture(), "TOPRIGHT")
         bar.depletedWrapper:SetAlpha(1)
         bar.depletedWrapper:Show()
 
-        -- notDepletedWrapper: clip from indicator texture TOP down to bar BOTTOM.
-        -- At 0/N: texture TOP = indicator BOTTOM → clip = 0 height.
-        -- At 1+/N: texture TOP = indicator TOP → clip = full height.
         bar.notDepletedWrapper:ClearAllPoints()
         bar.notDepletedWrapper:SetPoint("TOPLEFT", bar.depletedIndicator:GetStatusBarTexture(), "TOPLEFT")
         bar.notDepletedWrapper:SetPoint("BOTTOMRIGHT", bar, "TOPLEFT", nowOffset + futureWidth, -CONFIG.height)
         bar.notDepletedWrapper:SetAlpha(1)
         bar.notDepletedWrapper:Show()
 
-        -- Position bars within depletedWrapper
         local bottomY = -(barHeight - laneH)
-
+        bar.depletedCdBar:SetParent(bar)
+        bar.depletedCdBar:SetFrameLevel(bar:GetFrameLevel() + 1)
         bar.depletedCdBar:ClearAllPoints()
         bar.depletedCdBar:SetSize(futureWidth, laneH)
-        bar.depletedCdBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", 0, 0)
+        bar.depletedCdBar:SetMinMaxValues(0, CONFIG.future)
+        bar.depletedCdBar:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
         bar.depletedCdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
 
-        -- Bottom lane stagger scales with charge count
         local bottomSlotPx = (maxC - 1) * slotPx
         bar.depletedHelperBar:ClearAllPoints()
         bar.depletedHelperBar:SetSize(math.max(1, bottomSlotPx), laneH)
@@ -2651,18 +2696,18 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.depletedHelperBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
 
         bar.depletedChargeBar:ClearAllPoints()
-        bar.depletedChargeBar:SetSize(futureWidth, laneH)
+        bar.depletedChargeBar:SetSize(chargeDurPx, laneH)
+        bar.depletedChargeBar:SetMinMaxValues(0, 1)
         bar.depletedChargeBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", bottomSlotPx, bottomY)
         bar.depletedChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
 
-        -- Position bars within notDepletedWrapper
         bar.normalChargeBar:ClearAllPoints()
-        bar.normalChargeBar:SetSize(futureWidth, laneH)
+        bar.normalChargeBar:SetSize(chargeDurPx, laneH)
+        bar.normalChargeBar:SetMinMaxValues(0, 1)
         bar.normalChargeBar:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
         bar.normalChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
 
-        -- Bottom lane helper in notDepletedWrapper for 3+ charges
-        -- Shows stagger for depleted charges when the spell is still usable (1+/N)
+        -- 3+ charge bottom lane helper + spacer in notDepletedWrapper
         if maxC > 2 then
             if not bar.notDepletedHelperBar then
                 bar.notDepletedHelperBar = CreateFrame("StatusBar", nil, bar.notDepletedWrapper)
@@ -2674,35 +2719,78 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 bar.notDepletedHelperBar:GetStatusBarTexture():SetVertTile(false)
                 CrispBar(bar.notDepletedHelperBar)
             end
+
+            if not bar.ndHelperSpacer then
+                bar.ndHelperSpacer = CreateFrame("StatusBar", nil, bar.notDepletedWrapper)
+                bar.ndHelperSpacer:SetStatusBarTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
+                bar.ndHelperSpacer:SetReverseFill(true)
+                bar.ndHelperSpacer:GetStatusBarTexture():SetAlpha(0)
+            end
+            bar.ndHelperSpacer:SetMinMaxValues(0, maxC - 1)
+            bar.ndHelperSpacer:SetSize(math.max(1, bottomSlotPx), laneH)
+            bar.ndHelperSpacer:ClearAllPoints()
+            bar.ndHelperSpacer:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+            bar.ndHelperSpacer:SetValue(0)
+            bar.ndHelperSpacer:Show()
+
             bar.notDepletedHelperBar:ClearAllPoints()
-            bar.notDepletedHelperBar:SetSize(math.max(1, bottomSlotPx), laneH)
             bar.notDepletedHelperBar:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+            bar.notDepletedHelperBar:SetPoint("BOTTOMRIGHT", bar.ndHelperSpacer:GetStatusBarTexture(), "BOTTOMLEFT")
             bar.notDepletedHelperBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
             bar.notDepletedHelperBar:SetAlpha(0)
             bar.notDepletedHelperBar:Show()
+
+            bar.normalChargeBar:ClearAllPoints()
+            bar.normalChargeBar:SetPoint("TOPLEFT", bar.ndHelperSpacer:GetStatusBarTexture(), "TOPLEFT")
         elseif bar.notDepletedHelperBar then
             bar.notDepletedHelperBar:Hide()
+            if bar.ndHelperSpacer then bar.ndHelperSpacer:Hide() end
         end
 
-        -- Middle lane charge bars for 3+ charge spells
-        -- Parented to bar (not depletedWrapper) so wrapper alpha doesn't hide them.
-        -- Alpha driven per-lane by charge threshold detectors in the OnUpdate.
+        -- Middle lanes (3+ charges): clip indicator + wrapper per threshold
         bar.middleLanes = bar.middleLanes or {}
+        bar.middleClipIndicators = bar.middleClipIndicators or {}
+        bar.middleClipWrappers = bar.middleClipWrappers or {}
         if maxC > 2 then
             local wrapperLevel = bar:GetFrameLevel() + 1
             for j = 1, maxC - 2 do
+                if not bar.middleClipIndicators[j] then
+                    bar.middleClipIndicators[j] = CreateFrame("StatusBar", nil, bar)
+                    bar.middleClipIndicators[j]:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+                    bar.middleClipIndicators[j]:GetStatusBarTexture():SetAlpha(0)
+                    bar.middleClipIndicators[j]:SetOrientation("VERTICAL")
+                    CrispBar(bar.middleClipIndicators[j])
+                end
+                bar.middleClipIndicators[j]:ClearAllPoints()
+                bar.middleClipIndicators[j]:SetMinMaxValues(maxC - j - 1, maxC - j)
+                bar.middleClipIndicators[j]:SetSize(futureWidth, CONFIG.height)
+                bar.middleClipIndicators[j]:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
+                bar.middleClipIndicators[j]:SetValue(0)
+                bar.middleClipIndicators[j]:Show()
+
+                if not bar.middleClipWrappers[j] then
+                    bar.middleClipWrappers[j] = CreateFrame("Frame", nil, bar)
+                    bar.middleClipWrappers[j]:SetClipsChildren(true)
+                end
+                bar.middleClipWrappers[j]:SetFrameLevel(wrapperLevel)
+                bar.middleClipWrappers[j]:ClearAllPoints()
+                bar.middleClipWrappers[j]:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
+                bar.middleClipWrappers[j]:SetPoint("BOTTOMRIGHT",
+                    bar.middleClipIndicators[j]:GetStatusBarTexture(), "TOPRIGHT")
+                bar.middleClipWrappers[j]:Show()
+
                 if not bar.middleLanes[j] then
                     local ml = {}
-                    ml.depletedChargeBar = CreateFrame("StatusBar", nil, bar)
+                    ml.depletedChargeBar = CreateFrame("StatusBar", nil, bar.middleClipWrappers[j])
                     ml.depletedChargeBar:SetFrameLevel(wrapperLevel)
                     ml.depletedChargeBar:SetStatusBarTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
-                    ml.depletedChargeBar:SetMinMaxValues(0, CONFIG.future)
+                    ml.depletedChargeBar:SetMinMaxValues(0, 1)
                     ml.depletedChargeBar:SetOrientation("HORIZONTAL")
                     ml.depletedChargeBar:GetStatusBarTexture():SetHorizTile(false)
                     ml.depletedChargeBar:GetStatusBarTexture():SetVertTile(false)
                     CrispBar(ml.depletedChargeBar)
 
-                    ml.depletedHelperBar = CreateFrame("StatusBar", nil, bar)
+                    ml.depletedHelperBar = CreateFrame("StatusBar", nil, bar.depletedWrapper)
                     ml.depletedHelperBar:SetFrameLevel(wrapperLevel)
                     ml.depletedHelperBar:SetStatusBarTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
                     ml.depletedHelperBar:SetMinMaxValues(0, 1)
@@ -2713,12 +2801,14 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                     CrispBar(ml.depletedHelperBar)
 
                     bar.middleLanes[j] = ml
+                else
+                    bar.middleLanes[j].depletedChargeBar:SetParent(bar.middleClipWrappers[j])
+                    bar.middleLanes[j].depletedHelperBar:SetParent(bar.depletedWrapper)
                 end
                 local ml = bar.middleLanes[j]
                 local laneY = -(j * (laneH + 1))
                 local mlSlotPx = j * slotPx
 
-                -- Anchored to depletedWrapper for position, but parented to bar for alpha
                 ml.depletedHelperBar:ClearAllPoints()
                 ml.depletedHelperBar:SetSize(math.max(1, mlSlotPx), laneH)
                 ml.depletedHelperBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", 0, laneY)
@@ -2726,15 +2816,27 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 ml.depletedHelperBar:SetAlpha(0)
                 ml.depletedHelperBar:Show()
 
+                if not ml.helperSpacer then
+                    ml.helperSpacer = CreateFrame("StatusBar", nil, bar.middleClipWrappers[j])
+                    ml.helperSpacer:SetStatusBarTexture("Interface\\AddOns\\EventHorizon_Infall\\Smooth")
+                    ml.helperSpacer:SetReverseFill(true)
+                    ml.helperSpacer:GetStatusBarTexture():SetAlpha(0)
+                end
+                ml.helperSpacer:SetMinMaxValues(0, 1)
+                ml.helperSpacer:SetSize(math.max(1, mlSlotPx), laneH)
+                ml.helperSpacer:ClearAllPoints()
+                ml.helperSpacer:SetPoint("TOPLEFT", bar.middleClipWrappers[j], "TOPLEFT", 0, laneY)
+                ml.helperSpacer:SetValue(0)
+                ml.helperSpacer:Show()
+
                 ml.depletedChargeBar:ClearAllPoints()
-                ml.depletedChargeBar:SetSize(futureWidth, laneH)
-                ml.depletedChargeBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", mlSlotPx, laneY)
+                ml.depletedChargeBar:SetSize(chargeDurPx, laneH)
+                ml.depletedChargeBar:SetMinMaxValues(0, 1)
+                ml.depletedChargeBar:SetPoint("TOPLEFT", ml.helperSpacer:GetStatusBarTexture(), "TOPLEFT")
                 ml.depletedChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
-                ml.depletedChargeBar:SetAlpha(0)
                 ml.depletedChargeBar:Show()
             end
         end
-        -- Hide excess middle lanes from previous bar assignment
         for j = (maxC > 2 and maxC - 1 or 1), #bar.middleLanes do
             local ml = bar.middleLanes[j]
             if ml then
@@ -2745,9 +2847,14 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                     ml.activeSlide = nil
                 end
             end
+            if bar.middleClipIndicators and bar.middleClipIndicators[j] then
+                bar.middleClipIndicators[j]:Hide()
+            end
+            if bar.middleClipWrappers and bar.middleClipWrappers[j] then
+                bar.middleClipWrappers[j]:Hide()
+            end
         end
 
-        -- wrappers take over
         bar.cdBar:Hide()
     
     else
@@ -2769,6 +2876,8 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
 end
 
 LoadEssentialCooldowns = function()
+    CleanupActiveCast()
+    activeCast = nil
     for _, bar in ipairs(cooldownBars) do bar:Hide() end
     wipe(cooldownBars)
     
@@ -2988,49 +3097,96 @@ end
 ns.ApplyECMVisibility = ApplyECMVisibility
 
 local function ForceViewersAlways()
-    local CDM_VIS_SETTING = 6
-    local VIS_ALWAYS = 0
-    local CDM_HIDE_INACTIVE = 8
-    local changed = false
-    local mgr = EditModeManagerFrame
-    if not mgr or not mgr.OnSystemSettingChange then return false end
-
-    -- Preset layouts (Modern/Classic) don't persist changes
-    local isPreset = false
-    if mgr.GetActiveLayoutInfo then
-        local ok, layoutInfo = pcall(mgr.GetActiveLayoutInfo, mgr)
-        if ok and layoutInfo and layoutInfo.layoutType then
-            isPreset = (layoutInfo.layoutType == (Enum.EditModeLayoutType and Enum.EditModeLayoutType.Preset))
-        end
-    end
-
+    -- Fast path: check if VisibleSetting already correct via frame properties (read-only)
+    local allCorrect = true
     for _, name in ipairs(ecmFrameNames) do
         local viewer = _G[name]
         if viewer then
-            if viewer.visibleSetting and viewer.visibleSetting ~= VIS_ALWAYS then
-                pcall(mgr.OnSystemSettingChange, mgr, viewer, CDM_VIS_SETTING, VIS_ALWAYS)
-                changed = true
-            end
-            -- BuffIcon viewer: force HideWhenInactive off so buff frames stay populated
-            if name == "BuffIconCooldownViewer" then
-                local hideOk, hideVal = pcall(function()
-                    return viewer:GetSettingValue(CDM_HIDE_INACTIVE)
-                end)
-                if hideOk and hideVal and hideVal ~= 0 then
-                    pcall(mgr.OnSystemSettingChange, mgr, viewer, CDM_HIDE_INACTIVE, 0)
-                    changed = true
-                end
+            if viewer.visibleSetting == nil or viewer.visibleSetting ~= 0 then
+                allCorrect = false
+                break
             end
         end
     end
-    if changed and mgr.SaveLayouts then
-        pcall(mgr.SaveLayouts, mgr)
+    if allCorrect then return false end
+
+    -- Settings need fixing: modify saved layout data via C_EditMode (no frame interaction)
+    if not C_EditMode or not C_EditMode.GetLayouts or not C_EditMode.SaveLayouts then
+        return false
     end
-    if changed and isPreset then
-        print("|cff00ff00[Infall]|r Warning: You are using a preset Edit Mode layout. CDM viewer changes may not persist. Create a custom layout for permanent settings.")
+
+    local ok, layoutInfo = pcall(C_EditMode.GetLayouts)
+    if not ok or type(layoutInfo) ~= "table" then return false end
+
+    local layouts = layoutInfo.layouts
+    local activeIdx = layoutInfo.activeLayout
+    if type(layouts) ~= "table" or type(activeIdx) ~= "number" then return false end
+
+    -- Prepend preset layouts so activeLayout index resolves correctly.
+    if EditModePresetLayoutManager and EditModePresetLayoutManager.GetCopyOfPresetLayouts then
+        local presetOk, presets = pcall(EditModePresetLayoutManager.GetCopyOfPresetLayouts, EditModePresetLayoutManager)
+        if presetOk and type(presets) == "table" then
+            tAppendAll(presets, layouts)
+            layoutInfo.layouts = presets
+        end
     end
-    return changed
+
+    local activeLayout = layoutInfo.layouts[activeIdx]
+    if not activeLayout or type(activeLayout.systems) ~= "table" then return false end
+
+    local isPreset = activeLayout.layoutType == (Enum.EditModeLayoutType and Enum.EditModeLayoutType.Preset)
+    local CDM_SYSTEM = Enum.EditModeSystem and Enum.EditModeSystem.CooldownViewer
+    if not CDM_SYSTEM then return false end
+
+    local VIS_SETTING = 6  -- EditModeCooldownViewerSetting.VisibleSetting
+    local VIS_ALWAYS = 0   -- CooldownViewerVisibleSetting.Always
+
+    local changed = false
+    for _, systemInfo in ipairs(activeLayout.systems) do
+        if systemInfo.system == CDM_SYSTEM and type(systemInfo.settings) == "table" then
+            local foundVis = false
+            for _, s in ipairs(systemInfo.settings) do
+                if s.setting == VIS_SETTING then
+                    foundVis = true
+                    if s.value ~= VIS_ALWAYS then
+                        s.value = VIS_ALWAYS
+                        changed = true
+                    end
+                end
+            end
+            if not foundVis then
+                systemInfo.settings[#systemInfo.settings + 1] = { setting = VIS_SETTING, value = VIS_ALWAYS }
+                changed = true
+            end
+        end
+    end
+
+    if not changed then return false end
+
+    if isPreset and not ns._presetWarningShown then
+        ns._presetWarningShown = true
+        print("|cff00ff00[Infall]|r CDM viewers need to be set to Always. Open Edit Mode and change each viewer's visibility, or create a custom layout.")
+    end
+
+    pcall(C_EditMode.SaveLayouts, layoutInfo)
+    return true
 end
+
+local function GetCDMStatus()
+    local cvarEnabled = C_CVar and C_CVar.GetCVarBool("cooldownViewerEnabled")
+    local allAlways = true
+    for _, name in ipairs(ecmFrameNames) do
+        local viewer = _G[name]
+        if viewer then
+            if viewer.visibleSetting == nil or viewer.visibleSetting ~= 0 then
+                allAlways = false
+            end
+        end
+    end
+    return cvarEnabled, allAlways
+end
+ns.GetCDMStatus = GetCDMStatus
+ns.ForceViewersAlways = ForceViewersAlways
 
 local function ApplyCastBarVisibility()
     if InCombatLockdown() then return end
@@ -3070,11 +3226,8 @@ loginInitFrame:SetScript("OnEvent", function()
         print("|cff00ff00[Infall]|r Enabled the Cooldown Manager. Infall requires it to function.")
     end
 
-    -- Force all CDM viewers to "Always" visibility so frames are always populated
-    -- Infall uses SetAlpha(0) to hide them when hideBlizzECM is true
-    if ForceViewersAlways() then
-        print("|cff00ff00[Infall]|r Cooldown viewer visibility set to Always. Use |cffffff00/infall ecm|r to toggle visibility.")
-    end
+    -- Save CDM viewer settings to "Always" in layout data (no frame interaction, no taint)
+    if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
 
     PreCacheChargeSpells()
 
@@ -3117,8 +3270,7 @@ loginInitFrame:SetScript("OnEvent", function()
         end
     end
 
-    -- Buff data polling at 10Hz in OnUpdate replaces all CDM buff frame hooks.
-    -- No SetAuraInstanceInfo, OnAcquireItemFrame, or RefreshLayout hooks needed.
+    -- Buff data polling handled by 10Hz UpdateBars in OnUpdate.
 
     EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
         if InCombatLockdown() then return end
@@ -3232,6 +3384,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         
     elseif event == "PLAYER_ENTERING_WORLD" then
         C_Timer.After(2, function()
+            if ns.EnrichAllMappings then ns.EnrichAllMappings() end
             if #cooldownBars == 0 then LoadEssentialCooldowns() end
         end)
         C_Timer.After(2.5, UpdateVisibility)
@@ -3241,10 +3394,10 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 ns._pendingECMReapply = true
                 return
             end
-            ForceViewersAlways()
+            if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
             ApplyECMVisibility()
         end)
-        
+
     elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_CHARGES" then
         -- If bars haven't been loaded yet (first GCD before 2s timer), load now
         if #cooldownBars == 0 then
@@ -3267,6 +3420,13 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
 
         UpdateBars()
+
+        -- Event-driven charge bar fill (OctoChargeBar pattern)
+        for _, row in ipairs(cooldownBars) do
+            if row.isChargeSpell then
+                FeedChargeBarTimers(row)
+            end
+        end
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
@@ -3292,6 +3452,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 if row.isChargeSpell then
                     row.chargesAvailable = math.max((row.chargesAvailable or 0) - 1, 0)
                     FeedChargeHiddenFrames(row)
+                    FeedChargeBarTimers(row)
                     UpdateBars()
                     ScheduleDeferredUpdate(0)
                 end
@@ -3470,6 +3631,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         row.chargesAvailable = row.maxCharges or 2
                     end
                     FeedChargeHiddenFrames(row)
+                    FeedChargeBarTimers(row)
                 end
 
 
@@ -3478,7 +3640,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             -- Re-apply ECM visibility if PEW timer was blocked by combat
             if ns._pendingECMReapply then
                 ns._pendingECMReapply = nil
-                ForceViewersAlways()
+                if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
                 ApplyECMVisibility()
             end
         end
