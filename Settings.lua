@@ -17,6 +17,7 @@ local TOGGLE_KEYS = {
     "pandemicPulse", "locked", "hideBlizzCastBar", "hideBlizzECM",
     "buffLayerAbove", "hideIcons", "clickthrough",
     "showVariantNames", "smoothBars", "showPastBars",
+    "forceViewersAlways",
 }
 
 local DISPLAY_KEYS = {
@@ -48,6 +49,39 @@ local function DeepCopy(v)
         copy[k] = DeepCopy(val)
     end
     return copy
+end
+
+local VARIANT_PALETTE = {
+    {0.9, 0.5, 0.1, 0.6},
+    {0.3, 0.8, 0.3, 0.6},
+    {0.9, 0.2, 0.9, 0.6},
+    {0.8, 0.8, 0.2, 0.6},
+    {0.2, 0.8, 0.8, 0.6},
+}
+
+local function EnrichWithLinkedSpells(mapData)
+    if not mapData or mapData.spellColorMap then return end
+    if not mapData.buffCooldownIDs or not mapData.buffCooldownIDs[1] then return end
+    if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
+
+    local buffCdID = mapData.buffCooldownIDs[1]
+    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+    if not ok or not info then return end
+    if not info.linkedSpellIDs or #info.linkedSpellIDs == 0 then return end
+
+    mapData.spellColorMap = {}
+    for i, linkedID in ipairs(info.linkedSpellIDs) do
+        mapData.spellColorMap[linkedID] = DeepCopy(VARIANT_PALETTE[((i - 1) % #VARIANT_PALETTE) + 1])
+    end
+end
+
+function ns.EnrichAllMappings()
+    if not CONFIG.buffMappings then return end
+    for _, mappings in pairs(CONFIG.buffMappings) do
+        for _, mapData in ipairs(mappings) do
+            EnrichWithLinkedSpells(mapData)
+        end
+    end
 end
 
 function ns.GetSpecKey()
@@ -145,6 +179,26 @@ function ns.ApplyProfile(profile)
     if profile.pairings then
         CONFIG.buffMappings = DeepCopy(profile.pairings)
     end
+
+    -- Merge class config defaults for cooldownIDs the profile doesn't cover
+    if ns.classConfigDefaults and ns.classConfigDefaults.pairings then
+        CONFIG.buffMappings = CONFIG.buffMappings or {}
+        for cdID, defaultMappings in pairs(ns.classConfigDefaults.pairings) do
+            if not CONFIG.buffMappings[cdID] then
+                CONFIG.buffMappings[cdID] = DeepCopy(defaultMappings)
+            end
+        end
+    end
+
+    -- Auto-detect variant spells for any mapping missing spellColorMap
+    if CONFIG.buffMappings then
+        for _, mappings in pairs(CONFIG.buffMappings) do
+            for _, mapData in ipairs(mappings) do
+                EnrichWithLinkedSpells(mapData)
+            end
+        end
+    end
+
     if profile.extraCasts then
         CONFIG.extraCasts = DeepCopy(profile.extraCasts)
     end
@@ -772,8 +826,7 @@ local function BuildSettings()
     if settingsBuilt then return end
     settingsBuilt = true
 
-    -- Bars.lua is always loaded before BuildSettings runs. Local aliases avoid
-    -- 22+ redundant "if ns.X then" guards throughout this function.
+    -- Local aliases for Bars.lua functions.
     local LoadEssentialCooldowns = ns.LoadEssentialCooldowns
     local ApplyLayoutToAllBars = ns.ApplyLayoutToAllBars
 
@@ -809,10 +862,10 @@ local function BuildSettings()
                 ns.ApplyProfile(ns.classConfigDefaults)
                 ns.SaveCurrentProfile()
                 LoadEssentialCooldowns()
-                -- Force switch to Bars tab so user sees restored buff assignments
+                -- Switch to Bars tab after reset.
                 C_Timer.After(0, function()
                     SelectTab(1)
-                    -- Also directly refresh cooldown rows in case OnShow didn't fire
+                    -- Refresh cooldown rows and buff pool.
                     if RefreshCooldownRows then RefreshCooldownRows() end
                     if RefreshBuffPool then RefreshBuffPool() end
                 end)
@@ -1274,12 +1327,20 @@ local function BuildSettings()
         tex:SetPoint("BOTTOMRIGHT", -1, 1)
         tex:SetColorTexture(0.4, 0.4, 0.9, 0.6)
         btn.tex = tex
+
+        local procDot = btn:CreateTexture(nil, "OVERLAY", nil, 2)
+        procDot:SetSize(6, 6)
+        procDot:SetPoint("TOPRIGHT", -1, -1)
+        procDot:SetColorTexture(1, 0.8, 0, 1)
+        procDot:Hide()
+        btn.procDot = procDot
+
         btn:Hide()
 
         return btn
     end
 
-    -- Cached empty-state text (WoW FontStrings can't be GC'd, so reuse one per pool)
+    -- Cached empty-state text (one per pool).
     local emptyRowsText, emptyBuffsText, emptyCastsText
 
     -- Refresh Cooldown Rows
@@ -1500,8 +1561,7 @@ local function BuildSettings()
                 end)
                 buff2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-                -- Look up by CDM cooldownID first. If not found, try spellID as fallback
-                -- because ClassConfig may have used spellIDs as keys instead of CDM cooldownIDs.
+                -- Look up by CDM cooldownID first, fall back to spellID.
                 local mappings = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                 if not mappings and spellID and spellID ~= cooldownID and CONFIG.buffMappings then
                     mappings = CONFIG.buffMappings[spellID]
@@ -1528,6 +1588,7 @@ local function BuildSettings()
                             local bc = mappings[1].color
                             buff1ColorBtn.tex:SetColorTexture(bc[1], bc[2], bc[3], bc[4] or 1)
                             buff1ColorBtn:Show()
+                            buff1ColorBtn.procDot:SetShown(mappings[1].requireGlow == true)
                         end
                     end
                     -- Second mapping -> Buff 2 slot
@@ -1545,6 +1606,7 @@ local function BuildSettings()
                             local oc = mappings[2].color
                             buff2ColorBtn.tex:SetColorTexture(oc[1], oc[2], oc[3], oc[4] or 1)
                             buff2ColorBtn:Show()
+                            buff2ColorBtn.procDot:SetShown(mappings[2].requireGlow == true)
                         end
                     end
                 end
@@ -1557,6 +1619,7 @@ local function BuildSettings()
                             self.pairedColor = nil
                             slot.icon:Hide()
                             colorBtn:Hide()
+                            colorBtn.procDot:Hide()
                             local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                             if m then
                                 if slotIndex == 1 then
@@ -1612,6 +1675,7 @@ local function BuildSettings()
                                 buffCooldownIDs = {buffCdID},
                                 color = defaultColor,
                             }
+                            EnrichWithLinkedSpells(mapping)
                             if slotIndex == 1 then
                                 CONFIG.buffMappings[cooldownID][1] = mapping
                             else
@@ -1629,12 +1693,17 @@ local function BuildSettings()
                 buff2Slot:SetScript("OnClick", PairToSlot(buff2Slot, buff2ColorBtn, 2))
 
                 -- Colour picker for Buff 1
+                buff1ColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
                 buff1ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if m and m[1] and m[1].spellColorMap then
                         GameTooltip:SetText("Buff 1 Variant Colours")
                         GameTooltip:AddLine("Click to change colours for each buff variant.", 0.7, 0.7, 0.7, true)
+                        if m[1].requireGlow then
+                            GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
+                        end
+                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
                     else
                         GameTooltip:SetText("Buff 1 Colour")
                         GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
@@ -1642,8 +1711,16 @@ local function BuildSettings()
                     GameTooltip:Show()
                 end)
                 buff1ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-                buff1ColorBtn:SetScript("OnClick", function()
+                buff1ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    if button == "RightButton" then
+                        if m and m[1] and m[1].spellColorMap then
+                            m[1].requireGlow = not m[1].requireGlow
+                            self.procDot:SetShown(m[1].requireGlow == true)
+                            ns.SaveCurrentProfile()
+                        end
+                        return
+                    end
                     if m and m[1] and m[1].spellColorMap then
                         ShowVariantPopup(buff1ColorBtn, cooldownID, 1)
                     else
@@ -1658,12 +1735,17 @@ local function BuildSettings()
                 end)
 
                 -- Colour picker for Buff 2
+                buff2ColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
                 buff2ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if m and m[2] and m[2].spellColorMap then
                         GameTooltip:SetText("Buff 2 Variant Colours")
                         GameTooltip:AddLine("Click to change colours for each buff variant.", 0.7, 0.7, 0.7, true)
+                        if m[2].requireGlow then
+                            GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
+                        end
+                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
                     else
                         GameTooltip:SetText("Buff 2 Colour")
                         GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
@@ -1671,8 +1753,16 @@ local function BuildSettings()
                     GameTooltip:Show()
                 end)
                 buff2ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-                buff2ColorBtn:SetScript("OnClick", function()
+                buff2ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    if button == "RightButton" then
+                        if m and m[2] and m[2].spellColorMap then
+                            m[2].requireGlow = not m[2].requireGlow
+                            self.procDot:SetShown(m[2].requireGlow == true)
+                            ns.SaveCurrentProfile()
+                        end
+                        return
+                    end
                     if m and m[2] and m[2].spellColorMap then
                         ShowVariantPopup(buff2ColorBtn, cooldownID, 2)
                     else
@@ -2147,7 +2237,7 @@ local function BuildSettings()
         local castSpells = {}
         local seen = {}
 
-        -- Tooltip scan: the C++ engine tags channeled spells with the SPELL_CAST_CHANNELED global string
+        -- Tooltip scan: detect channeled spells via SPELL_CAST_CHANNELED global string.
         local function IsChanneled(sid)
             local tipOk, data = pcall(C_TooltipInfo.GetSpellByID, sid)
             if tipOk and data and data.lines then
@@ -3067,13 +3157,6 @@ local function BuildSettings()
     end)
     AddTogWidget(castBarCheck)
 
-    local ecmCheck = CreateCheckbox(togContent, "Hide Cooldown Manager", "Hide Blizzard's cooldown viewer frames", CONFIG.hideBlizzECM, function(v)
-        CONFIG.hideBlizzECM = v
-        if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
-        ns.SaveCurrentProfile()
-    end)
-    AddTogWidget(ecmCheck)
-
     local lockedCheck = CreateCheckbox(togContent, "Locked", "Lock frame position (prevent dragging)", CONFIG.locked, function(v)
         CONFIG.locked = v
         ns.SaveCurrentProfile()
@@ -3125,6 +3208,65 @@ local function BuildSettings()
     end)
     AddTogWidget(variantNamesCheck)
 
+    -- ---- Cooldown Manager ----
+    AddTogHeader("Cooldown Manager")
+
+    local cdmStatusText = togContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    cdmStatusText:SetPoint("TOPLEFT", togContent, "TOPLEFT", 14, -togY)
+    cdmStatusText:SetJustifyH("LEFT")
+    cdmStatusText:SetWidth(500)
+    cdmStatusText:SetText("CDM: Checking...")
+    togY = togY + 18
+
+    local cdmDetailText = togContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    cdmDetailText:SetPoint("TOPLEFT", togContent, "TOPLEFT", 14, -togY)
+    cdmDetailText:SetJustifyH("LEFT")
+    cdmDetailText:SetWidth(500)
+    cdmDetailText:SetSpacing(2)
+    cdmDetailText:SetText("")
+    togY = togY + 26
+
+    local function RefreshCDMStatus()
+        if InCombatLockdown() then return end
+        if not ns.GetCDMStatus then
+            cdmStatusText:SetText("|cffFF6666CDM: Not loaded|r")
+            cdmDetailText:SetText("")
+            return
+        end
+        local cvarOn, allAlways = ns.GetCDMStatus()
+        if not cvarOn then
+            cdmStatusText:SetText("|cffFF6666CDM: Disabled|r")
+            cdmDetailText:SetText("The Cooldown Manager CVar is off. Infall enables it automatically at login.")
+        elseif not allAlways then
+            cdmStatusText:SetText("|cffFFD100CDM: Not Always Visible|r")
+            cdmDetailText:SetText("One or more CDM viewers not set to Always. Open Edit Mode and set each viewer to Always.")
+        else
+            cdmStatusText:SetText("|cff00FF00CDM: OK|r")
+            cdmDetailText:SetText("All viewers set to Always.")
+        end
+    end
+
+    local forceAlwaysCheck = CreateCheckbox(togContent, "Force Always Visible",
+        "Infall requires CDM viewers set to Always so buff and cooldown frames stay populated. Disable only if another addon manages CDM visibility.",
+        CONFIG.forceViewersAlways ~= false, function(v)
+            CONFIG.forceViewersAlways = v
+            if v and not InCombatLockdown() then
+                if ns.ForceViewersAlways then ns.ForceViewersAlways() end
+            end
+            ns.SaveCurrentProfile()
+            RefreshCDMStatus()
+        end)
+    AddTogWidget(forceAlwaysCheck)
+
+    local ecmCheck = CreateCheckbox(togContent, "Hide Cooldown Icons",
+        "Hide Blizzard's cooldown viewer icons with opacity. Infall still reads their data in the background.",
+        CONFIG.hideBlizzECM, function(v)
+            CONFIG.hideBlizzECM = v
+            if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
+            ns.SaveCurrentProfile()
+        end)
+    AddTogWidget(ecmCheck)
+
     -- Utility Buttons
     AddTogHeader("Utility")
 
@@ -3173,13 +3315,15 @@ local function BuildSettings()
         redshiftCheck:SetChecked(CONFIG.redshift)
         pandemicCheck:SetChecked(CONFIG.pandemicPulse)
         castBarCheck:SetChecked(CONFIG.hideBlizzCastBar)
-        ecmCheck:SetChecked(CONFIG.hideBlizzECM)
         lockedCheck:SetChecked(CONFIG.locked)
         buffLayerCheck:SetChecked(CONFIG.buffLayerAbove)
         hideIconsCheck:SetChecked(CONFIG.hideIcons)
         clickthroughCheck:SetChecked(CONFIG.clickthrough or false)
         pastBarsCheck:SetChecked(CONFIG.showPastBars ~= false)
         variantNamesCheck:SetChecked(CONFIG.showVariantNames or false)
+        forceAlwaysCheck:SetChecked(CONFIG.forceViewersAlways ~= false)
+        ecmCheck:SetChecked(CONFIG.hideBlizzECM)
+        RefreshCDMStatus()
     end)
 
     -- ========================================================================
