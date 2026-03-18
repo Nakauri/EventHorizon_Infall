@@ -14,7 +14,8 @@ InfallDB.namedProfiles = InfallDB.namedProfiles or {}
 
 local TOGGLE_KEYS = {
     "reactiveIcons", "desaturateOnCooldown", "redshift",
-    "pandemicPulse", "locked", "hideBlizzCastBar", "hideBlizzECM",
+    "pandemicPulse", "locked", "hideBlizzCastBar",
+    "hideEssentialCD", "hideUtilityCD", "hideBuffIconCD", "hideBuffBarCD",
     "buffLayerAbove", "hideIcons", "clickthrough",
     "showVariantNames", "smoothBars", "showPastBars",
     "forceViewersAlways",
@@ -152,6 +153,14 @@ function ns.ApplyProfile(profile)
     if not profile then return end
 
     if profile.toggles then
+        -- Migrate old hideBlizzECM in saved profiles
+        if profile.toggles.hideBlizzECM ~= nil then
+            local v = profile.toggles.hideBlizzECM and true or false
+            for _, k in ipairs({"hideEssentialCD", "hideUtilityCD", "hideBuffIconCD", "hideBuffBarCD"}) do
+                if profile.toggles[k] == nil then profile.toggles[k] = v end
+            end
+            profile.toggles.hideBlizzECM = nil
+        end
         for _, key in ipairs(TOGGLE_KEYS) do
             if profile.toggles[key] ~= nil then
                 CONFIG[key] = profile.toggles[key]
@@ -3258,14 +3267,41 @@ local function BuildSettings()
         end)
     AddTogWidget(forceAlwaysCheck)
 
-    local ecmCheck = CreateCheckbox(togContent, "Hide Cooldown Icons",
-        "Hide Blizzard's cooldown viewer icons with opacity. Infall still reads their data in the background.",
-        CONFIG.hideBlizzECM, function(v)
-            CONFIG.hideBlizzECM = v
+    local hideEssentialCheck = CreateCheckbox(togContent, "Hide Essential CDs",
+        "Hide Blizzard's Essential Cooldown viewer (rotational abilities).",
+        CONFIG.hideEssentialCD, function(v)
+            CONFIG.hideEssentialCD = v
             if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
             ns.SaveCurrentProfile()
         end)
-    AddTogWidget(ecmCheck)
+    AddTogWidget(hideEssentialCheck)
+
+    local hideUtilityCheck = CreateCheckbox(togContent, "Hide Utility CDs",
+        "Hide Blizzard's Utility Cooldown viewer (defensives, interrupts).",
+        CONFIG.hideUtilityCD, function(v)
+            CONFIG.hideUtilityCD = v
+            if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
+            ns.SaveCurrentProfile()
+        end)
+    AddTogWidget(hideUtilityCheck)
+
+    local hideBuffIconCheck = CreateCheckbox(togContent, "Hide Buff Icons",
+        "Hide Blizzard's Buff Icon Cooldown viewer.",
+        CONFIG.hideBuffIconCD, function(v)
+            CONFIG.hideBuffIconCD = v
+            if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
+            ns.SaveCurrentProfile()
+        end)
+    AddTogWidget(hideBuffIconCheck)
+
+    local hideBuffBarCheck = CreateCheckbox(togContent, "Hide Buff Bars",
+        "Hide Blizzard's Buff Bar Cooldown viewer.",
+        CONFIG.hideBuffBarCD, function(v)
+            CONFIG.hideBuffBarCD = v
+            if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
+            ns.SaveCurrentProfile()
+        end)
+    AddTogWidget(hideBuffBarCheck)
 
     -- Utility Buttons
     AddTogHeader("Utility")
@@ -3322,7 +3358,10 @@ local function BuildSettings()
         pastBarsCheck:SetChecked(CONFIG.showPastBars ~= false)
         variantNamesCheck:SetChecked(CONFIG.showVariantNames or false)
         forceAlwaysCheck:SetChecked(CONFIG.forceViewersAlways ~= false)
-        ecmCheck:SetChecked(CONFIG.hideBlizzECM)
+        hideEssentialCheck:SetChecked(CONFIG.hideEssentialCD)
+        hideUtilityCheck:SetChecked(CONFIG.hideUtilityCD)
+        hideBuffIconCheck:SetChecked(CONFIG.hideBuffIconCD)
+        hideBuffBarCheck:SetChecked(CONFIG.hideBuffBarCD)
         RefreshCDMStatus()
     end)
 
