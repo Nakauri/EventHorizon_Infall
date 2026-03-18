@@ -90,13 +90,17 @@ ns.CONFIG = {
     redshift = true,
     pandemicPulse = true,
     hideBlizzCastBar = true,
-    hideBlizzECM = false,
+    hideEssentialCD = false,
+    hideUtilityCD = false,
+    hideBuffIconCD = false,
+    hideBuffBarCD = false,
     locked = false,
     buffLayerAbove = false,
     hideIcons = false,
     clickthrough = false,
     smoothBars = false,
     showPastBars = true,
+    forceViewersAlways = true,
 }
 
 InfallDB = InfallDB or {}
