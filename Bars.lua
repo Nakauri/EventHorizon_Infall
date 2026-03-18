@@ -3063,7 +3063,7 @@ EH_Parent:RegisterEvent("PLAYER_REGEN_DISABLED")
 EH_Parent:RegisterEvent("PLAYER_REGEN_ENABLED")
 EH_Parent:RegisterEvent("PLAYER_TARGET_CHANGED")
 
--- ECM visibility
+-- ECM visibility (per-viewer)
 local ecmFrameNames = {
     "EssentialCooldownViewer",
     "UtilityCooldownViewer",
@@ -3071,12 +3071,24 @@ local ecmFrameNames = {
     "BuffBarCooldownViewer",
 }
 
+local ecmViewerKey = {
+    EssentialCooldownViewer = "hideEssentialCD",
+    UtilityCooldownViewer   = "hideUtilityCD",
+    BuffIconCooldownViewer  = "hideBuffIconCD",
+    BuffBarCooldownViewer   = "hideBuffBarCD",
+}
+
+local function AnyViewerHidden()
+    return CONFIG.hideEssentialCD or CONFIG.hideUtilityCD or CONFIG.hideBuffIconCD or CONFIG.hideBuffBarCD
+end
+
 local function ApplyECMVisibility()
     if InCombatLockdown() then return end
     for _, name in ipairs(ecmFrameNames) do
         local frame = _G[name]
         if frame then
-            if CONFIG.hideBlizzECM then
+            local key = ecmViewerKey[name]
+            if key and CONFIG[key] then
                 pcall(function() frame:SetAlpha(0) end)
                 -- Disable mouse on item frames so tooltips don't appear on invisible CDM
                 pcall(function()
@@ -3227,6 +3239,16 @@ loginInitFrame:SetScript("OnEvent", function()
         print("|cff00ff00[Infall]|r Enabled the Cooldown Manager. Infall requires it to function.")
     end
 
+    -- Migrate old hideBlizzECM boolean → per-viewer keys
+    if CONFIG.hideBlizzECM ~= nil then
+        local v = CONFIG.hideBlizzECM and true or false
+        if CONFIG.hideEssentialCD == nil then CONFIG.hideEssentialCD = v end
+        if CONFIG.hideUtilityCD == nil then CONFIG.hideUtilityCD = v end
+        if CONFIG.hideBuffIconCD == nil then CONFIG.hideBuffIconCD = v end
+        if CONFIG.hideBuffBarCD == nil then CONFIG.hideBuffBarCD = v end
+        CONFIG.hideBlizzECM = nil
+    end
+
     -- Save CDM viewer settings to "Always" in layout data (no frame interaction, no taint)
     if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
 
@@ -3258,11 +3280,11 @@ loginInitFrame:SetScript("OnEvent", function()
     for _, name in ipairs(ecmFrameNames) do
         local frame = _G[name]
         if frame then
+            local key = ecmViewerKey[name]
             hooksecurefunc(frame, "SetAlpha", function(self, alpha)
-                if InCombatLockdown() then return end
                 if setAlphaGuard[self] then return end
                 if issecretvalue and issecretvalue(alpha) then return end
-                if CONFIG.hideBlizzECM and alpha > 0 then
+                if key and CONFIG[key] and alpha > 0 then
                     setAlphaGuard[self] = true
                     self:SetAlpha(0)
                     setAlphaGuard[self] = nil
@@ -3636,10 +3658,12 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
             end
 
-            -- Re-apply ECM visibility if PEW timer was blocked by combat
+            -- Re-apply ECM visibility after combat (catches TMW / Blizzard alpha restores)
             if ns._pendingECMReapply then
                 ns._pendingECMReapply = nil
                 if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
+            end
+            if AnyViewerHidden() then
                 ApplyECMVisibility()
             end
         end
@@ -3755,17 +3779,22 @@ SlashCmdList["INFALL"] = function(msg)
             print("|cff00ff00[Infall]|r Cannot toggle cooldown viewer in combat. Use /infall ecm after combat.")
             return
         end
-        CONFIG.hideBlizzECM = not CONFIG.hideBlizzECM
+        local allHidden = CONFIG.hideEssentialCD and CONFIG.hideUtilityCD and CONFIG.hideBuffIconCD and CONFIG.hideBuffBarCD
+        local newVal = not allHidden
+        CONFIG.hideEssentialCD = newVal
+        CONFIG.hideUtilityCD = newVal
+        CONFIG.hideBuffIconCD = newVal
+        CONFIG.hideBuffBarCD = newVal
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
 
         if ns.ApplyECMVisibility then
             ns.ApplyECMVisibility()
         end
 
-        if CONFIG.hideBlizzECM then
-            print("|cff00ff00[Infall]|r Blizzard cooldown viewer: |cffff0000HIDDEN|r")
+        if newVal then
+            print("|cff00ff00[Infall]|r Blizzard cooldown viewers: |cffff0000ALL HIDDEN|r")
         else
-            print("|cff00ff00[Infall]|r Blizzard cooldown viewer: |cff00ff00VISIBLE|r")
+            print("|cff00ff00[Infall]|r Blizzard cooldown viewers: |cff00ff00ALL VISIBLE|r")
         end
         
     elseif msg == "setup" then
