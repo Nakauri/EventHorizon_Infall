@@ -105,6 +105,7 @@ function ns.SeedProfileFromClassConfig(specKey)
         hiddenCooldownIDs = {},
         chargesDisabled = {},
         castColors = {},
+        cooldownColors = {},
     }
 
     for _, key in ipairs(TOGGLE_KEYS) do
@@ -135,6 +136,9 @@ function ns.SeedProfileFromClassConfig(specKey)
     end
     if CONFIG.castColors then
         profile.castColors = DeepCopy(CONFIG.castColors)
+    end
+    if CONFIG.cooldownColors then
+        profile.cooldownColors = DeepCopy(CONFIG.cooldownColors)
     end
 
     -- Capture current frame position (per-character)
@@ -223,6 +227,9 @@ function ns.ApplyProfile(profile)
     if profile.castColors then
         CONFIG.castColors = DeepCopy(profile.castColors)
     end
+    if profile.cooldownColors then
+        CONFIG.cooldownColors = DeepCopy(profile.cooldownColors)
+    end
 
     -- Restore per-profile frame position
     if profile.position and EH_Parent then
@@ -276,6 +283,7 @@ function ns.SaveCurrentProfile()
     profile.hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {})
     profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {})
     profile.castColors = DeepCopy(CONFIG.castColors or {})
+    profile.cooldownColors = DeepCopy(CONFIG.cooldownColors or {})
 
     -- Save current frame position (per-character)
     if EH_Parent then
@@ -299,6 +307,7 @@ ns.classConfigDefaults = {
     hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {}),
     chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {}),
     castColors = DeepCopy(CONFIG.castColors or {}),
+    cooldownColors = DeepCopy(CONFIG.cooldownColors or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
     ns.classConfigDefaults.toggles[key] = CONFIG[key]
@@ -540,7 +549,7 @@ local function CreateColorSwatch(parent, label, defaultColor, onChange)
             r = c[1],
             g = c[2],
             b = c[3],
-            opacity = 1 - (c[4] or 1),
+            opacity = c[4] or 1,
             hasOpacity = true,
             swatchFunc = function()
                 local r, g, b = ColorPickerFrame:GetColorRGB()
@@ -807,7 +816,7 @@ local function OpenInlineColorPicker(currentColor, onChange)
         r = currentColor[1],
         g = currentColor[2],
         b = currentColor[3],
-        opacity = 1 - (currentColor[4] or 1),
+        opacity = currentColor[4] or 1,
         hasOpacity = true,
         swatchFunc = function()
             local r, g, b = ColorPickerFrame:GetColorRGB()
@@ -1076,8 +1085,8 @@ local function BuildSettings()
     topTitle:SetText("Cooldown Rows")
 
     -- Column headers (aligned with row layout)
-    local colHeaders = {"Show", "", "Ability", "Buff 1", "Buff 2", "Cast 1", "Cast 2", "Stack"}
-    local colPositions = {6, 30, 58, 190, 240, 296, 346, 400}
+    local colHeaders = {"Show", "", "", "Ability", "Buff 1", "Buff 2", "Cast 1", "Cast 2", "Stack"}
+    local colPositions = {6, 30, 48, 76, 190, 240, 296, 346, 400}
 
     for i, text in ipairs(colHeaders) do
         local hdr = topPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -1404,13 +1413,22 @@ local function BuildSettings()
                     row.cb = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
                     row.cb:SetPoint("LEFT", 2, 0)
                     row.cb:SetSize(22, 22)
+                    row.cdColorBtn = CreateFrame("Button", nil, row)
+                    row.cdColorBtn:SetSize(16, 16)
+                    row.cdColorBtn:SetPoint("LEFT", row.cb, "RIGHT", 2, 0)
+                    local cdBg = row.cdColorBtn:CreateTexture(nil, "BACKGROUND")
+                    cdBg:SetAllPoints()
+                    cdBg:SetColorTexture(0, 0, 0, 1)
+                    row.cdColorBtn.tex = row.cdColorBtn:CreateTexture(nil, "OVERLAY")
+                    row.cdColorBtn.tex:SetPoint("TOPLEFT", 1, -1)
+                    row.cdColorBtn.tex:SetPoint("BOTTOMRIGHT", -1, 1)
                     row.abilIcon = row:CreateTexture(nil, "ARTWORK")
                     row.abilIcon:SetSize(24, 24)
-                    row.abilIcon:SetPoint("LEFT", row.cb, "RIGHT", 4, 0)
+                    row.abilIcon:SetPoint("LEFT", row.cdColorBtn, "RIGHT", 4, 0)
                     row.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
                     row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
                     row.nameText:SetPoint("LEFT", row.abilIcon, "RIGHT", 4, 0)
-                    row.nameText:SetWidth(124)
+                    row.nameText:SetWidth(106)
                     row.nameText:SetJustifyH("LEFT")
                     row.nameText:SetWordWrap(false)
                     row.buff1Slot = CreateSlotFrame(row, row.nameText, "RIGHT", 4)
@@ -1441,6 +1459,44 @@ local function BuildSettings()
                 row.nameText:SetText(spellName)
                 row.nameText:SetTextColor(isHidden and 0.5 or 1, isHidden and 0.5 or 0.82, isHidden and 0.5 or 0)
                 row.cb:SetChecked(not isHidden)
+
+                local cdOverride = CONFIG.cooldownColors and CONFIG.cooldownColors[cooldownID]
+                local cdColor = cdOverride or CONFIG.cooldownColor
+                row.cdColorBtn.tex:SetColorTexture(cdColor[1], cdColor[2], cdColor[3], cdColor[4] or 1)
+                row.cdColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                row.cdColorBtn:SetScript("OnClick", function(self, button)
+                    if button == "RightButton" then
+                        if CONFIG.cooldownColors then
+                            CONFIG.cooldownColors[cooldownID] = nil
+                        end
+                        self.tex:SetColorTexture(unpack(CONFIG.cooldownColor))
+                        ns.SaveCurrentProfile()
+                        ApplyLayoutToAllBars()
+                        return
+                    end
+                    local currentColor = (CONFIG.cooldownColors and CONFIG.cooldownColors[cooldownID])
+                        or DeepCopy(CONFIG.cooldownColor)
+                    OpenInlineColorPicker(currentColor, function(c)
+                        self.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                        CONFIG.cooldownColors = CONFIG.cooldownColors or {}
+                        CONFIG.cooldownColors[cooldownID] = c
+                        ns.SaveCurrentProfile()
+                        ApplyLayoutToAllBars()
+                    end)
+                end)
+                row.cdColorBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Cooldown Colour")
+                    local isOverridden = CONFIG.cooldownColors and CONFIG.cooldownColors[cooldownID]
+                    if isOverridden then
+                        GameTooltip:AddLine("Right click to reset to default.", 0.5, 0.8, 0.5, true)
+                    else
+                        GameTooltip:AddLine("Click to set a custom colour for this cooldown bar.", 0.7, 0.7, 0.7, true)
+                    end
+                    GameTooltip:Show()
+                end)
+                row.cdColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
                 row.buff1Slot.icon:Hide()
                 row.buff1Slot.pairedCooldownID = nil
                 row.buff1Slot.pairedColor = nil
@@ -2808,7 +2864,7 @@ local function BuildSettings()
 
     -- Bar Colours
     AddColourHeader("Bar Colours")
-    AddColourDescription("Default colours for bar types. Buff and debuff colours here are defaults. Per-slot colours set in the Bars tab take priority over these.")
+    AddColourDescription("Default colours for bar types. Per-cooldown and per-slot colours set in the Bars tab take priority over these.")
 
     local cdColourSwatch = CreateColorSwatch(colourContent, "Cooldown", DeepCopy(CONFIG.cooldownColor), function(c)
         CONFIG.cooldownColor = c
