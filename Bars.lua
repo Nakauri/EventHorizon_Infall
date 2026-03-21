@@ -13,6 +13,7 @@ CONFIG.extraCasts = CONFIG.extraCasts or {}
 CONFIG.buffMappings = CONFIG.buffMappings or {}
 CONFIG.stackMappings = CONFIG.stackMappings or {}
 CONFIG.castColors = CONFIG.castColors or {}
+CONFIG.cooldownColors = CONFIG.cooldownColors or {}
 CONFIG.hiddenCooldownIDs = CONFIG.hiddenCooldownIDs or {}
 CONFIG.chargesDisabled = CONFIG.chargesDisabled or {}
 
@@ -23,6 +24,11 @@ local permanentBuffCdIDs = {}
 local deferredGen = {}
 local specChangeToken = 0
 local specChangePending = false
+
+local function GetCooldownColor(row)
+    local c = CONFIG.cooldownColors[row.cooldownID]
+    return c or CONFIG.cooldownColor
+end
 
 local function GetEmpowerStageColor(stage)
     if stage == 1 then return CONFIG.empowerStage1Color
@@ -769,7 +775,7 @@ local function ApplyIconMode(row)
         end
     end
 
-    row.cdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+    row.cdBar:SetStatusBarColor(unpack(GetCooldownColor(row)))
     if row.castTex then row.castTex:SetVertexColor(unpack(CONFIG.castColor)) end
     row.gcdBar:SetStatusBarColor(unpack(CONFIG.gcdColor))
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
@@ -1126,7 +1132,7 @@ local function CreateCooldownBar(spellID, index)
     row.cdBar = CreateStatusBar(row)
     row.cdBar:SetSize(futureWidth, CONFIG.height)
     row.cdBar:SetPoint("TOPLEFT", row, "TOPLEFT", nowOffset, 0)
-    row.cdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+    row.cdBar:SetStatusBarColor(unpack(GetCooldownColor(row)))
     row.cdBar:SetFrameLevel(row:GetFrameLevel() + 1)
     
     row.cdBar:Hide()
@@ -1553,6 +1559,7 @@ local function MarkBuffDirtyForCdID(cdID)
 end
 
 local function GetTotemSlotForRow(buffFrame)
+    if buffFrame.totemData == nil then return nil end
     return buffFrame.preferredTotemUpdateSlot
 end
 
@@ -2349,7 +2356,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             if not row.isChargeSpell and row.hidden_cd then
                 local cdActive = row.hidden_cd:IsShown()
                 if cdActive and not row.activeCdSlide then
-                    row.activeCdSlide = SpawnPastSlide(row, row.pastCdClip, CONFIG.cooldownColor, row.cdBar.fullHeight or CONFIG.height, 0)
+                    row.activeCdSlide = SpawnPastSlide(row, row.pastCdClip, GetCooldownColor(row), row.cdBar.fullHeight or CONFIG.height, 0)
                 elseif not cdActive and row.activeCdSlide then
                     DetachPastSlide(row.activeCdSlide)
                     row.activeCdSlide = nil
@@ -2466,10 +2473,10 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 -- Top lane
                 if topTexShown and not row.activeDepletedSlide then
                     row.activeDepletedSlide = SpawnPastSlide(row,
-                        row.pastCdClip, CONFIG.cooldownColor, laneH, 0)
+                        row.pastCdClip, GetCooldownColor(row), laneH, 0)
                     row._depletedSpawnTime = GetTime()
                 elseif row.activeDepletedSlide and not row.activeDepletedSlide.detachTime and not topTexShown then
-                    row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                    row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     DetachPastSlide(row.activeDepletedSlide)
                     row.activeDepletedSlide = nil
                     row._depletedSpawnTime = nil
@@ -2479,11 +2486,11 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 if bottomTexShown and not row.activeChargeSlide then
                     local barH = row.cdBar.fullHeight or CONFIG.height
                     row.activeChargeSlide = SpawnPastSlide(row,
-                        row.pastCdClip, CONFIG.cooldownColor,
+                        row.pastCdClip, GetCooldownColor(row),
                         laneH, barH - laneH)
                     row._chargeSpawnTime = GetTime()
                 elseif row.activeChargeSlide and not row.activeChargeSlide.detachTime and not bottomTexShown then
-                    row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                    row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     DetachPastSlide(row.activeChargeSlide)
                     row.activeChargeSlide = nil
                     row._chargeSpawnTime = nil
@@ -2505,11 +2512,11 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                             end
                             if mlActive and not ml.activeSlide then
                                 ml.activeSlide = SpawnPastSlide(row,
-                                    row.pastCdClip, CONFIG.cooldownColor,
+                                    row.pastCdClip, GetCooldownColor(row),
                                     laneH, j * (laneH + 1))
                                 ml._slideSpawnTime = GetTime()
                             elseif ml.activeSlide and not ml.activeSlide.detachTime and not mlActive then
-                                ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                                ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                                 DetachPastSlide(ml.activeSlide)
                                 ml.activeSlide = nil
                                 ml._slideSpawnTime = nil
@@ -2522,7 +2529,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 local maxSlideDur = (row.maxCharges or 2) * (row.chargeDurationConstant or 12) + 2
                 if row._depletedSpawnTime and GetTime() - row._depletedSpawnTime > maxSlideDur then
                     if row.activeDepletedSlide then
-                        row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                        row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     end
                     DetachPastSlide(row.activeDepletedSlide)
                     row.activeDepletedSlide = nil
@@ -2530,7 +2537,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 end
                 if row._chargeSpawnTime and GetTime() - row._chargeSpawnTime > maxSlideDur then
                     if row.activeChargeSlide then
-                        row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                        row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     end
                     DetachPastSlide(row.activeChargeSlide)
                     row.activeChargeSlide = nil
@@ -2540,7 +2547,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     for j = 1, #row.middleLanes do
                         local ml = row.middleLanes[j]
                         if ml and ml.activeSlide and ml._slideSpawnTime and GetTime() - ml._slideSpawnTime > maxSlideDur then
-                            ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or CONFIG.cooldownColor[4] or 0.5)
+                            ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                             DetachPastSlide(ml.activeSlide)
                             ml.activeSlide = nil
                             ml._slideSpawnTime = nil
@@ -2798,7 +2805,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.spellName = spellInfo.name
     end
     
-    bar.cdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+    bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
     if isChargeSpell then
         bar.cdBar:SetHeight(bar.cdBar.laneHeight)
@@ -2881,25 +2888,25 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.depletedCdBar:SetSize(futureWidth, laneH)
         bar.depletedCdBar:SetMinMaxValues(0, CONFIG.future)
         bar.depletedCdBar:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
-        bar.depletedCdBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+        bar.depletedCdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         local bottomSlotPx = (maxC - 1) * slotPx
         bar.depletedHelperBar:ClearAllPoints()
         bar.depletedHelperBar:SetSize(math.max(1, bottomSlotPx), laneH)
         bar.depletedHelperBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", 0, bottomY)
-        bar.depletedHelperBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+        bar.depletedHelperBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         bar.depletedChargeBar:ClearAllPoints()
         bar.depletedChargeBar:SetSize(chargeDurPx, laneH)
         bar.depletedChargeBar:SetMinMaxValues(0, 1)
         bar.depletedChargeBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", bottomSlotPx, bottomY)
-        bar.depletedChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+        bar.depletedChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         bar.normalChargeBar:ClearAllPoints()
         bar.normalChargeBar:SetSize(chargeDurPx, laneH)
         bar.normalChargeBar:SetMinMaxValues(0, 1)
         bar.normalChargeBar:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
-        bar.normalChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+        bar.normalChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         -- 3+ charge bottom lane helper + spacer in notDepletedWrapper
         if maxC > 2 then
@@ -2930,7 +2937,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             bar.notDepletedHelperBar:ClearAllPoints()
             bar.notDepletedHelperBar:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
             bar.notDepletedHelperBar:SetPoint("BOTTOMRIGHT", bar.ndHelperSpacer:GetStatusBarTexture(), "BOTTOMLEFT")
-            bar.notDepletedHelperBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+            bar.notDepletedHelperBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
             bar.notDepletedHelperBar:SetAlpha(0)
             bar.notDepletedHelperBar:Show()
 
@@ -3006,7 +3013,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 ml.depletedHelperBar:ClearAllPoints()
                 ml.depletedHelperBar:SetSize(math.max(1, mlSlotPx), laneH)
                 ml.depletedHelperBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", 0, laneY)
-                ml.depletedHelperBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+                ml.depletedHelperBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
                 ml.depletedHelperBar:SetAlpha(0)
                 ml.depletedHelperBar:Show()
 
@@ -3027,7 +3034,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 ml.depletedChargeBar:SetSize(chargeDurPx, laneH)
                 ml.depletedChargeBar:SetMinMaxValues(0, 1)
                 ml.depletedChargeBar:SetPoint("TOPLEFT", ml.helperSpacer:GetStatusBarTexture(), "TOPLEFT")
-                ml.depletedChargeBar:SetStatusBarColor(unpack(CONFIG.cooldownColor))
+                ml.depletedChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
                 ml.depletedChargeBar:Show()
             end
         end
