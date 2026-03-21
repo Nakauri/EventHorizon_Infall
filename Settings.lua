@@ -68,7 +68,7 @@ local function EnrichWithLinkedSpells(mapData)
     local buffCdID = mapData.buffCooldownIDs[1]
     local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
     if not ok or not info then return end
-    if not info.linkedSpellIDs or #info.linkedSpellIDs == 0 then return end
+    if not info.linkedSpellIDs or #info.linkedSpellIDs <= 1 then return end
 
     mapData.spellColorMap = {}
     for i, linkedID in ipairs(info.linkedSpellIDs) do
@@ -1200,6 +1200,12 @@ local function BuildSettings()
 
     hideVariantPopupFunc = function() variantPopup:Hide() end
 
+    local function IsMultiVariant(mapData)
+        if not mapData or not mapData.spellColorMap then return false end
+        local firstKey = next(mapData.spellColorMap)
+        return firstKey and next(mapData.spellColorMap, firstKey) ~= nil
+    end
+
     local function ShowVariantPopup(anchor, cooldownID, mapIndex)
         if variantPopup:IsShown() then
             variantPopup:Hide()
@@ -1706,9 +1712,9 @@ local function BuildSettings()
                 buff1ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    if m and m[1] and m[1].spellColorMap then
+                    if m and m[1] and IsMultiVariant(m[1]) then
                         GameTooltip:SetText("Buff 1 Variant Colours")
-                        GameTooltip:AddLine("Click to change colours for each buff variant.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:AddLine("Click to change colours for each buff variant. Variant colours only resolve outside of instances.", 0.7, 0.7, 0.7, true)
                         if m[1].requireGlow then
                             GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                         end
@@ -1716,6 +1722,9 @@ local function BuildSettings()
                     else
                         GameTooltip:SetText("Buff 1 Colour")
                         GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                        if m and m[1] and m[1].spellColorMap then
+                            GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                        end
                     end
                     GameTooltip:Show()
                 end)
@@ -1730,14 +1739,25 @@ local function BuildSettings()
                         end
                         return
                     end
-                    if m and m[1] and m[1].spellColorMap then
+                    if m and m[1] and IsMultiVariant(m[1]) then
                         ShowVariantPopup(buff1ColorBtn, cooldownID, 1)
                     else
-                        local currentColor = buff1Slot.pairedColor or DeepCopy(CONFIG.buffColor)
+                        -- Single colour: edit the spellColorMap entry directly if it exists, else mapData.color
+                        local mapData = m and m[1]
+                        local singleColor
+                        local singleKey
+                        if mapData and mapData.spellColorMap then
+                            singleKey = next(mapData.spellColorMap)
+                            if singleKey then singleColor = mapData.spellColorMap[singleKey] end
+                        end
+                        local currentColor = singleColor or (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(CONFIG.buffColor)
                         OpenInlineColorPicker(currentColor, function(c)
                             buff1ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
                             buff1Slot.pairedColor = c
-                            if m and m[1] then m[1].color = c end
+                            if mapData then
+                                mapData.color = c
+                                if singleKey then mapData.spellColorMap[singleKey] = c end
+                            end
                             ns.SaveCurrentProfile()
                         end)
                     end
@@ -1748,9 +1768,9 @@ local function BuildSettings()
                 buff2ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    if m and m[2] and m[2].spellColorMap then
+                    if m and m[2] and IsMultiVariant(m[2]) then
                         GameTooltip:SetText("Buff 2 Variant Colours")
-                        GameTooltip:AddLine("Click to change colours for each buff variant.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:AddLine("Click to change colours for each buff variant. Variant colours only resolve outside of instances.", 0.7, 0.7, 0.7, true)
                         if m[2].requireGlow then
                             GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                         end
@@ -1758,6 +1778,9 @@ local function BuildSettings()
                     else
                         GameTooltip:SetText("Buff 2 Colour")
                         GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                        if m and m[2] and m[2].spellColorMap then
+                            GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                        end
                     end
                     GameTooltip:Show()
                 end)
@@ -1772,15 +1795,25 @@ local function BuildSettings()
                         end
                         return
                     end
-                    if m and m[2] and m[2].spellColorMap then
+                    if m and m[2] and IsMultiVariant(m[2]) then
                         ShowVariantPopup(buff2ColorBtn, cooldownID, 2)
                     else
-                        local currentColor = buff2Slot.pairedColor or DeepCopy(CONFIG.buffColor)
+                        local mapData = m and m[2]
+                        local singleColor
+                        local singleKey
+                        if mapData and mapData.spellColorMap then
+                            singleKey = next(mapData.spellColorMap)
+                            if singleKey then singleColor = mapData.spellColorMap[singleKey] end
+                        end
+                        local currentColor = singleColor or (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(CONFIG.buffColor)
                         currentColor[4] = currentColor[4] or 0.3
                         OpenInlineColorPicker(currentColor, function(c)
                             buff2ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
                             buff2Slot.pairedColor = c
-                            if m and m[2] then m[2].color = c end
+                            if mapData then
+                                mapData.color = c
+                                if singleKey then mapData.spellColorMap[singleKey] = c end
+                            end
                             ns.SaveCurrentProfile()
                         end)
                     end
@@ -3211,7 +3244,7 @@ local function BuildSettings()
 
     AddTogHeader("Variant Names")
 
-    local variantNamesCheck = CreateCheckbox(togContent, "Show Variant Names", "Show the name of protected aura variants on the bar (IE Roll the Bones outcomes). Blizzard hides aura details inside raids, so bar colours fall back to default. This text label still works because spell names pass through the combat protection system.", CONFIG.showVariantNames or false, function(v)
+    local variantNamesCheck = CreateCheckbox(togContent, "Show Variant Names", "Show the name of aura variants on the bar (IE Roll the Bones outcomes). Variant colours only resolve outside of instances. Inside instances, the last known variant colour is used. This text label always works because spell names pass through the combat protection system.", CONFIG.showVariantNames or false, function(v)
         CONFIG.showVariantNames = v
         ns.SaveCurrentProfile()
     end)
