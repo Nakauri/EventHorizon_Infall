@@ -67,23 +67,23 @@ hiddenGcdCooldown:SetScript("OnCooldownDone", function(self)
     gcdActive = false
 end)
 
-local lastFedGcdDurObj = nil
+local lastFedGcdDurObj
 
 -- Curves for secret safe desaturation and alpha.
 -- BinaryCurve: 0% remaining = 0, >0% = 1 (for SetDesaturation).
 -- AlphaCurve: 0s remaining = 0, >0s = 1 (for SetAlpha).
 local BinaryCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
 if BinaryCurve then
-    BinaryCurve:AddPoint(0.0, 0)      -- 0% remaining (ready) → 0
-    BinaryCurve:AddPoint(0.001, 1)    -- >0% remaining (on CD) → 1
+    BinaryCurve:AddPoint(0.0, 0)
+    BinaryCurve:AddPoint(0.001, 1)
     BinaryCurve:AddPoint(1.0, 1)
 end
 
 local AlphaCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
 if AlphaCurve then
-    AlphaCurve:AddPoint(0.0, 0)       -- 0s remaining → alpha 0 (invisible)
-    AlphaCurve:AddPoint(0.001, 1)     -- >0s remaining → alpha 1 (visible)
-    AlphaCurve:AddPoint(300, 1)       -- stays visible for any positive duration
+    AlphaCurve:AddPoint(0.0, 0)
+    AlphaCurve:AddPoint(0.001, 1)
+    AlphaCurve:AddPoint(300, 1)
 end
 
 
@@ -95,14 +95,6 @@ if BuffFillCurve then
     BuffFillCurve:AddPoint(3600, 3600)
 end
 
--- InvertedAlphaCurve: visible when timer is NOT active, invisible when active.
-local InvertedAlphaCurve = C_CurveUtil and C_CurveUtil.CreateCurve and C_CurveUtil.CreateCurve()
-if InvertedAlphaCurve then
-    InvertedAlphaCurve:AddPoint(0.0, 1)       -- 0s remaining → alpha 1 (visible when NOT active)
-    InvertedAlphaCurve:AddPoint(0.001, 0)     -- >0s remaining → alpha 0 (invisible when active)
-    InvertedAlphaCurve:AddPoint(300, 0)       -- stays invisible for any positive duration
-end
-
 local SMOOTH_INTERPOLATION = Enum and Enum.StatusBarInterpolation
     and Enum.StatusBarInterpolation.ExponentialEaseOut or nil
 local function GetInterpolation()
@@ -111,6 +103,7 @@ end
 
 local UpdateChargeState
 local FeedChargeHiddenFrames
+local InstallBuffFrameHooks
 
 -- Apply CONFIG font (or fallback) to a FontString at a given size.
 local function ApplyFont(fontString, size)
@@ -190,10 +183,6 @@ local function GetFutureWidth()
     return CONFIG.width - GetNowPixelOffset()
 end
 
-local function GetPastWidth()
-    return GetNowPixelOffset()
-end
-
 local function TimeToPixel(timeOffset)
     local fraction = (timeOffset + CONFIG.past) / GetTotalSpan()
     return fraction * CONFIG.width
@@ -213,7 +202,7 @@ end
 
 local function UpdateCastBar(event)
     local name, text, texture, startTimeMS, endTimeMS, isTradeSkill, castID, notInterruptible, spellID
-    local isChannel = false
+    local isChannel
     local numStages
 
     -- Prioritize based on event type to avoid stale data
@@ -243,7 +232,7 @@ local function UpdateCastBar(event)
     end
     
     if name and spellID then
-        local targetRow = nil
+        local targetRow
         for _, row in ipairs(cooldownBars) do
             if row.spellID == spellID or row.baseSpellID == spellID then
                 targetRow = row
@@ -355,8 +344,6 @@ local function UpdateCastBar(event)
             if not color then
                 color = CONFIG.castColor
             end
-            activeCast.color = color
-
             -- Spawn past slide (stage 1 colour for empowered, cast colour otherwise)
             local slideColor = (isEmpowered and GetEmpowerStageColor(1)) or color
             activeCast.pastSlide = SpawnPastSlide(targetRow, targetRow.pastCastClip, slideColor)
@@ -548,7 +535,7 @@ SpawnPastSlide = function(row, clip, color, height, yOffset)
     yOffset = yOffset or 0
     
     -- Recycle from the same clip frame only (reparenting breaks clip boundaries).
-    local slide = nil
+    local slide
     for _, s in ipairs(row.pastSlides) do
         if not s.active and s.clip == clip then
             slide = s
@@ -594,7 +581,7 @@ end
 DetachPastSlide = function(slide)
     if not slide or not slide.active or slide.detachTime then return end
     slide.detachTime = GetTime()
-    local pastWidth = GetPastWidth()
+    local pastWidth = GetNowPixelOffset()
     if pastWidth <= 0 then
         slide.tex:Hide()
         slide.active = false
@@ -609,7 +596,7 @@ end
 
 local function UpdatePastSlides()
     local now = GetTime()
-    local pastWidth = GetPastWidth()
+    local pastWidth = GetNowPixelOffset()
     if pastWidth <= 0 then return end
     
     local pxPerSec = pastWidth / CONFIG.past
@@ -772,7 +759,7 @@ local function ApplyIconMode(row)
     end
     
     -- Past clip frames
-    local pastWidth = GetPastWidth()
+    local pastWidth = GetNowPixelOffset()
     local pastClips = {row.pastCdClip, row.pastBuffClip, row.pastOverlayClip, row.pastCastClip}
     for _, clip in ipairs(pastClips) do
         if clip then
@@ -918,7 +905,6 @@ local function CreateHiddenCooldown(rowRef, timerType)
                 UpdateDesaturation(rowRef)
             end
         elseif timerType == "charge" then
-            rowRef.chargesAvailable = math.min((rowRef.chargesAvailable or 0) + 1, rowRef.maxCharges or 2)
             UpdateChargeState(rowRef)
             UpdateDesaturation(rowRef)
         elseif timerType == "buff" then
@@ -967,9 +953,7 @@ FeedChargeHiddenFrames = function(row)
     else FeedHiddenCooldown(row, "charge", nil) end
 end
 
--- Event-driven charge bar fill via SetTimerDuration (OctoChargeBar pattern).
--- Called on SPELL_UPDATE_CHARGES, SPELL_UPDATE_COOLDOWN, USCS, and OCD.
--- Engine animates fill; OnUpdate only handles alpha, helpers, past slides.
+-- Event-driven charge bar fill via SetTimerDuration.
 local IMM_INTERP = Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate
 local REMAIN_DIR = Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.RemainingTime
 FeedChargeBarTimers = function(row)
@@ -1004,6 +988,7 @@ FeedChargeBarTimers = function(row)
         end
     end
 
+    row._cachedChargeInfo = chargesOk and chargeInfo or nil
     row._chargeDurObj = chargeDurObj
     row._cdDurObj = cdDurObj
 
@@ -1105,7 +1090,6 @@ local function CreateCooldownBar(spellID, index)
     pulse:SetDuration(0.6)
     pulse:SetSmoothing("IN_OUT")
     
-    -- Parented to EH_Parent so text isn't clipped by row:SetClipsChildren
     row.textOverlay = CreateFrame("Frame", nil, EH_Parent)
     row.textOverlay:SetAllPoints(row.iconContainer)
     row.textOverlay:SetFrameLevel(row.iconContainer:GetFrameLevel() + 10)
@@ -1181,7 +1165,7 @@ local function CreateCooldownBar(spellID, index)
     row.lastPtr_overlay = nil
     row.wasOnGCD = false
 
-    -- Cast bar texture (not StatusBar, so it can straddle the now line).
+    -- Cast bar texture
     row.castFrame = CreateFrame("Frame", nil, row)
     row.castFrame:SetAllPoints(row)
     row.castFrame:SetFrameLevel(row:GetFrameLevel() + 5)
@@ -1221,7 +1205,7 @@ local function CreateCooldownBar(spellID, index)
     row.buffBarOverlay:SetFrameLevel(row:GetFrameLevel() + 4)
     row.buffBarOverlay:Hide()
     
-    -- Cooldown swirl (plain "Cooldown", not CooldownFrameTemplate which taints).
+    -- Cooldown swirl
     row.cooldownFrame = CreateFrame("Cooldown", nil, row.iconContainer)
     row.cooldownFrame:SetAllPoints(row.iconContainer)
     row.cooldownFrame:SetDrawEdge(false) 
@@ -1251,7 +1235,7 @@ local function CreateCooldownBar(spellID, index)
     row.gcdSpark:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
     row.gcdSpark:Hide()
     
-    -- Now line, on its own frame so it draws above all bars.
+    -- Now line
     row.nowLineFrame = CreateFrame("Frame", nil, row)
     row.nowLineFrame:SetFrameLevel(row:GetFrameLevel() + 7)
     row.nowLineFrame:SetAllPoints(row)
@@ -1508,7 +1492,6 @@ local function SmartReorder()
     ResizeContainer()
 end
 
--- Pool enumeration works even if other addons reparent frames
 local function ScanViewer(viewerName)
     local viewer = _G[viewerName]
     if not viewer then return nil end
@@ -1553,7 +1536,54 @@ local cachedBuffViewerFrames = {}
 local cooldownViewerNames = {"EssentialCooldownViewer", "UtilityCooldownViewer"}
 local buffViewerNames = {"BuffIconCooldownViewer", "BuffBarCooldownViewer"}
 
+-- Hook-maintained persistent maps: survive combat without frame pool iteration
+local persistentCooldownMap = {}
+local persistentBuffMap = {}
+local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
+local hookedAuraFrames = setmetatable({}, { __mode = "k" })
+
+local function MarkBuffDirtyForCdID(cdID)
+    for _, row in ipairs(cooldownBars) do
+        if row.cooldownID == cdID then
+            row._buffDirty = true
+        elseif row._buffCooldownIDs and row._buffCooldownIDs[cdID] then
+            row._buffDirty = true
+        end
+    end
+end
+
+local function GetTotemSlotForRow(buffFrame)
+    return buffFrame.preferredTotemUpdateSlot
+end
+
+InstallBuffFrameHooks = function(frame)
+    if hookedAuraFrames[frame] then return end
+    hookedAuraFrames[frame] = true
+    if frame.SetAuraInstanceInfo then
+        hooksecurefunc(frame, "SetAuraInstanceInfo", function(self)
+            local cdID = cdmFrameToCdID[self]
+            if not cdID then cdID = self.cooldownID end
+            if cdID then
+                persistentBuffMap[cdID] = self
+                MarkBuffDirtyForCdID(cdID)
+            end
+        end)
+    end
+    if frame.ClearAuraInstanceInfo then
+        hooksecurefunc(frame, "ClearAuraInstanceInfo", function(self)
+            local cdID = cdmFrameToCdID[self]
+            if not cdID then cdID = self.cooldownID end
+            if cdID then MarkBuffDirtyForCdID(cdID) end
+        end)
+    end
+end
+
 ScanViewerFrames = function()
+    -- In combat: return hook-maintained persistent maps (no frame pool iteration)
+    if InCombatLockdown() then
+        return persistentCooldownMap, persistentBuffMap
+    end
+
     wipe(cachedCooldownViewerFrames)
     wipe(cachedBuffViewerFrames)
 
@@ -1589,6 +1619,18 @@ ScanViewerFrames = function()
                 end
             end
         end
+    end
+
+    -- Sync persistent maps from OOC scan
+    wipe(persistentCooldownMap)
+    wipe(persistentBuffMap)
+    for k, v in pairs(cachedCooldownViewerFrames) do
+        persistentCooldownMap[k] = v
+        InstallBuffFrameHooks(v)
+    end
+    for k, v in pairs(cachedBuffViewerFrames) do
+        persistentBuffMap[k] = v
+        InstallBuffFrameHooks(v)
     end
 
     return cachedCooldownViewerFrames, cachedBuffViewerFrames
@@ -1627,7 +1669,7 @@ local function MirrorECMState(row, cooldownViewerFrames)
         end
     end
     
-    -- Charge text via direct API (not CDM frame field — stale if viewer hidden)
+    -- Charge text
     if row.hasCharges then
         local ok, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
         if ok and chargeInfo then
@@ -1650,8 +1692,7 @@ local function UpdateRowCooldown(row)
     local cdInfoSuccess, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
     local isOnGCD = cdInfoSuccess and cdInfo and cdInfo.isOnGCD
 
-    -- On GCD falling edge, clear hidden frame and skip this feed.
-    -- Prevents stale GCD-length DurObj from creating a false past slide.
+    -- GCD falling edge: clear hidden frame, skip feed
     local gcdJustEnded = row.wasOnGCD and not isOnGCD
     row.wasOnGCD = isOnGCD or false
     if gcdJustEnded and row.hidden_cd then
@@ -1675,8 +1716,7 @@ local function UpdateRowCooldown(row)
         row.cdBar:Hide()
         row.lastCdDurObj = nil
         if row.cooldownFrame then row.cooldownFrame:Hide() end
-        -- Clear stale hidden_cd timer: handles proc resets mid-GCD (IE Black Arrow)
-        -- AND spell transforms mid-cooldown (old spell timer would persist as ghost past slide)
+        -- Clear stale hidden_cd timer
         if row.hidden_cd and row.hidden_cd:IsShown() then
             row.hidden_cd:SetCooldown(0, 0)
             row.lastPtr_cd = nil
@@ -1690,7 +1730,6 @@ UpdateChargeState = function(row)
         return
     end
 
-    -- Clear so the OnUpdate fill code does not animate hidden bars.
     row.activeCooldown = nil
 
     -- Icon cooldown swirl
@@ -1753,6 +1792,10 @@ local function GetAuraDurationWithRetry(unit, auraInstanceID, cdmUnit)
         local opposite = (unit == "target") and "player" or "target"
         local rOk, rDur = pcall(C_UnitAuras.GetAuraDuration, opposite, auraInstanceID)
         if rOk and rDur then return true, rDur, opposite end
+        if unit ~= "pet" and cdmUnit ~= "pet" then
+            local pOk, pDur = pcall(C_UnitAuras.GetAuraDuration, "pet", auraInstanceID)
+            if pOk and pDur then return true, pDur, "pet" end
+        end
         return false, nil, unit
     end
     return durSuccess, durObj, unit
@@ -1764,9 +1807,9 @@ local _overlayBuffEntry = {}
 
 UpdateBuffState = function(row, buffViewerFrames)
     -- Each mapping entry owns a fixed lane: [1] = primary, [2] = overlay.
-    local primaryBuff = nil
-    local overlayBuff = nil
-    
+    local primaryBuff, overlayBuff
+    local mappings = row.cooldownID and CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
+
     if row.cooldownID then
         -- Self match: buff cooldownID == ability cooldownID
         local selfFrame = buffViewerFrames[row.cooldownID]
@@ -1775,35 +1818,46 @@ UpdateBuffState = function(row, buffViewerFrames)
             _primaryBuffEntry.frame = selfFrame
             _primaryBuffEntry.color = CONFIG.buffColor
             _primaryBuffEntry.hasCustomColor = false
-            _primaryBuffEntry.unit = selfFrame.auraDataUnit or "player"
+            _primaryBuffEntry.unit = row._resolvedBuffUnit or selfFrame.auraDataUnit or "player"
             _primaryBuffEntry.secretAuraSpellId = nil
             primaryBuff = _primaryBuffEntry
         end
 
         -- Mapping matches: direct lookup by each buffCooldownID
-        local mappings = CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
         if mappings then
             for mapIdx, mapData in ipairs(mappings) do
                 if mapData.buffCooldownIDs then
                     for _, mappedID in ipairs(mapData.buffCooldownIDs) do
                         local buffFrame = buffViewerFrames[mappedID]
                         if buffFrame and buffFrame.auraInstanceID then
-                            local unitHint = mapData.unit or buffFrame.auraDataUnit or "player"
+                            local unitHint = row._resolvedBuffUnit or mapData.unit or buffFrame.auraDataUnit or "player"
                             local matchedColor = mapData.color or CONFIG.buffColor
                             local hasCustomColor = mapData.color ~= nil
-                            local secretAuraSpellId = nil
-                            if mapData.spellColorMap and buffFrame.auraInstanceID then
-                                local aOk, aData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unitHint, buffFrame.auraInstanceID)
-                                if aOk and aData then
-                                    secretAuraSpellId = aData.spellId
-                                    local sOk, sColor = pcall(function()
-                                        if aData.spellId and mapData.spellColorMap[aData.spellId] then
-                                            return mapData.spellColorMap[aData.spellId]
+                            local secretAuraSpellId
+                            if mapData.spellColorMap then
+                                -- Single-entry: use directly (no aura data lookup needed)
+                                local firstKey, firstColor = next(mapData.spellColorMap)
+                                if firstKey and not next(mapData.spellColorMap, firstKey) then
+                                    matchedColor = firstColor
+                                    hasCustomColor = true
+                                else
+                                    -- Multi-entry: try lookup, cache result for combat
+                                    local aOk, aData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unitHint, buffFrame.auraInstanceID)
+                                    if aOk and aData then
+                                        secretAuraSpellId = aData.spellId
+                                        local sOk, sColor = pcall(function()
+                                            if aData.spellId and mapData.spellColorMap[aData.spellId] then
+                                                return mapData.spellColorMap[aData.spellId]
+                                            end
+                                        end)
+                                        if sOk and sColor then
+                                            matchedColor = sColor
+                                            hasCustomColor = true
+                                            row._cachedVariantColor = sColor
+                                        elseif row._cachedVariantColor then
+                                            matchedColor = row._cachedVariantColor
+                                            hasCustomColor = true
                                         end
-                                    end)
-                                    if sOk and sColor then
-                                        matchedColor = sColor
-                                        hasCustomColor = true
                                     end
                                 end
                             end
@@ -1821,12 +1875,64 @@ UpdateBuffState = function(row, buffViewerFrames)
                                 _overlayBuffEntry.frame = buffFrame
                                 _overlayBuffEntry.color = matchedColor
                                 _overlayBuffEntry.hasCustomColor = hasCustomColor
-                                _overlayBuffEntry.unit = unitHint
+                                _overlayBuffEntry.unit = row._resolvedOverlayUnit or unitHint
                                 _overlayBuffEntry.secretAuraSpellId = secretAuraSpellId
                                 _overlayBuffEntry.requireGlow = mapData.requireGlow
                                 overlayBuff = _overlayBuffEntry
                             end
                             break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Totem pass (CDM tracks summon abilities via preferredTotemUpdateSlot)
+    if not primaryBuff and row.cooldownID then
+        local selfFrame = buffViewerFrames[row.cooldownID]
+        if selfFrame and not selfFrame.auraInstanceID then
+            local totemSlot = GetTotemSlotForRow(selfFrame)
+            if totemSlot then
+                wipe(_primaryBuffEntry)
+                _primaryBuffEntry.frame = selfFrame
+                _primaryBuffEntry.color = CONFIG.buffColor
+                _primaryBuffEntry.hasCustomColor = false
+                _primaryBuffEntry.unit = "player"
+                _primaryBuffEntry.totemSlot = totemSlot
+                primaryBuff = _primaryBuffEntry
+            end
+        end
+        if not primaryBuff and mappings then
+            for mapIdx, mapData in ipairs(mappings) do
+                if primaryBuff then break end
+                if mapData.buffCooldownIDs then
+                    for _, mappedID in ipairs(mapData.buffCooldownIDs) do
+                        local buffFrame = buffViewerFrames[mappedID]
+                        if buffFrame and not buffFrame.auraInstanceID then
+                            local totemSlot = GetTotemSlotForRow(buffFrame)
+                            if totemSlot then
+                                local matchedColor = mapData.color or CONFIG.buffColor
+                                local hasCustomColor = mapData.color ~= nil
+                                if mapIdx == 1 then
+                                    wipe(_primaryBuffEntry)
+                                    _primaryBuffEntry.frame = buffFrame
+                                    _primaryBuffEntry.color = matchedColor
+                                    _primaryBuffEntry.hasCustomColor = hasCustomColor
+                                    _primaryBuffEntry.unit = "player"
+                                    _primaryBuffEntry.totemSlot = totemSlot
+                                    primaryBuff = _primaryBuffEntry
+                                elseif mapIdx == 2 and not overlayBuff then
+                                    wipe(_overlayBuffEntry)
+                                    _overlayBuffEntry.frame = buffFrame
+                                    _overlayBuffEntry.color = matchedColor
+                                    _overlayBuffEntry.hasCustomColor = hasCustomColor
+                                    _overlayBuffEntry.unit = "player"
+                                    _overlayBuffEntry.totemSlot = totemSlot
+                                    overlayBuff = _overlayBuffEntry
+                                end
+                                break
+                            end
                         end
                     end
                 end
@@ -1847,14 +1953,41 @@ UpdateBuffState = function(row, buffViewerFrames)
 
     -- Primary lane → buffBar
     if primaryBuff then
-        local isPermanent = DetectPermanentBuff(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.cooldownID)
         local resolvedColor = ResolveBuffColor(primaryBuff)
         row.resolvedBuffColor = resolvedColor
         row.buffBar:SetStatusBarColor(unpack(resolvedColor))
 
-        if isPermanent then
+        if primaryBuff.totemSlot then
+            if not row._totemCooldownFed then
+                local hasTotem, _, startTime, duration, _, modRate = GetTotemInfo(primaryBuff.totemSlot)
+                if hasTotem ~= nil then
+                    row.hidden_buff:SetCooldown(startTime, duration, modRate or 1)
+                else
+                    row.hidden_buff:SetCooldown(0, 0)
+                end
+                row._totemCooldownFed = true
+            end
+            row.activeBuffDuration = nil
+            row._totemSlot = primaryBuff.totemSlot
+            row.cachedPandemicIcon = nil
+            if row.buffPandemicAnim and row.buffPandemicAnim:IsPlaying() then
+                row.buffPandemicAnim:Stop()
+                row.buffBar:SetAlpha(1.0)
+            end
+            if row.hidden_buff:IsShown() then
+                row.buffBar:Show()
+                row._totemActive = true
+            else
+                row.buffBar:Hide()
+                row._totemActive = false
+            end
+            row.trackedBuffAuraInstanceID = nil
+            row.secretAuraSpellId = nil
+        elseif DetectPermanentBuff(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.cooldownID) then
             -- Permanent buff — show as full bar, no animation
             row.activeBuffDuration = nil
+            row._totemActive = false
+            row._totemSlot = nil
             row.cachedPandemicIcon = nil
             if row.buffPandemicAnim and row.buffPandemicAnim:IsPlaying() then
                 row.buffPandemicAnim:Stop()
@@ -1872,8 +2005,13 @@ UpdateBuffState = function(row, buffViewerFrames)
                 FeedHiddenCooldown(row, "buff", row._permBuffDurObj)
             end
         else
+            row._totemActive = false
+            row._totemSlot = nil
             local durSuccess, durObj, resolvedUnit = GetAuraDurationWithRetry(primaryBuff.unit, primaryBuff.frame.auraInstanceID, primaryBuff.frame.auraDataUnit)
-            if resolvedUnit and resolvedUnit ~= primaryBuff.unit then primaryBuff.unit = resolvedUnit end
+            if resolvedUnit and resolvedUnit ~= primaryBuff.unit then
+                primaryBuff.unit = resolvedUnit
+                row._resolvedBuffUnit = resolvedUnit
+            end
             if durSuccess and durObj then
                 row.activeBuffDuration = durObj
 
@@ -1913,6 +2051,9 @@ UpdateBuffState = function(row, buffViewerFrames)
         row.resolvedBuffColor = nil
         row.cachedPandemicIcon = nil
         row.trackedBuffAuraInstanceID = nil
+        row._totemActive = false
+        row._totemSlot = nil
+        row._totemCooldownFed = false
         if not row._glowGatedVariant then
             row.secretAuraSpellId = nil
         end
@@ -1921,13 +2062,34 @@ UpdateBuffState = function(row, buffViewerFrames)
 
     -- Overlay lane → buffBarOverlay
     if overlayBuff and row.buffBarOverlay then
-        local isPermanent2 = DetectPermanentBuff(overlayBuff.unit, overlayBuff.frame.auraInstanceID, overlayBuff.frame.cooldownID)
         local resolvedOverlayColor = ResolveBuffColor(overlayBuff)
         row.resolvedOverlayColor = resolvedOverlayColor
         row.buffBarOverlay:SetStatusBarColor(unpack(resolvedOverlayColor))
 
-        if isPermanent2 then
+        if overlayBuff.totemSlot then
+            if not row._overlayTotemFed then
+                local hasTotem, _, startTime, duration, _, modRate = GetTotemInfo(overlayBuff.totemSlot)
+                if hasTotem ~= nil then
+                    row.hidden_overlay:SetCooldown(startTime, duration, modRate or 1)
+                else
+                    row.hidden_overlay:SetCooldown(0, 0)
+                end
+                row._overlayTotemFed = true
+            end
             row.activeBuffOverlayDuration = nil
+            row._overlayTotemSlot = overlayBuff.totemSlot
+            if row.hidden_overlay:IsShown() then
+                row.buffBarOverlay:Show()
+                row._overlayTotemActive = true
+            else
+                row.buffBarOverlay:Hide()
+                row._overlayTotemActive = false
+            end
+            row.trackedOverlayAuraInstanceID = nil
+        elseif DetectPermanentBuff(overlayBuff.unit, overlayBuff.frame.auraInstanceID, overlayBuff.frame.cooldownID) then
+            row.activeBuffOverlayDuration = nil
+            row._overlayTotemActive = false
+            row._overlayTotemSlot = nil
             row.buffBarOverlay:SetValue(CONFIG.future)
             row.buffBarOverlay:Show()
             row.trackedOverlayAuraInstanceID = overlayBuff.frame.auraInstanceID
@@ -1939,8 +2101,13 @@ UpdateBuffState = function(row, buffViewerFrames)
                 FeedHiddenCooldown(row, "overlay", row._permOverlayDurObj)
             end
         else
+            row._overlayTotemActive = false
+            row._overlayTotemSlot = nil
             local durSuccess2, durObj2, resolvedUnit2 = GetAuraDurationWithRetry(overlayBuff.unit, overlayBuff.frame.auraInstanceID, overlayBuff.frame.auraDataUnit)
-            if resolvedUnit2 and resolvedUnit2 ~= overlayBuff.unit then overlayBuff.unit = resolvedUnit2 end
+            if resolvedUnit2 and resolvedUnit2 ~= overlayBuff.unit then
+                overlayBuff.unit = resolvedUnit2
+                row._resolvedOverlayUnit = resolvedUnit2
+            end
             if durSuccess2 and durObj2 then
                 row.activeBuffOverlayDuration = durObj2
                 FeedHiddenCooldown(row, "overlay", durObj2)
@@ -1959,6 +2126,9 @@ UpdateBuffState = function(row, buffViewerFrames)
         row.activeBuffOverlayDuration = nil
         row.resolvedOverlayColor = nil
         row.trackedOverlayAuraInstanceID = nil
+        row._overlayTotemActive = false
+        row._overlayTotemSlot = nil
+        row._overlayTotemFed = false
         FeedHiddenCooldown(row, "overlay", nil)
     end
 end
@@ -2037,21 +2207,14 @@ UpdateDesaturation = function(row)
     if CONFIG.hideIcons then return end
 
     if row.isChargeSpell then
-        -- BinaryCurve maps zero-remaining to 0 (not gray), active CD to 1 (gray).
-        local ok, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
-        if ok and cdDurObj and BinaryCurve then
-            -- GCD filter
-            local infoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
-            local isGCD = infoOk and cdInfo and cdInfo.isOnGCD == true
-            if isGCD then
-                row.icon:SetDesaturation(0)
+        -- Use event-cached _cdDurObj (already nil when GCD-only)
+        local cdDurObj = row._cdDurObj
+        if cdDurObj and BinaryCurve then
+            local curveOk, result = pcall(cdDurObj.EvaluateRemainingPercent, cdDurObj, BinaryCurve)
+            if curveOk and result then
+                row.icon:SetDesaturation(result)
             else
-                local curveOk, result = pcall(cdDurObj.EvaluateRemainingPercent, cdDurObj, BinaryCurve)
-                if curveOk and result then
-                    row.icon:SetDesaturation(result)
-                else
-                    row.icon:SetDesaturation(0)
-                end
+                row.icon:SetDesaturation(0)
             end
         else
             row.icon:SetDesaturation(0)
@@ -2150,11 +2313,22 @@ local buffPollTimer = 0
 EH_Parent:SetScript("OnUpdate", function(self, elapsed)
     updateTimer = updateTimer + elapsed
 
-    -- 10Hz buff data polling: re-reads CDM frames for aura changes (target swap, dot refresh)
+    -- 10Hz buff data polling
     buffPollTimer = buffPollTimer + elapsed
     if buffPollTimer >= 0.1 then
         buffPollTimer = 0
-        UpdateBars()
+        if InCombatLockdown() then
+            -- In combat: only process rows dirtied by aura hooks (no frame pool iteration)
+            for _, row in ipairs(cooldownBars) do
+                if row._buffDirty then
+                    row._buffDirty = false
+                    UpdateBuffState(row, persistentBuffMap)
+                    UpdateStackText(row, persistentBuffMap)
+                end
+            end
+        else
+            UpdateBars()
+        end
     end
 
     if updateTimer >= 0.033 then
@@ -2182,8 +2356,16 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 end
             end
 
-            -- Buff bar fill (BuffFillCurve maps 0 remaining to full bar for permanent buffs)
-            if row.activeBuffDuration then
+            -- Buff bar fill
+            if row._totemActive and row._totemSlot then
+                local timeLeft = GetTotemTimeLeft(row._totemSlot)
+                if timeLeft ~= nil then
+                    row.buffBar:SetValue(timeLeft, interp)
+                else
+                    row.buffBar:Hide()
+                    row._totemActive = false
+                end
+            elseif row.activeBuffDuration then
                 local ok, val
                 if BuffFillCurve then
                     ok, val = pcall(row.activeBuffDuration.EvaluateRemainingDuration, row.activeBuffDuration, BuffFillCurve)
@@ -2194,7 +2376,15 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             end
 
             -- Buff overlay bar fill
-            if row.activeBuffOverlayDuration and row.buffBarOverlay then
+            if row._overlayTotemActive and row._overlayTotemSlot and row.buffBarOverlay then
+                local timeLeft = GetTotemTimeLeft(row._overlayTotemSlot)
+                if timeLeft ~= nil then
+                    row.buffBarOverlay:SetValue(timeLeft, interp)
+                else
+                    row.buffBarOverlay:Hide()
+                    row._overlayTotemActive = false
+                end
+            elseif row.activeBuffOverlayDuration and row.buffBarOverlay then
                 local ok, val
                 if BuffFillCurve then
                     ok, val = pcall(row.activeBuffOverlayDuration.EvaluateRemainingDuration, row.activeBuffOverlayDuration, BuffFillCurve)
@@ -2208,30 +2398,8 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             if row.isChargeSpell and row.depletedWrapper then
                 local chargeDurObj = row._chargeDurObj
 
-                -- Feed all charge-driven indicators
-                local chOk, chInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
-                if chOk and chInfo then
-                    local cc = chInfo.currentCharges
-                    row.depletedIndicator:SetValue(cc)
-                    if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
-                    if row.middleClipIndicators then
-                        for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
-                    end
-                    if row.middleLanes then
-                        for _, ml2 in ipairs(row.middleLanes) do
-                            if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
-                        end
-                    end
-                end
-
                 -- depletedCdBar fill
-                local cdDurObj
-                do
-                    local ok2, dur2 = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
-                    if ok2 then cdDurObj = dur2 end
-                    local ok3, inf3 = pcall(C_Spell.GetSpellCooldown, row.spellID)
-                    if ok3 and inf3 and inf3.isOnGCD then cdDurObj = nil end
-                end
+                local cdDurObj = row._cdDurObj
 
                 -- Charge bar alpha
                 if chargeDurObj and AlphaCurve then
@@ -2321,7 +2489,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row._chargeSpawnTime = nil
                 end
 
-                -- Middle lane past slides (WIP — detach tied to bottom lane for now)
+                -- Middle lane past slides
                 if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
                     for j = 1, row.maxCharges - 2 do
                         local ml = row.middleLanes[j]
@@ -2455,10 +2623,17 @@ local function ResetBarState(bar)
     if bar.hidden_buff then bar.hidden_buff:SetCooldown(0, 0) end
     if bar.hidden_overlay then bar.hidden_overlay:SetCooldown(0, 0) end
 
-    if bar.isChargeSpell then
-        bar.chargesAvailable = bar.maxCharges or 2
-    end
-    
+    bar._buffDirty = false
+    bar._cachedChargeInfo = nil
+    bar._resolvedBuffUnit = nil
+    bar._resolvedOverlayUnit = nil
+    bar._cachedVariantColor = nil
+    bar._totemActive = false
+    bar._totemSlot = nil
+    bar._totemCooldownFed = false
+    bar._overlayTotemActive = false
+    bar._overlayTotemSlot = nil
+    bar._overlayTotemFed = false
     bar.trackedBuffAuraInstanceID = nil
     bar.trackedOverlayAuraInstanceID = nil
     bar.secretAuraSpellId = nil
@@ -2515,7 +2690,27 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     bar.baseSpellID = spellID
     bar.cooldownID = cooldownID
 
-    -- Resolve override spell immediately so cast bar matching works before first UpdateBars
+    -- Build set of all buff cooldownIDs that affect this row
+    bar._buffCooldownIDs = nil
+    bar._buffDirty = false
+    local bMappings = CONFIG.buffMappings and (CONFIG.buffMappings[cooldownID] or CONFIG.buffMappings[spellID])
+    if bMappings then
+        for _, mapData in ipairs(bMappings) do
+            if mapData.buffCooldownIDs then
+                for _, mappedID in ipairs(mapData.buffCooldownIDs) do
+                    bar._buffCooldownIDs = bar._buffCooldownIDs or {}
+                    bar._buffCooldownIDs[mappedID] = true
+                end
+            end
+        end
+    end
+    local sMapping = CONFIG.stackMappings and (CONFIG.stackMappings[cooldownID] or CONFIG.stackMappings[spellID])
+    if sMapping and sMapping.buffCooldownID then
+        bar._buffCooldownIDs = bar._buffCooldownIDs or {}
+        bar._buffCooldownIDs[sMapping.buffCooldownID] = true
+    end
+
+    -- Resolve override spell
     local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, spellID)
     if ovOk and ovID and ovID ~= spellID then
         bar.spellID = ovID
@@ -2529,7 +2724,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
 
     local isChargeSpell = false
     local chargeInfo = GetChargesWithOverride(spellID)
-    local detectedMaxCharges = nil
+    local detectedMaxCharges
     
     if chargeInfo and chargeInfo.maxCharges then
         if issecretvalue and issecretvalue(chargeInfo.maxCharges) then
@@ -2576,10 +2771,8 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             currentC = chargeInfo.currentCharges
         end
         bar.maxCharges = maxC
-        bar.chargesAvailable = currentC
     else
         bar.maxCharges = 1
-        bar.chargesAvailable = 1
     end
     
     if isChargeSpell and chargeInfo then
@@ -2884,8 +3077,6 @@ LoadEssentialCooldowns = function()
     
     local sortedSpellIDs = {}
     local sortedCooldownIDs = {}
-    local foundSource = false
-    
     if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
         local dataProvider = CooldownViewerSettings:GetDataProvider()
         if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
@@ -2898,23 +3089,20 @@ LoadEssentialCooldowns = function()
                         table.insert(sortedCooldownIDs, cdID)
                     end
                 end
-                foundSource = (#sortedSpellIDs > 0)
             end
         end
     end
-    
-    if not foundSource then
-        if C_CooldownViewer and C_CooldownViewer.IsCooldownViewerAvailable then
-            local isAvailable = C_CooldownViewer.IsCooldownViewerAvailable()
-            if isAvailable then
-                local success, cooldownIDs = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, 0, false)
-                if success and cooldownIDs then
-                    for _, cooldownID in ipairs(cooldownIDs) do
-                        local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-                        if infoOk and info and info.spellID then
-                            table.insert(sortedSpellIDs, info.spellID)
-                            table.insert(sortedCooldownIDs, cooldownID)
-                        end
+
+    if #sortedSpellIDs == 0 then
+        if C_CooldownViewer and C_CooldownViewer.IsCooldownViewerAvailable
+           and C_CooldownViewer.IsCooldownViewerAvailable() then
+            local success, cooldownIDs = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, 0, false)
+            if success and cooldownIDs then
+                for _, cooldownID in ipairs(cooldownIDs) do
+                    local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+                    if infoOk and info and info.spellID then
+                        table.insert(sortedSpellIDs, info.spellID)
+                        table.insert(sortedCooldownIDs, cooldownID)
                     end
                 end
             end
@@ -2970,7 +3158,7 @@ LoadEssentialCooldowns = function()
         table.insert(cooldownBars, bar)
     end
     
-    -- Hide text on unused pooled bars (text frames parented to EH_Parent, not row)
+    -- Hide text on unused pooled bars
     for i = #cooldownBars + 1, #barPool do
         local bar = barPool[i]
         bar.chargeText:Hide()
@@ -3043,6 +3231,7 @@ EH_Parent:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_SHOW")
 EH_Parent:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_HIDE")
 EH_Parent:RegisterEvent("SPELL_UPDATE_USABLE")
 EH_Parent:RegisterEvent("SPELL_RANGE_CHECK_UPDATE")
+EH_Parent:RegisterEvent("PLAYER_TOTEM_UPDATE")
 
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_START", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_STOP", "player")
@@ -3090,7 +3279,7 @@ local function ApplyECMVisibility()
             local key = ecmViewerKey[name]
             if key and CONFIG[key] then
                 pcall(function() frame:SetAlpha(0) end)
-                -- Disable mouse on item frames so tooltips don't appear on invisible CDM
+                -- Disable mouse on item frames
                 pcall(function()
                     for itemFrame in frame.itemFramePool:EnumerateActive() do
                         itemFrame:SetMouseMotionEnabled(false)
@@ -3135,7 +3324,7 @@ local function ForceViewersAlways()
     local activeIdx = layoutInfo.activeLayout
     if type(layouts) ~= "table" or type(activeIdx) ~= "number" then return false end
 
-    -- Prepend preset layouts so activeLayout index resolves correctly.
+    -- Prepend preset layouts
     if EditModePresetLayoutManager and EditModePresetLayoutManager.GetCopyOfPresetLayouts then
         local presetOk, presets = pcall(EditModePresetLayoutManager.GetCopyOfPresetLayouts, EditModePresetLayoutManager)
         if presetOk and type(presets) == "table" then
@@ -3293,7 +3482,48 @@ loginInitFrame:SetScript("OnEvent", function()
         end
     end
 
-    -- Buff data polling handled by 10Hz UpdateBars in OnUpdate.
+    -- Mixin hooks: maintain persistent CDM frame maps reactively
+    if CooldownViewerItemDataMixin then
+        if CooldownViewerItemDataMixin.SetCooldownID then
+            hooksecurefunc(CooldownViewerItemDataMixin, "SetCooldownID", function(frame, cdID)
+                if not cdID then return end
+                local oldCdID = cdmFrameToCdID[frame]
+                if oldCdID then
+                    if persistentCooldownMap[oldCdID] == frame then persistentCooldownMap[oldCdID] = nil end
+                    if persistentBuffMap[oldCdID] == frame then persistentBuffMap[oldCdID] = nil end
+                end
+                cdmFrameToCdID[frame] = cdID
+
+                local viewer = frame.viewerFrame
+                if not viewer then return end
+                local isBuff = (viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"])
+                local isCooldown = (viewer == _G["EssentialCooldownViewer"] or viewer == _G["UtilityCooldownViewer"])
+
+                if isCooldown then
+                    persistentCooldownMap[cdID] = frame
+                    if not persistentBuffMap[cdID] then
+                        persistentBuffMap[cdID] = frame
+                    end
+                end
+                if isBuff then
+                    persistentBuffMap[cdID] = frame
+                end
+                InstallBuffFrameHooks(frame)
+                MarkBuffDirtyForCdID(cdID)
+            end)
+        end
+        if CooldownViewerItemDataMixin.ClearCooldownID then
+            hooksecurefunc(CooldownViewerItemDataMixin, "ClearCooldownID", function(frame)
+                local cdID = cdmFrameToCdID[frame]
+                if cdID then
+                    if persistentCooldownMap[cdID] == frame then persistentCooldownMap[cdID] = nil end
+                    if persistentBuffMap[cdID] == frame then persistentBuffMap[cdID] = nil end
+                    cdmFrameToCdID[frame] = nil
+                    MarkBuffDirtyForCdID(cdID)
+                end
+            end)
+        end
+    end
 
     EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
         if InCombatLockdown() then return end
@@ -3473,7 +3703,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
             if isMatch then
                 if row.isChargeSpell then
-                    row.chargesAvailable = math.max((row.chargesAvailable or 0) - 1, 0)
                     FeedChargeHiddenFrames(row)
                     FeedChargeBarTimers(row)
                     UpdateBars()
@@ -3534,7 +3763,14 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 UpdateIconState(row)
             end
         end
-        
+
+    elseif event == "PLAYER_TOTEM_UPDATE" then
+        for _, row in ipairs(cooldownBars) do
+            row._totemCooldownFed = false
+            row._overlayTotemFed = false
+        end
+        UpdateBars()
+
     elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_CHANNEL_START"
            or event == "UNIT_SPELLCAST_CHANNEL_UPDATE" or event == "UNIT_SPELLCAST_DELAYED"
            or event == "UNIT_SPELLCAST_EMPOWER_START" or event == "UNIT_SPELLCAST_EMPOWER_UPDATE" then
@@ -3554,9 +3790,9 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             
             local typeMatch = true
             if activeCast.isChannel and isCastStop then
-                typeMatch = false  -- don't let a cast stop kill an active channel
+                typeMatch = false
             elseif not activeCast.isChannel and isChannelStop then
-                typeMatch = false  -- don't let a channel stop kill an active cast
+                typeMatch = false
             end
             
             if typeMatch and (not spellID or spellID == activeCast.spellID) then
@@ -3638,18 +3874,11 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 if row.isChargeSpell then
                     local cInfo = GetChargesWithOverride(row.spellID, row.baseSpellID)
                     if cInfo and cInfo.currentCharges then
-                        if not issecretvalue(cInfo.currentCharges) then
-                            row.chargesAvailable = cInfo.currentCharges
-                        else
-                            row.chargesAvailable = row.maxCharges or 2
-                        end
                         if not issecretvalue(cInfo.maxCharges) then
                             row.maxCharges = cInfo.maxCharges
                             local bH = row.cdBar.fullHeight or CONFIG.height
                             row.cdBar.laneHeight = (bH - (cInfo.maxCharges - 1)) / cInfo.maxCharges
                         end
-                    else
-                        row.chargesAvailable = row.maxCharges or 2
                     end
                     FeedChargeHiddenFrames(row)
                     FeedChargeBarTimers(row)
@@ -3658,7 +3887,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
             end
 
-            -- Re-apply ECM visibility after combat (catches TMW / Blizzard alpha restores)
+            -- Re-apply ECM visibility after combat
             if ns._pendingECMReapply then
                 ns._pendingECMReapply = nil
                 if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
