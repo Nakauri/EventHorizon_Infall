@@ -209,11 +209,11 @@ function ns.SeedProfileFromClassConfig(specKey)
     if CONFIG.cooldownColors then
         profile.cooldownColors = DeepCopy(CONFIG.cooldownColors)
     end
-    if CONFIG.stackIndicatorSettings then
-        profile.stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings)
+    if ns.classConfigDefaults and ns.classConfigDefaults.stackIndicatorSettings then
+        profile.stackIndicatorSettings = DeepCopy(ns.classConfigDefaults.stackIndicatorSettings)
     end
-    if CONFIG.stackIndicatorList and #CONFIG.stackIndicatorList > 0 then
-        profile.stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList)
+    if ns.classConfigDefaults and ns.classConfigDefaults.stackIndicatorList and #ns.classConfigDefaults.stackIndicatorList > 0 then
+        profile.stackIndicatorList = DeepCopy(ns.classConfigDefaults.stackIndicatorList)
     end
 
     -- Capture current frame position (per-character)
@@ -278,16 +278,12 @@ function ns.ApplyProfile(profile)
         end
     end
 
-    -- Strip stale single-entry spellColorMaps from old profiles where user
-    -- later set an explicit colour (auto-palette would override it in rendering)
+    -- Strip stale spellColorMaps from old profiles where user set an explicit colour
     if CONFIG.buffMappings then
         for _, mappings in pairs(CONFIG.buffMappings) do
             for _, mapData in ipairs(mappings) do
                 if mapData.color and mapData.spellColorMap then
-                    local firstKey = next(mapData.spellColorMap)
-                    if firstKey and not next(mapData.spellColorMap, firstKey) then
-                        mapData.spellColorMap = nil
-                    end
+                    mapData.spellColorMap = nil
                 end
             end
         end
