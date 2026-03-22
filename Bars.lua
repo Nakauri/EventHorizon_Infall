@@ -20,10 +20,14 @@ CONFIG.chargesDisabled = CONFIG.chargesDisabled or {}
 local activeCast
 local cachedGcdDurObj
 local shownSetupHint = false
+local SyncStackContainerLayout
 local permanentBuffCdIDs = {}
 local deferredGen = {}
 local specChangeToken = 0
 local specChangePending = false
+local SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeDepletedSlide", "activeChargeSlide"}
+local PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay"}
+local HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay"}
 
 local function GetCooldownColor(row)
     local c = CONFIG.cooldownColors[row.cooldownID]
@@ -108,7 +112,6 @@ local function GetInterpolation()
 end
 
 local UpdateChargeState
-local FeedChargeHiddenFrames
 local InstallBuffFrameHooks
 
 -- Apply CONFIG font (or fallback) to a FontString at a given size.
@@ -124,12 +127,10 @@ end
 
 local function GetChargesWithOverride(spellID, baseSpellID)
     local ok, info = pcall(C_Spell.GetSpellCharges, spellID)
-    if not ok then info = nil end
-    if not (info and info.maxCharges) then
+    if not (ok and info and info.maxCharges) then
         local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, baseSpellID or spellID)
         if ovOk and ovID and ovID ~= spellID then
             ok, info = pcall(C_Spell.GetSpellCharges, ovID)
-            if not ok then info = nil end
         end
     end
     return info
@@ -729,10 +730,19 @@ local function ApplyIconMode(row)
         row.icon:Show()
         row.iconBorder:Show()
         row.innerGlow:SetAlpha(0)  -- default hidden state, procs will show it
-        
+
         row.iconContainer:SetSize(CONFIG.iconSize, CONFIG.iconSize)
+        row.iconBorder:SetSize(CONFIG.iconSize + 2, CONFIG.iconSize + 2)
+        row.innerGlow:ClearAllPoints()
+        row.innerGlow:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+        row.innerGlow:SetPoint("BOTTOMRIGHT", row, "BOTTOMLEFT", CONFIG.iconSize, 0)
+        if row.iconGlow then
+            row.iconGlow:ClearAllPoints()
+            row.iconGlow:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+            row.iconGlow:SetPoint("BOTTOMRIGHT", row, "BOTTOMLEFT", CONFIG.iconSize, 0)
+        end
     end
-    
+
     local nowOffset = barOffset + nowPx
     
     row.cdBar:ClearAllPoints()
@@ -779,7 +789,7 @@ local function ApplyIconMode(row)
     if row.castTex then row.castTex:SetVertexColor(unpack(CONFIG.castColor)) end
     row.gcdBar:SetStatusBarColor(unpack(CONFIG.gcdColor))
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
-    row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 3, row:GetHeight())
+    row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 2, row:GetHeight())
 
     if row.barTextOverlay then
         row.barTextOverlay:ClearAllPoints()
@@ -810,6 +820,12 @@ local function ApplyBuffLayer(row)
     if row.depletedIndicator then row.depletedIndicator:SetFrameLevel(cdLevel) end
     if row.depletedWrapper then row.depletedWrapper:SetFrameLevel(cdLevel) end
     if row.notDepletedWrapper then row.notDepletedWrapper:SetFrameLevel(cdLevel) end
+    if row.middleClipIndicators then
+        for _, ind in pairs(row.middleClipIndicators) do ind:SetFrameLevel(cdLevel) end
+    end
+    if row.middleClipWrappers then
+        for _, wrap in pairs(row.middleClipWrappers) do wrap:SetFrameLevel(cdLevel) end
+    end
     -- Past clip frames mirror their future counterparts' frame levels
     if row.pastCdClip then
         row.pastCdClip:SetFrameLevel(cdLevel)
@@ -847,6 +863,7 @@ local function ApplyLayoutToAllBars()
     end
     
     CreateTimeLines()
+    if SyncStackContainerLayout then SyncStackContainerLayout() end
 end
 
 local function UpdateAllMinMax()
@@ -949,16 +966,6 @@ local function FeedHiddenCooldown(rowRef, timerType, durObj)
     end
 end
 
--- Event-driven hidden frame feeding for charge spells.
-FeedChargeHiddenFrames = function(row)
-    if not row.isChargeSpell then return end
-    local ok, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
-    if not ok then chargeDurObj = nil end
-
-    if chargeDurObj then FeedHiddenCooldown(row, "charge", chargeDurObj)
-    else FeedHiddenCooldown(row, "charge", nil) end
-end
-
 -- Event-driven charge bar fill via SetTimerDuration.
 local IMM_INTERP = Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate
 local REMAIN_DIR = Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.RemainingTime
@@ -1002,8 +1009,8 @@ FeedChargeBarTimers = function(row)
     FeedHiddenCooldown(row, "cd", cdDurObj)
 
     if chargeDurObj and IMM_INTERP and REMAIN_DIR then
-        pcall(row.depletedChargeBar.SetTimerDuration, row.depletedChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
-        pcall(row.normalChargeBar.SetTimerDuration, row.normalChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
+        row.depletedChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
+        row.normalChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
     else
         row.depletedChargeBar:SetValue(0)
         row.normalChargeBar:SetValue(0)
@@ -1014,7 +1021,7 @@ FeedChargeBarTimers = function(row)
             local ml = row.middleLanes[j]
             if ml then
                 if chargeDurObj and IMM_INTERP and REMAIN_DIR then
-                    pcall(ml.depletedChargeBar.SetTimerDuration, ml.depletedChargeBar, chargeDurObj, IMM_INTERP, REMAIN_DIR)
+                    ml.depletedChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
                 else
                     ml.depletedChargeBar:SetValue(0)
                 end
@@ -1236,7 +1243,7 @@ local function CreateCooldownBar(spellID, index)
     
     -- GCD spark
     row.gcdSpark = row.gcdBar:CreateTexture(nil, "OVERLAY", nil, 5)
-    row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 3, CONFIG.height)
+    row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 2, CONFIG.height)
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
     row.gcdSpark:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
     row.gcdSpark:Hide()
@@ -1545,6 +1552,7 @@ local buffViewerNames = {"BuffIconCooldownViewer", "BuffBarCooldownViewer"}
 -- Hook-maintained persistent maps: survive combat without frame pool iteration
 local persistentCooldownMap = {}
 local persistentBuffMap = {}
+local viewerScanDirty = true
 local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
 local hookedAuraFrames = setmetatable({}, { __mode = "k" })
 
@@ -1590,6 +1598,11 @@ ScanViewerFrames = function()
     if InCombatLockdown() then
         return persistentCooldownMap, persistentBuffMap
     end
+
+    if not viewerScanDirty then
+        return cachedCooldownViewerFrames, cachedBuffViewerFrames
+    end
+    viewerScanDirty = false
 
     wipe(cachedCooldownViewerFrames)
     wipe(cachedBuffViewerFrames)
@@ -1739,15 +1752,11 @@ UpdateChargeState = function(row)
 
     row.activeCooldown = nil
 
-    -- Icon cooldown swirl
-    local cdOk, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
-    local chargeOk, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
+    -- FeedChargeBarTimers caches row._cdDurObj, row._chargeDurObj (GCD-filtered)
+    FeedChargeBarTimers(row)
 
-    local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
-    local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
-    if isOnGCD then cdDurObj = nil end
-
-    local feedDurObj = cdDurObj or chargeDurObj
+    -- Icon cooldown swirl from cached values
+    local feedDurObj = row._cdDurObj or row._chargeDurObj
     if feedDurObj and CONFIG.reactiveIcons and not CONFIG.hideIcons and row.cooldownFrame then
         if feedDurObj ~= row.lastChargeDurObj then
             pcall(row.cooldownFrame.SetCooldownFromDurationObject, row.cooldownFrame, feedDurObj, false)
@@ -1758,9 +1767,6 @@ UpdateChargeState = function(row)
         row.cooldownFrame:Hide()
         row.lastChargeDurObj = nil
     end
-
-    -- Event-driven charge bar fill
-    FeedChargeBarTimers(row)
 end
 
 local function DetectPermanentBuff(unit, auraInstanceID, cdID)
@@ -1818,18 +1824,6 @@ UpdateBuffState = function(row, buffViewerFrames)
     local mappings = row.cooldownID and CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
 
     if row.cooldownID then
-        -- Self match: buff cooldownID == ability cooldownID
-        local selfFrame = buffViewerFrames[row.cooldownID]
-        if selfFrame and selfFrame.auraInstanceID then
-            wipe(_primaryBuffEntry)
-            _primaryBuffEntry.frame = selfFrame
-            _primaryBuffEntry.color = CONFIG.buffColor
-            _primaryBuffEntry.hasCustomColor = false
-            _primaryBuffEntry.unit = row._resolvedBuffUnit or selfFrame.auraDataUnit or "player"
-            _primaryBuffEntry.secretAuraSpellId = nil
-            primaryBuff = _primaryBuffEntry
-        end
-
         -- Mapping matches: direct lookup by each buffCooldownID
         if mappings then
             for mapIdx, mapData in ipairs(mappings) do
@@ -1845,8 +1839,10 @@ UpdateBuffState = function(row, buffViewerFrames)
                                 -- Single-entry: use directly (no aura data lookup needed)
                                 local firstKey, firstColor = next(mapData.spellColorMap)
                                 if firstKey and not next(mapData.spellColorMap, firstKey) then
-                                    matchedColor = firstColor
-                                    hasCustomColor = true
+                                    if not mapData.color then
+                                        matchedColor = firstColor
+                                        hasCustomColor = true
+                                    end
                                 else
                                     -- Multi-entry: try lookup, cache result for combat
                                     local aOk, aData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unitHint, buffFrame.auraInstanceID)
@@ -2181,14 +2177,8 @@ UpdateStackText = function(row, buffViewerFrames)
             ok, auraData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", buffFrame.auraInstanceID)
         end
         if ok and auraData then
-            -- applications may be secret, passthrough via SetText
-            local appOk, appVal = pcall(function()
-                if auraData.applications ~= nil then
-                    return auraData.applications
-                end
-                return nil
-            end)
-            if appOk and appVal ~= nil then
+            local appVal = auraData.applications
+            if appVal ~= nil then
                 row.stackText:SetText(appVal)
                 if stackMapping.color then
                     row.stackText:SetTextColor(unpack(stackMapping.color))
@@ -2526,8 +2516,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 end
 
                 -- Safety timeout
+                local safetyNow = GetTime()
                 local maxSlideDur = (row.maxCharges or 2) * (row.chargeDurationConstant or 12) + 2
-                if row._depletedSpawnTime and GetTime() - row._depletedSpawnTime > maxSlideDur then
+                if row._depletedSpawnTime and safetyNow - row._depletedSpawnTime > maxSlideDur then
                     if row.activeDepletedSlide then
                         row.activeDepletedSlide.tex:SetAlpha(row.activeDepletedSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     end
@@ -2535,7 +2526,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row.activeDepletedSlide = nil
                     row._depletedSpawnTime = nil
                 end
-                if row._chargeSpawnTime and GetTime() - row._chargeSpawnTime > maxSlideDur then
+                if row._chargeSpawnTime and safetyNow - row._chargeSpawnTime > maxSlideDur then
                     if row.activeChargeSlide then
                         row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                     end
@@ -2546,7 +2537,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 if row.middleLanes then
                     for j = 1, #row.middleLanes do
                         local ml = row.middleLanes[j]
-                        if ml and ml.activeSlide and ml._slideSpawnTime and GetTime() - ml._slideSpawnTime > maxSlideDur then
+                        if ml and ml.activeSlide and ml._slideSpawnTime and safetyNow - ml._slideSpawnTime > maxSlideDur then
                             ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
                             DetachPastSlide(ml.activeSlide)
                             ml.activeSlide = nil
@@ -2772,12 +2763,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     bar.isChargeSpell = isChargeSpell
 
     if isChargeSpell then
-        local maxC = detectedMaxCharges or 2
-        local currentC = maxC  -- default to full
-        if chargeInfo and chargeInfo.currentCharges and not issecretvalue(chargeInfo.currentCharges) then
-            currentC = chargeInfo.currentCharges
-        end
-        bar.maxCharges = maxC
+        bar.maxCharges = detectedMaxCharges or 2
     else
         bar.maxCharges = 1
     end
@@ -3146,7 +3132,9 @@ LoadEssentialCooldowns = function()
         sortedSpellIDs = filteredSpellIDs
         sortedCooldownIDs = filteredCooldownIDs
     end
-    
+
+    if ns.AutoPopulateSelfBuffMappings then ns.AutoPopulateSelfBuffMappings() end
+
     if #sortedSpellIDs == 0 then return end
     
     for i, spellID in ipairs(sortedSpellIDs) do
@@ -3449,6 +3437,7 @@ loginInitFrame:SetScript("OnEvent", function()
     if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
 
     PreCacheChargeSpells()
+    if ns.AutoPopulateSelfBuffMappings then ns.AutoPopulateSelfBuffMappings() end
 
     EH_Parent:SetMovable(true)
     EH_Parent:EnableMouse(true)
@@ -3517,6 +3506,7 @@ loginInitFrame:SetScript("OnEvent", function()
                 end
                 InstallBuffFrameHooks(frame)
                 MarkBuffDirtyForCdID(cdID)
+                viewerScanDirty = true
             end)
         end
         if CooldownViewerItemDataMixin.ClearCooldownID then
@@ -3527,12 +3517,14 @@ loginInitFrame:SetScript("OnEvent", function()
                     if persistentBuffMap[cdID] == frame then persistentBuffMap[cdID] = nil end
                     cdmFrameToCdID[frame] = nil
                     MarkBuffDirtyForCdID(cdID)
+                    viewerScanDirty = true
                 end
             end)
         end
     end
 
     EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
+        viewerScanDirty = true
         if InCombatLockdown() then return end
         C_Timer.After(0, function()
             if InCombatLockdown() then return end
@@ -3643,7 +3635,9 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         end
         
     elseif event == "PLAYER_ENTERING_WORLD" then
+        viewerScanDirty = true
         C_Timer.After(2, function()
+            viewerScanDirty = true
             if ns.EnrichAllMappings then ns.EnrichAllMappings() end
             if #cooldownBars == 0 then LoadEssentialCooldowns() end
         end)
@@ -3681,13 +3675,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
         UpdateBars()
 
-        -- Event-driven charge bar fill (OctoChargeBar pattern)
-        for _, row in ipairs(cooldownBars) do
-            if row.isChargeSpell then
-                FeedChargeBarTimers(row)
-            end
-        end
-
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
 
@@ -3710,8 +3697,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
             if isMatch then
                 if row.isChargeSpell then
-                    FeedChargeHiddenFrames(row)
-                    FeedChargeBarTimers(row)
                     UpdateBars()
                     ScheduleDeferredUpdate(0)
                 end
@@ -3855,10 +3840,11 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         UpdateVisibility()
         
         if event == "PLAYER_REGEN_ENABLED" then
+            viewerScanDirty = true
             for _, row in ipairs(cooldownBars) do
                 row.cachedPandemicIcon = nil
                 -- Detach active slides so they drift off naturally
-                for _, key in ipairs({"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeDepletedSlide", "activeChargeSlide"}) do
+                for _, key in ipairs(SLIDE_KEYS) do
                     if row[key] then DetachPastSlide(row[key]) end
                     row[key] = nil
                 end
@@ -3870,10 +3856,10 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         ml.activeSlide = nil
                     end
                 end
-                for _, key in ipairs({"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay"}) do
+                for _, key in ipairs(PTR_KEYS) do
                     row[key] = nil
                 end
-                for _, key in ipairs({"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay"}) do
+                for _, key in ipairs(HIDDEN_KEYS) do
                     if row[key] then row[key]:SetCooldown(0, 0) end
                 end
 
@@ -3887,7 +3873,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                             row.cdBar.laneHeight = (bH - (cInfo.maxCharges - 1)) / cInfo.maxCharges
                         end
                     end
-                    FeedChargeHiddenFrames(row)
                     FeedChargeBarTimers(row)
                 end
 
@@ -4150,9 +4135,8 @@ SlashCmdList["INFALL"] = function(msg)
             if n and n >= 0 and n <= 30 then
                 CONFIG.iconGap = n
                 ApplyLayoutToAllBars()
-                print("|cff00ff00[Infall]|r Icon gap set to " .. n .. "px (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.iconGap = " .. n .. "|r")
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Icon gap set to " .. n .. "px")
             else
                 print("|cff00ff00[Infall]|r Gap must be between 0 and 30. Usage: /infall gap 0")
             end
@@ -4194,9 +4178,8 @@ SlashCmdList["INFALL"] = function(msg)
             if n and n >= 0.5 and n <= 3.0 then
                 CONFIG.scale = n
                 EH_Parent:SetScale(n)
-                print("|cff00ff00[Infall]|r Scale set to " .. n .. " (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.scale = " .. n .. "|r")
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Scale set to " .. n)
             else
                 print("|cff00ff00[Infall]|r Scale must be between 0.5 and 3.0")
             end
@@ -4210,9 +4193,8 @@ SlashCmdList["INFALL"] = function(msg)
             if val == "off" or val == "none" or val == "0" then
                 CONFIG.lines = nil
                 CreateTimeLines()
-                print("|cff00ff00[Infall]|r Time markers: |cffff0000DISABLED|r (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.lines = nil|r")
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Time markers: |cffff0000DISABLED|r")
             else
                 local newLines = {}
                 for num in val:gmatch("[%d%.]+") do
@@ -4224,10 +4206,9 @@ SlashCmdList["INFALL"] = function(msg)
                 if #newLines > 0 then
                     CONFIG.lines = newLines
                     CreateTimeLines()
+                    if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
                     local str = table.concat(newLines, ", ")
-                    print("|cff00ff00[Infall]|r Time markers at: " .. str .. "s (until reload)")
-                    print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                    print("|cffaaaaaa  CONFIG.lines = {" .. str .. "}|r")
+                    print("|cff00ff00[Infall]|r Time markers at: " .. str .. "s")
                 else
                     print("|cff00ff00[Infall]|r Invalid input. Usage: /infall lines 1 3 7")
                 end
@@ -4247,9 +4228,8 @@ SlashCmdList["INFALL"] = function(msg)
             if val == "off" or val == "none" or val == "0" then
                 CONFIG.staticHeight = nil
                 ApplyLayoutToAllBars()
-                print("|cff00ff00[Infall]|r Static height: |cffff0000DISABLED|r (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.staticHeight = nil|r")
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Static height: |cffff0000DISABLED|r")
             else
                 local parts = {}
                 for num in val:gmatch("[%d%.]+") do
@@ -4261,16 +4241,12 @@ SlashCmdList["INFALL"] = function(msg)
                         CONFIG.staticFrames = math.floor(parts[2])
                     end
                     ApplyLayoutToAllBars()
+                    if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
                     local msg_out = "|cff00ff00[Infall]|r Static height: |cff00ff00" .. CONFIG.staticHeight .. "px|r"
                     if (CONFIG.staticFrames or 0) > 0 then
                         msg_out = msg_out .. " (min " .. CONFIG.staticFrames .. " bars)"
                     end
-                    print(msg_out .. " (until reload)")
-                    print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                    print("|cffaaaaaa  CONFIG.staticHeight = " .. CONFIG.staticHeight .. "|r")
-                    if parts[2] then
-                        print("|cffaaaaaa  CONFIG.staticFrames = " .. CONFIG.staticFrames .. "|r")
-                    end
+                    print(msg_out)
                 else
                     print("|cff00ff00[Infall]|r Height must be at least 40. Usage: /infall static 150 or /infall static 150 4")
                 end
@@ -4289,17 +4265,15 @@ SlashCmdList["INFALL"] = function(msg)
             if val == "off" or val == "none" or val == "0" then
                 CONFIG.past = 0
                 ApplyLayoutToAllBars()
-                print("|cff00ff00[Infall]|r Past region: |cffff0000DISABLED|r (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.past = 0|r")
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Past region: |cffff0000DISABLED|r")
             else
                 local n = tonumber(val)
                 if n and n >= 0 and n <= 10 then
                     CONFIG.past = n
                     ApplyLayoutToAllBars()
-                    print("|cff00ff00[Infall]|r Past region: |cff00ff00" .. n .. "s|r (until reload)")
-                    print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                    print("|cffaaaaaa  CONFIG.past = " .. n .. "|r")
+                    if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                    print("|cff00ff00[Infall]|r Past region: |cff00ff00" .. n .. "s|r")
                 else
                     print("|cff00ff00[Infall]|r Past must be between 0 and 10. Usage: /infall past 2.5")
                 end
@@ -4322,13 +4296,8 @@ SlashCmdList["INFALL"] = function(msg)
                     CONFIG.nowLineColor = {parts[2], parts[3], parts[4], parts[5] or 0.7}
                 end
                 ApplyLayoutToAllBars()
-                print("|cff00ff00[Infall]|r Now line: width=" .. CONFIG.nowLineWidth .. "px (until reload)")
-                print("|cff00ff00[Infall]|r Use |cffffff00/infall setup|r to save to your profile, or add to ClassConfig:")
-                print("|cffaaaaaa  CONFIG.nowLineWidth = " .. CONFIG.nowLineWidth .. "|r")
-                if parts[2] and parts[3] and parts[4] then
-                    local c = CONFIG.nowLineColor
-                    print("|cffaaaaaa  CONFIG.nowLineColor = {" .. c[1] .. ", " .. c[2] .. ", " .. c[3] .. ", " .. c[4] .. "}|r")
-                end
+                if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+                print("|cff00ff00[Infall]|r Now line: width=" .. CONFIG.nowLineWidth .. "px")
             else
                 print("|cff00ff00[Infall]|r Usage: /infall nowline 2 or /infall nowline 2 1 1 1 0.7")
             end
@@ -4391,3 +4360,486 @@ ns.HideVariantPreview = function()
         end
     end
 end
+
+-- ============================================================================
+-- STACK INDICATORS
+-- ============================================================================
+
+local SI_DEFAULTS = {
+    position = "TOP",
+    gap = 2,
+    pipHeight = 6,
+    pipSpacing = 1,
+    rowSpacing = 1,
+    borderSize = 1,
+    emptyColor = {0.12, 0.12, 0.12, 0.6},
+    glowAtMax = true,
+    glowColor = {1, 1, 1, 0.6},
+}
+
+local function GetSISettings()
+    if not CONFIG.stackIndicatorSettings then
+        CONFIG.stackIndicatorSettings = {}
+    end
+    local s = CONFIG.stackIndicatorSettings
+    for k, v in pairs(SI_DEFAULTS) do
+        if s[k] == nil then
+            if type(v) == "table" then
+                s[k] = {unpack(v)}
+            else
+                s[k] = v
+            end
+        end
+    end
+    return s
+end
+
+local function GetSIList()
+    if not CONFIG.stackIndicatorList then
+        CONFIG.stackIndicatorList = {}
+    end
+    return CONFIG.stackIndicatorList
+end
+
+local stackContainerTop
+local stackContainerBottom
+local siHooksInstalled = false
+local indicatorRows = {}
+local siIsBuilt = false
+local siRowPool = {}
+
+local function SnapPx(value, scale)
+    if value == 0 then return 0 end
+    local px = 768 / select(2, GetPhysicalScreenSize()) / scale
+    return math.floor(value / px + 0.5) * px
+end
+
+local function CreateSIPip(parent, index, indicatorConfig, settings)
+    local maxStacks = indicatorConfig.maxStacks or 3
+    local hasOverflow = indicatorConfig.overflowMax and indicatorConfig.overflowMax > maxStacks
+    local bs = settings.borderSize
+
+    local pip = CreateFrame("Frame", nil, parent)
+
+    local bc = settings.borderColor or CONFIG.bordercolor or {0, 0, 0, 1}
+    local br, bg2, bb, ba = bc[1], bc[2], bc[3], bc[4] or 1
+    if bs > 0 then
+        local bTop = pip:CreateTexture(nil, "BACKGROUND")
+        bTop:SetPoint("TOPLEFT") bTop:SetPoint("TOPRIGHT")
+        bTop:SetHeight(bs)
+        bTop:SetColorTexture(br, bg2, bb, ba)
+
+        local bBot = pip:CreateTexture(nil, "BACKGROUND")
+        bBot:SetPoint("BOTTOMLEFT") bBot:SetPoint("BOTTOMRIGHT")
+        bBot:SetHeight(bs)
+        bBot:SetColorTexture(br, bg2, bb, ba)
+
+        local bLeft = pip:CreateTexture(nil, "BACKGROUND")
+        bLeft:SetPoint("TOPLEFT", 0, -bs) bLeft:SetPoint("BOTTOMLEFT", 0, bs)
+        bLeft:SetWidth(bs)
+        bLeft:SetColorTexture(br, bg2, bb, ba)
+
+        local bRight = pip:CreateTexture(nil, "BACKGROUND")
+        bRight:SetPoint("TOPRIGHT", 0, -bs) bRight:SetPoint("BOTTOMRIGHT", 0, bs)
+        bRight:SetWidth(bs)
+        bRight:SetColorTexture(br, bg2, bb, ba)
+    end
+
+    local ec = settings.emptyColor
+    local emptyTex = pip:CreateTexture(nil, "BORDER")
+    emptyTex:SetPoint("TOPLEFT", bs, -bs)
+    emptyTex:SetPoint("BOTTOMRIGHT", -bs, bs)
+    emptyTex:SetColorTexture(ec[1], ec[2], ec[3], ec[4] or 0.6)
+
+    local baseBar = CreateFrame("StatusBar", nil, pip)
+    baseBar:SetPoint("TOPLEFT", pip, "TOPLEFT", bs, -bs)
+    baseBar:SetPoint("BOTTOMRIGHT", pip, "BOTTOMRIGHT", -bs, bs)
+    baseBar:SetMinMaxValues(index - 1, index)
+    baseBar:SetValue(0)
+    baseBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
+
+    local color = indicatorConfig.stackColors and indicatorConfig.stackColors[index]
+    if not color then color = indicatorConfig.color or {0.8, 0.2, 0.1, 1} end
+    baseBar:SetStatusBarColor(color[1], color[2], color[3], color[4] or 1)
+    CrispBar(baseBar)
+
+    pip.baseBar = baseBar
+
+    if hasOverflow then
+        local overflowBar = CreateFrame("StatusBar", nil, pip)
+        overflowBar:SetPoint("TOPLEFT", pip, "TOPLEFT", bs, -bs)
+        overflowBar:SetPoint("BOTTOMRIGHT", pip, "BOTTOMRIGHT", -bs, bs)
+        overflowBar:SetMinMaxValues(maxStacks + index - 1, maxStacks + index)
+        overflowBar:SetValue(0)
+        overflowBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
+        overflowBar:SetFrameLevel(baseBar:GetFrameLevel() + 1)
+
+        local oc = indicatorConfig.overflowColor or {1, 0.8, 0.2, 1}
+        overflowBar:SetStatusBarColor(oc[1], oc[2], oc[3], oc[4] or 1)
+        CrispBar(overflowBar)
+
+        pip.overflowBar = overflowBar
+    end
+
+    return pip
+end
+
+local function CreateSIGlowOverlay(parent, settings, totalMax)
+    -- StatusBar-based glow: fills to 100% at totalMax via SetValue (secret passthrough).
+    -- No Lua comparison needed — engine handles the fill threshold.
+    local glowBar = CreateFrame("StatusBar", nil, parent)
+    glowBar:SetAllPoints()
+    glowBar:SetFrameLevel(parent:GetFrameLevel() + 10)
+    glowBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
+    glowBar:SetMinMaxValues(totalMax - 0.5, totalMax)
+    glowBar:SetValue(0)
+
+    local gc = settings.glowColor or {1, 1, 1, 0.6}
+    glowBar:GetStatusBarTexture():SetVertexColor(gc[1], gc[2], gc[3], gc[4] or 0.6)
+
+    local ag = glowBar:CreateAnimationGroup()
+    ag:SetLooping("REPEAT")
+
+    local fadeIn = ag:CreateAnimation("Alpha")
+    fadeIn:SetFromAlpha(0)
+    fadeIn:SetToAlpha(1)
+    fadeIn:SetDuration(0.65)
+    fadeIn:SetOrder(1)
+
+    local fadeOut = ag:CreateAnimation("Alpha")
+    fadeOut:SetFromAlpha(1)
+    fadeOut:SetToAlpha(0)
+    fadeOut:SetDuration(0.65)
+    fadeOut:SetOrder(2)
+
+    ag:Play()
+
+    return glowBar
+end
+
+local function SyncStackLayout()
+    if not EH_Parent then return end
+    if not stackContainerTop and not stackContainerBottom then return end
+    local settings = GetSISettings()
+    local gap = settings.gap or 2
+    local pipHeight = settings.pipHeight or 6
+    local pipSpacing = settings.pipSpacing or 1
+    local rowSpacing = settings.rowSpacing or 1
+    local containerWidth = EH_Parent:GetWidth()
+
+    local function LayoutContainer(container, rows, isBottom)
+        if not container then return end
+        container:ClearAllPoints()
+        if isBottom then
+            container:SetPoint("TOPLEFT", EH_Parent, "BOTTOMLEFT", 0, -gap)
+            container:SetPoint("TOPRIGHT", EH_Parent, "BOTTOMRIGHT", 0, -gap)
+        else
+            container:SetPoint("BOTTOMLEFT", EH_Parent, "TOPLEFT", 0, gap)
+            container:SetPoint("BOTTOMRIGHT", EH_Parent, "TOPRIGHT", 0, gap)
+        end
+
+        local totalHeight = 0
+        local layoutOrder = rows
+        if not isBottom then
+            layoutOrder = {}
+            for ri = #rows, 1, -1 do layoutOrder[#layoutOrder + 1] = rows[ri] end
+        end
+        for _, rowData in ipairs(layoutOrder) do
+            local numPips = #rowData.pips
+            if numPips > 0 and rowData.frame:IsShown() then
+                local rowFrame = rowData.frame
+                rowFrame:ClearAllPoints()
+                if isBottom then
+                    rowFrame:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -totalHeight)
+                    rowFrame:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, -totalHeight)
+                else
+                    rowFrame:SetPoint("BOTTOMLEFT", container, "BOTTOMLEFT", 0, totalHeight)
+                    rowFrame:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, totalHeight)
+                end
+                rowFrame:SetHeight(pipHeight)
+
+                local es = rowFrame:GetEffectiveScale()
+                local onePx = 768 / select(2, GetPhysicalScreenSize()) / es
+                local snap = function(v) return math.floor(v / onePx + 0.5) * onePx end
+                local snappedSpacing = snap(pipSpacing)
+                local idealPipW = (containerWidth - (numPips - 1) * snappedSpacing) / numPips
+                local stride = idealPipW + snappedSpacing
+                for j, pip in ipairs(rowData.pips) do
+                    local idx = j - 1
+                    local startX = snap(idx * stride)
+                    local endX = (j == numPips) and containerWidth or snap(idx * stride + idealPipW)
+                    pip:ClearAllPoints()
+                    pip:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", startX, 0)
+                    pip:SetSize(endX - startX, pipHeight)
+                end
+
+                if rowData.glow then
+                    rowData.glow:ClearAllPoints()
+                    rowData.glow:SetAllPoints(rowFrame)
+                end
+
+                totalHeight = totalHeight + pipHeight + rowSpacing
+            end
+        end
+        if totalHeight > 0 then totalHeight = totalHeight - rowSpacing end
+        container:SetHeight(math.max(totalHeight, 1))
+        local parentVisible = EH_Parent and EH_Parent:IsShown()
+        if totalHeight == 0 or not parentVisible then container:Hide() else container:Show() end
+    end
+
+    local topRows, bottomRows = {}, {}
+    for _, rowData in ipairs(indicatorRows) do
+        if rowData.position == "BOTTOM" then
+            bottomRows[#bottomRows + 1] = rowData
+        else
+            topRows[#topRows + 1] = rowData
+        end
+    end
+
+    LayoutContainer(stackContainerTop, topRows, false)
+    LayoutContainer(stackContainerBottom, bottomRows, true)
+end
+
+SyncStackContainerLayout = function()
+    if siIsBuilt and CONFIG.stackIndicators then
+        SyncStackLayout()
+    end
+end
+
+local function UpdateAllSIPips()
+    if not siHooksInstalled and EH_Parent then
+        EH_Parent:HookScript("OnShow", function()
+            if siIsBuilt and CONFIG.stackIndicators then
+                if stackContainerTop then stackContainerTop:Show() end
+                if stackContainerBottom then stackContainerBottom:Show() end
+                SyncStackLayout()
+            end
+        end)
+        EH_Parent:HookScript("OnHide", function()
+            if stackContainerTop then stackContainerTop:Hide() end
+            if stackContainerBottom then stackContainerBottom:Hide() end
+        end)
+        siHooksInstalled = true
+    end
+    local list = GetSIList()
+    local settings = GetSISettings()
+    local layoutDirty = false
+
+    for i, rowData in ipairs(indicatorRows) do
+        local config = list[i]
+        if config then
+            local applications = 0
+
+            local buffFrame = config.cooldownID and persistentBuffMap[config.cooldownID]
+            if buffFrame and buffFrame.auraInstanceID ~= nil then
+                local unit = buffFrame.auraDataUnit or "player"
+                local ok, auraData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, buffFrame.auraInstanceID)
+                if ok and auraData then
+                    local appVal = auraData.applications
+                    if appVal ~= nil then
+                        applications = appVal
+                    end
+                end
+            end
+
+            -- Hide when empty
+            local wasShown = rowData.frame:IsShown()
+            if config.hideWhenEmpty then
+                local hideOk, isEmpty = pcall(function() return applications == 0 end)
+                if hideOk and isEmpty then
+                    rowData.frame:Hide()
+                else
+                    rowData.frame:Show()
+                end
+            else
+                rowData.frame:Show()
+            end
+            if rowData.frame:IsShown() ~= wasShown then
+                layoutDirty = true
+            end
+
+            for _, pip in ipairs(rowData.pips) do
+                pip.baseBar:SetValue(applications)
+                if pip.overflowBar then
+                    pip.overflowBar:SetValue(applications)
+                end
+            end
+
+            if settings.glowAtMax and rowData.glow then
+                rowData.glow:SetValue(applications)
+            end
+        end
+    end
+
+    if layoutDirty then
+        SyncStackLayout()
+    end
+end
+
+local function WipeSIIndicators()
+    for _, rowData in ipairs(indicatorRows) do
+        if rowData.glow then
+            rowData.glow:SetValue(0)
+            rowData.glow:Hide()
+        end
+        for _, pip in ipairs(rowData.pips) do
+            pip:Hide()
+            pip:SetParent(nil)
+        end
+        rowData.frame:Hide()
+        siRowPool[#siRowPool + 1] = rowData.frame
+    end
+    wipe(indicatorRows)
+    if stackContainerTop then stackContainerTop:Hide() end
+    if stackContainerBottom then stackContainerBottom:Hide() end
+end
+
+local function AcquireSIRow(parent)
+    local frame = table.remove(siRowPool)
+    if frame then
+        frame:SetParent(parent)
+        frame:ClearAllPoints()
+        for _, region in pairs({frame:GetRegions()}) do
+            region:Hide()
+            region:SetParent(nil)
+        end
+        for _, child in pairs({frame:GetChildren()}) do
+            child:Hide()
+            child:SetParent(nil)
+        end
+        return frame
+    end
+    return CreateFrame("Frame", nil, parent)
+end
+
+local function BuildSIIndicators()
+    WipeSIIndicators()
+
+    if not CONFIG.stackIndicators then
+        siIsBuilt = false
+        return
+    end
+
+    local list = GetSIList()
+    if #list == 0 then
+        siIsBuilt = false
+        return
+    end
+
+    local settings = GetSISettings()
+
+    if not stackContainerTop then
+        stackContainerTop = CreateFrame("Frame", "EH_StackIndicatorTop", UIParent)
+        stackContainerTop:SetFrameStrata("MEDIUM")
+        stackContainerBottom = CreateFrame("Frame", "EH_StackIndicatorBottom", UIParent)
+        stackContainerBottom:SetFrameStrata("MEDIUM")
+    end
+
+    if not siHooksInstalled and EH_Parent then
+        EH_Parent:HookScript("OnShow", function()
+            if siIsBuilt and CONFIG.stackIndicators then
+                if stackContainerTop then stackContainerTop:Show() end
+                if stackContainerBottom then stackContainerBottom:Show() end
+                SyncStackLayout()
+            end
+        end)
+        EH_Parent:HookScript("OnHide", function()
+            if stackContainerTop then stackContainerTop:Hide() end
+            if stackContainerBottom then stackContainerBottom:Hide() end
+        end)
+        siHooksInstalled = true
+    end
+
+    for i, config in ipairs(list) do
+        local pos = config.position or settings.position or "TOP"
+        local parentContainer = (pos == "BOTTOM") and stackContainerBottom or stackContainerTop
+        local rowFrame = AcquireSIRow(parentContainer)
+        local pips = {}
+        local numPips = config.maxStacks or 3
+
+        -- Resolve colorZones into stackColors for CreateSIPip
+        local resolvedConfig = config
+        if config.colorZones and #config.colorZones > 0 then
+            resolvedConfig = {
+                maxStacks = config.maxStacks,
+                overflowMax = config.overflowMax,
+                overflowColor = config.overflowColor,
+                color = config.color,
+            }
+            local zones = {}
+            for _, z in ipairs(config.colorZones) do zones[#zones + 1] = z end
+            table.sort(zones, function(a, b) return a.fromStack < b.fromStack end)
+            local stackColors = {}
+            local zIdx = 1
+            for p = 1, numPips do
+                while zIdx < #zones and zones[zIdx + 1].fromStack <= p do
+                    zIdx = zIdx + 1
+                end
+                stackColors[p] = zones[zIdx].color
+            end
+            resolvedConfig.stackColors = stackColors
+        end
+
+        for j = 1, numPips do
+            local pip = CreateSIPip(rowFrame, j, resolvedConfig, settings)
+            pips[j] = pip
+        end
+
+        local glow = nil
+        if settings.glowAtMax then
+            local totalMax = config.overflowMax or config.maxStacks or 3
+            glow = CreateSIGlowOverlay(rowFrame, settings, totalMax)
+        end
+
+        indicatorRows[i] = {
+            frame = rowFrame,
+            pips = pips,
+            glow = glow,
+            position = pos,
+        }
+    end
+
+    SyncStackLayout()
+    siIsBuilt = true
+    if not EH_Parent or not EH_Parent:IsShown() then
+        if stackContainerTop then stackContainerTop:Hide() end
+        if stackContainerBottom then stackContainerBottom:Hide() end
+    end
+end
+
+function ns.RebuildStackIndicators()
+    BuildSIIndicators()
+    if siIsBuilt then
+        UpdateAllSIPips()
+    end
+end
+
+local siEventFrame = CreateFrame("Frame")
+siEventFrame:RegisterUnitEvent("UNIT_AURA", "player")
+siEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+siEventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+
+local lastSIUpdate = 0
+local SI_THROTTLE = 0.1
+siEventFrame:SetScript("OnEvent", function(self, event)
+    if event == "UNIT_AURA" then
+        local now = GetTime()
+        if now - lastSIUpdate < SI_THROTTLE then return end
+        lastSIUpdate = now
+        if siIsBuilt then
+            UpdateAllSIPips()
+        end
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        C_Timer.After(2.5, function()
+            if CONFIG.stackIndicators then
+                BuildSIIndicators()
+                UpdateAllSIPips()
+            end
+        end)
+    elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+        C_Timer.After(1, function()
+            BuildSIIndicators()
+            if siIsBuilt then UpdateAllSIPips() end
+        end)
+    end
+end)
