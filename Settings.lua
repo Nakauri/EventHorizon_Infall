@@ -18,7 +18,7 @@ local TOGGLE_KEYS = {
     "hideEssentialCD", "hideUtilityCD", "hideBuffIconCD", "hideBuffBarCD",
     "buffLayerAbove", "hideIcons", "clickthrough",
     "showVariantNames", "smoothBars", "showPastBars",
-    "forceViewersAlways",
+    "forceViewersAlways", "stackIndicators",
 }
 
 local DISPLAY_KEYS = {
@@ -52,6 +52,19 @@ local function DeepCopy(v)
     return copy
 end
 
+local debouncedGen = 0
+local function DebouncedApplyAndSave(extraFn)
+    debouncedGen = debouncedGen + 1
+    local myGen = debouncedGen
+    C_Timer.After(0.1, function()
+        if myGen == debouncedGen then
+            if extraFn then extraFn() end
+            if ns.ApplyLayoutToAllBars then ns.ApplyLayoutToAllBars() end
+            if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
+        end
+    end)
+end
+
 local VARIANT_PALETTE = {
     {0.9, 0.5, 0.1, 0.6},
     {0.3, 0.8, 0.3, 0.6},
@@ -62,6 +75,7 @@ local VARIANT_PALETTE = {
 
 local function EnrichWithLinkedSpells(mapData)
     if not mapData or mapData.spellColorMap then return end
+    if mapData.color then return end
     if not mapData.buffCooldownIDs or not mapData.buffCooldownIDs[1] then return end
     if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
 
@@ -82,6 +96,59 @@ function ns.EnrichAllMappings()
         for _, mapData in ipairs(mappings) do
             EnrichWithLinkedSpells(mapData)
         end
+    end
+end
+
+function ns.AutoPopulateSelfBuffMappings()
+    if InCombatLockdown() then return end
+    if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then return end
+    if not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
+
+    local cooldownIDs = {}
+    local success, result = pcall(function()
+        return C_CooldownViewer.GetCooldownViewerCategorySet(0, false)
+    end)
+    if success and result then cooldownIDs = result end
+
+    CONFIG.buffMappings = CONFIG.buffMappings or {}
+    local created = false
+
+    for _, cooldownID in ipairs(cooldownIDs) do
+        if CONFIG.buffMappings[cooldownID] == nil then
+            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+            if infoOk and cdInfo and cdInfo.hasAura then
+                local mapping = { buffCooldownIDs = { cooldownID } }
+                if cdInfo.spellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
+                    mapping.unit = "target"
+                end
+                EnrichWithLinkedSpells(mapping)
+                CONFIG.buffMappings[cooldownID] = { mapping }
+                created = true
+            end
+        else
+            -- Patch existing self-mappings missing unit field
+            local existing = CONFIG.buffMappings[cooldownID]
+            if type(existing) == "table" then
+                for _, mapData in ipairs(existing) do
+                    if mapData.unit == nil and mapData.buffCooldownIDs then
+                        for _, bcdID in ipairs(mapData.buffCooldownIDs) do
+                            if bcdID == cooldownID then
+                                local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+                                if infoOk and cdInfo and cdInfo.spellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
+                                    mapData.unit = "target"
+                                    created = true
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if created then
+        ns.SaveCurrentProfile()
     end
 end
 
@@ -106,6 +173,8 @@ function ns.SeedProfileFromClassConfig(specKey)
         chargesDisabled = {},
         castColors = {},
         cooldownColors = {},
+        stackIndicatorSettings = {},
+        stackIndicatorList = {},
     }
 
     for _, key in ipairs(TOGGLE_KEYS) do
@@ -139,6 +208,12 @@ function ns.SeedProfileFromClassConfig(specKey)
     end
     if CONFIG.cooldownColors then
         profile.cooldownColors = DeepCopy(CONFIG.cooldownColors)
+    end
+    if CONFIG.stackIndicatorSettings then
+        profile.stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings)
+    end
+    if CONFIG.stackIndicatorList and #CONFIG.stackIndicatorList > 0 then
+        profile.stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList)
     end
 
     -- Capture current frame position (per-character)
@@ -203,6 +278,21 @@ function ns.ApplyProfile(profile)
         end
     end
 
+    -- Strip stale single-entry spellColorMaps from old profiles where user
+    -- later set an explicit colour (auto-palette would override it in rendering)
+    if CONFIG.buffMappings then
+        for _, mappings in pairs(CONFIG.buffMappings) do
+            for _, mapData in ipairs(mappings) do
+                if mapData.color and mapData.spellColorMap then
+                    local firstKey = next(mapData.spellColorMap)
+                    if firstKey and not next(mapData.spellColorMap, firstKey) then
+                        mapData.spellColorMap = nil
+                    end
+                end
+            end
+        end
+    end
+
     -- Auto-detect variant spells for any mapping missing spellColorMap
     if CONFIG.buffMappings then
         for _, mappings in pairs(CONFIG.buffMappings) do
@@ -215,8 +305,24 @@ function ns.ApplyProfile(profile)
     if profile.extraCasts then
         CONFIG.extraCasts = DeepCopy(profile.extraCasts)
     end
+    if ns.classConfigDefaults and ns.classConfigDefaults.extraCasts then
+        CONFIG.extraCasts = CONFIG.extraCasts or {}
+        for cdID, defaultCasts in pairs(ns.classConfigDefaults.extraCasts) do
+            if not CONFIG.extraCasts[cdID] then
+                CONFIG.extraCasts[cdID] = DeepCopy(defaultCasts)
+            end
+        end
+    end
     if profile.stackMappings then
         CONFIG.stackMappings = DeepCopy(profile.stackMappings)
+    end
+    if ns.classConfigDefaults and ns.classConfigDefaults.stackMappings then
+        CONFIG.stackMappings = CONFIG.stackMappings or {}
+        for cdID, defaultMapping in pairs(ns.classConfigDefaults.stackMappings) do
+            if not CONFIG.stackMappings[cdID] then
+                CONFIG.stackMappings[cdID] = DeepCopy(defaultMapping)
+            end
+        end
     end
     if profile.hiddenCooldownIDs then
         CONFIG.hiddenCooldownIDs = DeepCopy(profile.hiddenCooldownIDs)
@@ -229,6 +335,12 @@ function ns.ApplyProfile(profile)
     end
     if profile.cooldownColors then
         CONFIG.cooldownColors = DeepCopy(profile.cooldownColors)
+    end
+    if profile.stackIndicatorSettings then
+        CONFIG.stackIndicatorSettings = DeepCopy(profile.stackIndicatorSettings)
+    end
+    if profile.stackIndicatorList then
+        CONFIG.stackIndicatorList = DeepCopy(profile.stackIndicatorList)
     end
 
     -- Restore per-profile frame position
@@ -254,6 +366,9 @@ function ns.ApplyProfile(profile)
     end
     if ns.ApplyECMVisibility then
         ns.ApplyECMVisibility()
+    end
+    if ns.RebuildStackIndicators then
+        ns.RebuildStackIndicators()
     end
 end
 
@@ -284,6 +399,8 @@ function ns.SaveCurrentProfile()
     profile.chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {})
     profile.castColors = DeepCopy(CONFIG.castColors or {})
     profile.cooldownColors = DeepCopy(CONFIG.cooldownColors or {})
+    profile.stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings or {})
+    profile.stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {})
 
     -- Save current frame position (per-character)
     if EH_Parent then
@@ -308,6 +425,8 @@ ns.classConfigDefaults = {
     chargesDisabled = DeepCopy(CONFIG.chargesDisabled or {}),
     castColors = DeepCopy(CONFIG.castColors or {}),
     cooldownColors = DeepCopy(CONFIG.cooldownColors or {}),
+    stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings or {}),
+    stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
     ns.classConfigDefaults.toggles[key] = CONFIG[key]
@@ -420,26 +539,30 @@ local function CreateSlider(parent, label, minVal, maxVal, step, default, onChan
     valueBox:SetJustifyH("CENTER")
     valueBox:SetText(string.format(fmtStr, default or minVal))
 
+    local currentVal = default or minVal
+
     valueBox:SetScript("OnEnterPressed", function(self)
         local num = tonumber(self:GetText())
         if num then
-            num = math.max(minVal, math.min(maxVal, num))
+            num = math.max(minVal, num)
             num = math.floor(num / step + 0.5) * step
-            slider:SetValue(num)
+            currentVal = num
+            slider:SetValue(math.min(num, maxVal))
             self:SetText(string.format(fmtStr, num))
             if onChange then onChange(num) end
         else
-            self:SetText(string.format(fmtStr, slider:GetValue()))
+            self:SetText(string.format(fmtStr, currentVal))
         end
         self:ClearFocus()
     end)
     valueBox:SetScript("OnEscapePressed", function(self)
-        self:SetText(string.format(fmtStr, slider:GetValue()))
+        self:SetText(string.format(fmtStr, currentVal))
         self:ClearFocus()
     end)
 
     slider:SetScript("OnValueChanged", function(self, value)
         value = math.floor(value / step + 0.5) * step
+        currentVal = value
         valueBox:SetText(string.format(fmtStr, value))
         if onChange then onChange(value) end
     end)
@@ -448,7 +571,8 @@ local function CreateSlider(parent, label, minVal, maxVal, step, default, onChan
     container.valueBox = valueBox
 
     function container:SetValue(v)
-        slider:SetValue(v)
+        currentVal = v
+        slider:SetValue(math.min(v, maxVal))
         valueBox:SetText(string.format(fmtStr, v))
     end
 
@@ -761,7 +885,7 @@ end
 -- TAB SYSTEM
 -- ============================================================================
 
-local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Profiles"}
+local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Profiles"}
 local tabFrames = {}
 local tabButtons = {}
 local currentTab = 1
@@ -834,6 +958,1262 @@ local function OpenInlineColorPicker(currentColor, onChange)
         end,
     }
     ColorPickerFrame:SetupColorPickerAndShow(info)
+end
+
+-- ============================================================================
+-- TAB BUILDERS
+-- ============================================================================
+
+local function BuildColoursTab(contentArea, tabFrames)
+    local coloursTab = CreateFrame("Frame", nil, contentArea)
+    coloursTab:SetAllPoints()
+    coloursTab:Hide()
+    tabFrames[3] = coloursTab
+
+    local colourScroll, colourContent = CreateScrollableContent(coloursTab)
+
+    local colourY = 0
+    local function AddColourWidget(widget)
+        widget:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
+        colourY = colourY + widget:GetHeight() + 6
+    end
+
+    local function AddColourHeader(text)
+        colourY = colourY + 10
+        local h = CreateSectionHeader(colourContent, text)
+        h:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
+        colourY = colourY + 22
+    end
+
+    local function AddColourDescription(text)
+        local desc = colourContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        desc:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
+        desc:SetWidth(500)
+        desc:SetJustifyH("LEFT")
+        desc:SetSpacing(2)
+        desc:SetText(text)
+        colourY = colourY + desc:GetStringHeight() + 6
+    end
+
+    local LoadEssentialCooldowns = ns.LoadEssentialCooldowns
+
+    -- Bar Colours
+    AddColourHeader("Bar Colours")
+    AddColourDescription("Default colours for bar types. Per-cooldown and per-slot colours set in the Bars tab take priority over these.")
+
+    local cdColourSwatch = CreateColorSwatch(colourContent, "Cooldown", DeepCopy(CONFIG.cooldownColor), function(c)
+        CONFIG.cooldownColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(cdColourSwatch)
+
+    local castColourSwatch = CreateColorSwatch(colourContent, "Cast", DeepCopy(CONFIG.castColor), function(c)
+        CONFIG.castColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(castColourSwatch)
+
+    local buffColourSwatch = CreateColorSwatch(colourContent, "Buff", DeepCopy(CONFIG.buffColor), function(c)
+        CONFIG.buffColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(buffColourSwatch)
+
+    local debuffColourSwatch = CreateColorSwatch(colourContent, "Debuff", DeepCopy(CONFIG.debuffColor), function(c)
+        CONFIG.debuffColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(debuffColourSwatch)
+
+    local petBuffColourSwatch = CreateColorSwatch(colourContent, "Pet Buff", DeepCopy(CONFIG.petBuffColor), function(c)
+        CONFIG.petBuffColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(petBuffColourSwatch)
+
+    -- Frame Colours
+    AddColourHeader("Frame Colours")
+    AddColourDescription("Background and border of the main Infall frame. These affect the container around all bars.")
+
+    local bgColourSwatch = CreateColorSwatch(colourContent, "Background", DeepCopy(CONFIG.bgcolor), function(c)
+        CONFIG.bgcolor = c
+        DebouncedApplyAndSave(function() if ns.ApplyBackdrop then ns.ApplyBackdrop() end end)
+    end)
+    AddColourWidget(bgColourSwatch)
+
+    local borderColourSwatch = CreateColorSwatch(colourContent, "Border", DeepCopy(CONFIG.bordercolor), function(c)
+        CONFIG.bordercolor = c
+        DebouncedApplyAndSave(function() if ns.ApplyBackdrop then ns.ApplyBackdrop() end end)
+    end)
+    AddColourWidget(borderColourSwatch)
+
+    -- Now Line / GCD
+    AddColourHeader("Now Line / GCD")
+    AddColourDescription("Colours for the now line, GCD bar and spark, and time reference lines.")
+
+    local nowLineColourSwatch = CreateColorSwatch(colourContent, "Now Line", DeepCopy(CONFIG.nowLineColor), function(c)
+        CONFIG.nowLineColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(nowLineColourSwatch)
+
+    local gcdColourSwatch = CreateColorSwatch(colourContent, "GCD Bar", DeepCopy(CONFIG.gcdColor), function(c)
+        CONFIG.gcdColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(gcdColourSwatch)
+
+    local gcdSparkColourSwatch = CreateColorSwatch(colourContent, "GCD Spark", DeepCopy(CONFIG.gcdSparkColor), function(c)
+        CONFIG.gcdSparkColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(gcdSparkColourSwatch)
+
+    local linesColourSwatch = CreateColorSwatch(colourContent, "Time Lines", DeepCopy(CONFIG.linesColor), function(c)
+        CONFIG.linesColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(linesColourSwatch)
+
+    -- Icon State Colours
+    AddColourHeader("Icon State Colours")
+    AddColourDescription("Tint applied to ability icons based on usability. Only visible when Reactive Icons is enabled in the Toggles tab.")
+
+    local iconUsableColourSwatch = CreateColorSwatch(colourContent, "Usable", DeepCopy(CONFIG.iconUsableColor), function(c)
+        CONFIG.iconUsableColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(iconUsableColourSwatch)
+
+    local iconManaColourSwatch = CreateColorSwatch(colourContent, "Not Enough Mana", DeepCopy(CONFIG.iconNotEnoughManaColor), function(c)
+        CONFIG.iconNotEnoughManaColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(iconManaColourSwatch)
+
+    local iconNotUsableColourSwatch = CreateColorSwatch(colourContent, "Not Usable", DeepCopy(CONFIG.iconNotUsableColor), function(c)
+        CONFIG.iconNotUsableColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(iconNotUsableColourSwatch)
+
+    local iconRangeColourSwatch = CreateColorSwatch(colourContent, "Out of Range", DeepCopy(CONFIG.iconNotInRangeColor), function(c)
+        CONFIG.iconNotInRangeColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(iconRangeColourSwatch)
+
+    -- Empowered Stage Colours
+    AddColourHeader("Empowered Stage Colours")
+    AddColourDescription("Colours for each empowered cast stage (IE Evoker abilities). Stages progress left to right as you hold the cast.")
+
+    local empowerStage1Swatch = CreateColorSwatch(colourContent, "Stage 1", DeepCopy(CONFIG.empowerStage1Color), function(c)
+        CONFIG.empowerStage1Color = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(empowerStage1Swatch)
+
+    local empowerStage2Swatch = CreateColorSwatch(colourContent, "Stage 2", DeepCopy(CONFIG.empowerStage2Color), function(c)
+        CONFIG.empowerStage2Color = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(empowerStage2Swatch)
+
+    local empowerStage3Swatch = CreateColorSwatch(colourContent, "Stage 3", DeepCopy(CONFIG.empowerStage3Color), function(c)
+        CONFIG.empowerStage3Color = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(empowerStage3Swatch)
+
+    local empowerStage4Swatch = CreateColorSwatch(colourContent, "Stage 4", DeepCopy(CONFIG.empowerStage4Color), function(c)
+        CONFIG.empowerStage4Color = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(empowerStage4Swatch)
+
+    -- Channel Colours
+    AddColourHeader("Channel Colours")
+    AddColourDescription("Colour for the chain window at the tail of a Disintegrate channel, showing when it's safe to clip and recast.")
+
+    local disintChainSwatch = CreateColorSwatch(colourContent, "Disintegrate Chain Window", DeepCopy(CONFIG.disintegrateChainColor), function(c)
+        CONFIG.disintegrateChainColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(disintChainSwatch)
+
+    -- Text Colours
+    AddColourHeader("Text Colours")
+    AddColourDescription("Default colours for charge and stack text on bars. Per-slot colours set in the Bars tab take priority over these.")
+
+    local chargeTextColourSwatch = CreateColorSwatch(colourContent, "Charge Text", DeepCopy(CONFIG.chargeTextColor), function(c)
+        CONFIG.chargeTextColor = c
+        DebouncedApplyAndSave(function() LoadEssentialCooldowns() end)
+    end)
+    AddColourWidget(chargeTextColourSwatch)
+
+    local stackTextColourSwatch = CreateColorSwatch(colourContent, "Stack Text", DeepCopy(CONFIG.stackTextColor), function(c)
+        CONFIG.stackTextColor = c
+        DebouncedApplyAndSave(function() LoadEssentialCooldowns() end)
+    end)
+    AddColourWidget(stackTextColourSwatch)
+
+    -- Font Settings
+    AddColourHeader("Font Settings")
+    AddColourDescription("Font used for charge counts and stack text on bars. Size and flags control readability. To add custom fonts, install LibSharedMedia-3.0 and a SharedMedia font pack (IE SharedMedia_MyMedia). Fonts from those packs will appear in the dropdown automatically.")
+
+    local fontOptions = GetFontOptions()
+    local fontDropdown = CreateDropdown(colourContent, "Font", fontOptions, CONFIG.font, function(v)
+        CONFIG.font = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end, true)
+    AddColourWidget(fontDropdown)
+
+    local fontSizeSlider = CreateSlider(colourContent, "Font Size", 8, 24, 1, CONFIG.fontSize, function(v)
+        CONFIG.fontSize = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(fontSizeSlider)
+
+    local fontFlagsDropdown = CreateDropdown(colourContent, "Font Flags", FONT_FLAG_OPTIONS, CONFIG.fontFlags, function(v)
+        CONFIG.fontFlags = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(fontFlagsDropdown)
+
+    -- Text Anchors
+    AddColourHeader("Charge Text Anchor")
+    AddColourDescription("Where charge count text is positioned on each bar. Offset sliders fine-tune placement from the anchor point.")
+
+    local chargeAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.chargeTextAnchor, function(v)
+        CONFIG.chargeTextAnchor = v
+        CONFIG.chargeTextRelPoint = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(chargeAnchorDropdown)
+
+    local chargeOffXSlider = CreateSlider(colourContent, "Charge Offset X", -20, 20, 1, CONFIG.chargeTextOffsetX, function(v)
+        CONFIG.chargeTextOffsetX = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(chargeOffXSlider)
+
+    local chargeOffYSlider = CreateSlider(colourContent, "Charge Offset Y", -20, 20, 1, CONFIG.chargeTextOffsetY, function(v)
+        CONFIG.chargeTextOffsetY = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(chargeOffYSlider)
+
+    AddColourHeader("Stack Text Anchor")
+    AddColourDescription("Where stack count text is positioned on each bar. Works the same way as charge text anchoring.")
+
+    local stackAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.stackTextAnchor, function(v)
+        CONFIG.stackTextAnchor = v
+        CONFIG.stackTextRelPoint = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(stackAnchorDropdown)
+
+    local stackOffXSlider = CreateSlider(colourContent, "Stack Offset X", -20, 20, 1, CONFIG.stackTextOffsetX, function(v)
+        CONFIG.stackTextOffsetX = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(stackOffXSlider)
+
+    local stackOffYSlider = CreateSlider(colourContent, "Stack Offset Y", -20, 20, 1, CONFIG.stackTextOffsetY, function(v)
+        CONFIG.stackTextOffsetY = v
+        LoadEssentialCooldowns()
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(stackOffYSlider)
+
+    -- Variant Name Text
+    AddColourHeader("Variant Name Text")
+    AddColourDescription("Colour, size, and position of variant name text on bars (IE Roll the Bones outcome names). Enable this feature in the Toggles tab. Adjusting these settings shows a preview on your bars.")
+
+    local variantTextColourSwatch = CreateColorSwatch(colourContent, "Variant Name Colour", DeepCopy(CONFIG.variantTextColor), function(c)
+        CONFIG.variantTextColor = c
+        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(variantTextColourSwatch)
+
+    local variantTextSizeSlider = CreateSlider(colourContent, "Variant Name Size", 6, 24, 1, CONFIG.variantTextSize, function(v)
+        CONFIG.variantTextSize = v
+        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(variantTextSizeSlider)
+
+    local variantAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.variantTextAnchor, function(v)
+        CONFIG.variantTextAnchor = v
+        CONFIG.variantTextRelPoint = v
+        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(variantAnchorDropdown)
+
+    local variantOffXSlider = CreateSlider(colourContent, "Variant Offset X", -50, 50, 1, CONFIG.variantTextOffsetX, function(v)
+        CONFIG.variantTextOffsetX = v
+        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(variantOffXSlider)
+
+    local variantOffYSlider = CreateSlider(colourContent, "Variant Offset Y", -20, 20, 1, CONFIG.variantTextOffsetY, function(v)
+        CONFIG.variantTextOffsetY = v
+        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
+        ns.SaveCurrentProfile()
+    end)
+    AddColourWidget(variantOffYSlider)
+
+    colourContent:SetHeight(colourY + 20)
+
+    coloursTab:SetScript("OnShow", function()
+        if CONFIG.cooldownColor then cdColourSwatch:SetColor(DeepCopy(CONFIG.cooldownColor)) end
+        if CONFIG.castColor then castColourSwatch:SetColor(DeepCopy(CONFIG.castColor)) end
+        if CONFIG.buffColor then buffColourSwatch:SetColor(DeepCopy(CONFIG.buffColor)) end
+        if CONFIG.debuffColor then debuffColourSwatch:SetColor(DeepCopy(CONFIG.debuffColor)) end
+        if CONFIG.petBuffColor then petBuffColourSwatch:SetColor(DeepCopy(CONFIG.petBuffColor)) end
+        if CONFIG.bgcolor then bgColourSwatch:SetColor(DeepCopy(CONFIG.bgcolor)) end
+        if CONFIG.bordercolor then borderColourSwatch:SetColor(DeepCopy(CONFIG.bordercolor)) end
+        if CONFIG.nowLineColor then nowLineColourSwatch:SetColor(DeepCopy(CONFIG.nowLineColor)) end
+        if CONFIG.gcdColor then gcdColourSwatch:SetColor(DeepCopy(CONFIG.gcdColor)) end
+        if CONFIG.gcdSparkColor then gcdSparkColourSwatch:SetColor(DeepCopy(CONFIG.gcdSparkColor)) end
+        if CONFIG.linesColor then linesColourSwatch:SetColor(DeepCopy(CONFIG.linesColor)) end
+        if CONFIG.iconUsableColor then iconUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconUsableColor)) end
+        if CONFIG.iconNotEnoughManaColor then iconManaColourSwatch:SetColor(DeepCopy(CONFIG.iconNotEnoughManaColor)) end
+        if CONFIG.iconNotUsableColor then iconNotUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconNotUsableColor)) end
+        if CONFIG.iconNotInRangeColor then iconRangeColourSwatch:SetColor(DeepCopy(CONFIG.iconNotInRangeColor)) end
+        if CONFIG.empowerStage1Color then empowerStage1Swatch:SetColor(DeepCopy(CONFIG.empowerStage1Color)) end
+        if CONFIG.empowerStage2Color then empowerStage2Swatch:SetColor(DeepCopy(CONFIG.empowerStage2Color)) end
+        if CONFIG.empowerStage3Color then empowerStage3Swatch:SetColor(DeepCopy(CONFIG.empowerStage3Color)) end
+        if CONFIG.empowerStage4Color then empowerStage4Swatch:SetColor(DeepCopy(CONFIG.empowerStage4Color)) end
+        if CONFIG.disintegrateChainColor then disintChainSwatch:SetColor(DeepCopy(CONFIG.disintegrateChainColor)) end
+        if CONFIG.chargeTextColor then chargeTextColourSwatch:SetColor(DeepCopy(CONFIG.chargeTextColor)) end
+        if CONFIG.stackTextColor then stackTextColourSwatch:SetColor(DeepCopy(CONFIG.stackTextColor)) end
+        if CONFIG.variantTextColor then variantTextColourSwatch:SetColor(DeepCopy(CONFIG.variantTextColor)) end
+        fontDropdown:SetValue(CONFIG.font)
+        fontSizeSlider:SetValue(CONFIG.fontSize)
+        fontFlagsDropdown:SetValue(CONFIG.fontFlags)
+        chargeAnchorDropdown:SetValue(CONFIG.chargeTextAnchor)
+        chargeOffXSlider:SetValue(CONFIG.chargeTextOffsetX)
+        chargeOffYSlider:SetValue(CONFIG.chargeTextOffsetY)
+        stackAnchorDropdown:SetValue(CONFIG.stackTextAnchor)
+        stackOffXSlider:SetValue(CONFIG.stackTextOffsetX)
+        stackOffYSlider:SetValue(CONFIG.stackTextOffsetY)
+        variantTextSizeSlider:SetValue(CONFIG.variantTextSize)
+        variantAnchorDropdown:SetValue(CONFIG.variantTextAnchor)
+        variantOffXSlider:SetValue(CONFIG.variantTextOffsetX)
+        variantOffYSlider:SetValue(CONFIG.variantTextOffsetY)
+    end)
+
+    coloursTab:SetScript("OnHide", function()
+        if ns.HideVariantPreview then ns.HideVariantPreview() end
+    end)
+end
+
+-- ============================================================================
+-- TAB F: STACKS
+-- ============================================================================
+
+local function BuildStacksTab(contentArea, tabFrames)
+    local stacksTab = CreateFrame("Frame", nil, contentArea)
+    stacksTab:SetAllPoints()
+    stacksTab:Hide()
+    tabFrames[5] = stacksTab
+
+    local stacksScroll, stacksContent = CreateScrollableContent(stacksTab)
+
+    local yOff = 0
+    local function AddStacksWidget(widget)
+        widget:SetPoint("TOPLEFT", stacksContent, "TOPLEFT", 10, -yOff)
+        yOff = yOff + widget:GetHeight() + 6
+    end
+
+    local function AddStacksHeader(text)
+        yOff = yOff + 10
+        local h = CreateSectionHeader(stacksContent, text)
+        h:SetPoint("TOPLEFT", stacksContent, "TOPLEFT", 10, -yOff)
+        yOff = yOff + 22
+    end
+
+    local function AddStacksDescription(text)
+        local desc = stacksContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        desc:SetPoint("TOPLEFT", stacksContent, "TOPLEFT", 10, -yOff)
+        desc:SetWidth(500)
+        desc:SetJustifyH("LEFT")
+        desc:SetSpacing(2)
+        desc:SetText(text)
+        yOff = yOff + desc:GetStringHeight() + 6
+    end
+
+    -- Section 1: Enable Toggle
+    AddStacksHeader("Stack Indicators")
+    AddStacksDescription("Segmented pip indicators for aura stacks, shown as a thin strip above or below the bar frame. Each pip fills as stacks increase.")
+
+    local enableCheck = CreateCheckbox(stacksContent, "Enable Stack Indicators",
+        "Show segmented pip indicators for aura stacks above or below the bar frame",
+        CONFIG.stackIndicators or false, function(v)
+        CONFIG.stackIndicators = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(enableCheck)
+
+    -- Section 2: Display Settings
+    AddStacksHeader("Display")
+
+    local siPositionDropdown = CreateDropdown(stacksContent, "Default Position",
+        {{text = "Top", value = "TOP"}, {text = "Bottom", value = "BOTTOM"}},
+        (CONFIG.stackIndicatorSettings or {}).position or "TOP", function(v)
+            CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+            CONFIG.stackIndicatorSettings.position = v
+            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+            ns.SaveCurrentProfile()
+        end)
+    AddStacksWidget(siPositionDropdown)
+
+    local siGapSlider = CreateSlider(stacksContent, "Gap from Frame", 0, 10, 1, (CONFIG.stackIndicatorSettings or {}).gap or 2, function(v)
+        CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+        CONFIG.stackIndicatorSettings.gap = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(siGapSlider)
+
+    local siPipHeightSlider = CreateSlider(stacksContent, "Pip Height", 4, 16, 1, (CONFIG.stackIndicatorSettings or {}).pipHeight or 6, function(v)
+        CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+        CONFIG.stackIndicatorSettings.pipHeight = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(siPipHeightSlider)
+
+    local siPipSpacingSlider = CreateSlider(stacksContent, "Pip Spacing", 0, 4, 1, (CONFIG.stackIndicatorSettings or {}).pipSpacing or 1, function(v)
+        CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+        CONFIG.stackIndicatorSettings.pipSpacing = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(siPipSpacingSlider)
+
+    local siRowSpacingSlider = CreateSlider(stacksContent, "Row Spacing", 0, 4, 1, (CONFIG.stackIndicatorSettings or {}).rowSpacing or 1, function(v)
+        CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+        CONFIG.stackIndicatorSettings.rowSpacing = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(siRowSpacingSlider)
+
+    local siBorderSizeSlider = CreateSlider(stacksContent, "Border Size", 0, 3, 1, (CONFIG.stackIndicatorSettings or {}).borderSize or 1, function(v)
+        CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+        CONFIG.stackIndicatorSettings.borderSize = v
+        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(siBorderSizeSlider)
+
+    local siGlowCheck = CreateCheckbox(stacksContent, "Glow at Max Stacks",
+        "Pulse a glow overlay when an indicator reaches its maximum stacks",
+        (CONFIG.stackIndicatorSettings or {}).glowAtMax ~= false, function(v)
+            CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+            CONFIG.stackIndicatorSettings.glowAtMax = v
+            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+            ns.SaveCurrentProfile()
+        end)
+    AddStacksWidget(siGlowCheck)
+
+    -- Section 3: Colours
+    AddStacksHeader("Colours")
+
+    local siEmptyColourSwatch = CreateColorSwatch(stacksContent, "Empty Pip",
+        DeepCopy((CONFIG.stackIndicatorSettings or {}).emptyColor or {0.12, 0.12, 0.12, 0.6}),
+        function(c)
+            CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+            CONFIG.stackIndicatorSettings.emptyColor = c
+            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+            ns.SaveCurrentProfile()
+        end)
+    AddStacksWidget(siEmptyColourSwatch)
+
+    local siBorderColourSwatch = CreateColorSwatch(stacksContent, "Pip Border",
+        DeepCopy((CONFIG.stackIndicatorSettings or {}).borderColor or CONFIG.bordercolor or {0, 0, 0, 1}),
+        function(c)
+            CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+            CONFIG.stackIndicatorSettings.borderColor = c
+            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+            ns.SaveCurrentProfile()
+        end)
+    AddStacksWidget(siBorderColourSwatch)
+
+    local siGlowColourSwatch = CreateColorSwatch(stacksContent, "Max Stack Glow",
+        DeepCopy((CONFIG.stackIndicatorSettings or {}).glowColor or {1, 1, 1, 0.6}),
+        function(c)
+            CONFIG.stackIndicatorSettings = CONFIG.stackIndicatorSettings or {}
+            CONFIG.stackIndicatorSettings.glowColor = c
+            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+            ns.SaveCurrentProfile()
+        end)
+    AddStacksWidget(siGlowColourSwatch)
+
+    -- Section 4: Configured Indicators
+    AddStacksHeader("Configured Indicators")
+    AddStacksDescription("Each tracked aura shows its icon, name, max stacks and position. Use colour zones to assign different colours at different stack counts (IE green at 1, yellow at 2, red at 3). Set an overflow value to layer a second colour for stacks beyond the base max.")
+
+    local siListContainer = CreateFrame("Frame", nil, stacksContent)
+    siListContainer:SetSize(520, 1)
+    local siListTopY = yOff
+    AddStacksWidget(siListContainer)
+
+    local siRowFrames = {}
+    local RefreshStacksGrid
+    local gridRetried = false
+    local UpdateStacksContentHeight
+
+    local function RebuildSIListUI()
+        for _, rf in ipairs(siRowFrames) do
+            for _, region in pairs({rf:GetRegions()}) do
+                region:Hide()
+            end
+            for _, child in pairs({rf:GetChildren()}) do
+                child:Hide()
+                for _, cr in pairs({child:GetRegions()}) do
+                    cr:Hide()
+                end
+            end
+            rf:Hide()
+            rf:SetParent(nil)
+        end
+        wipe(siRowFrames)
+
+        local list = CONFIG.stackIndicatorList or {}
+        local rowY = 0
+        local defaultPos = (CONFIG.stackIndicatorSettings or {}).position or "TOP"
+        local topCount, bottomCount = 0, 0
+        for _, e in ipairs(list) do
+            local p = e.position or defaultPos
+            if p == "BOTTOM" then bottomCount = bottomCount + 1 else topCount = topCount + 1 end
+        end
+
+        for idx, entry in ipairs(list) do
+            local sis = CONFIG.stackIndicatorSettings or {}
+            local rf = CreateFrame("Frame", nil, siListContainer, "BackdropTemplate")
+            rf:SetSize(510, 100)
+            rf:SetPoint("TOPLEFT", siListContainer, "TOPLEFT", 0, -rowY)
+            rf:SetBackdrop({
+                bgFile = "Interface\\Buttons\\WHITE8x8",
+                edgeFile = "Interface\\Buttons\\WHITE8x8",
+                edgeSize = 1,
+                insets = {left = 1, right = 1, top = 1, bottom = 1},
+            })
+            rf:SetBackdropColor(0.08, 0.08, 0.08, 0.4)
+            rf:SetBackdropBorderColor(0.2, 0.2, 0.2, 0.5)
+
+            -- Row 1: Icon + Name + Position Toggle + Delete
+            local icon = rf:CreateTexture(nil, "ARTWORK")
+            icon:SetSize(32, 32)
+            icon:SetPoint("TOPLEFT", rf, "TOPLEFT", 8, -8)
+            icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+            local displaySpellID = entry.auraSpellID
+            if (not displaySpellID or displaySpellID == 0) and entry.cooldownID then
+                local cdOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, entry.cooldownID)
+                if cdOk and cdInfo then displaySpellID = cdInfo.spellID end
+            end
+            local spellName = displaySpellID and C_Spell.GetSpellName(displaySpellID)
+            local spellIcon = spellName and C_Spell.GetSpellTexture(displaySpellID)
+            if spellIcon then
+                icon:SetTexture(spellIcon)
+            else
+                icon:SetColorTexture(0.3, 0.3, 0.3, 1)
+            end
+
+            local nameText = rf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            nameText:SetPoint("LEFT", icon, "RIGHT", 8, 0)
+            nameText:SetWidth(200)
+            nameText:SetJustifyH("LEFT")
+            nameText:SetText(spellName or ("ID: " .. (entry.cooldownID or entry.auraSpellID or "?")))
+
+            local delBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+            delBtn:SetSize(22, 22)
+            delBtn:SetPoint("TOPRIGHT", rf, "TOPRIGHT", -6, -10)
+            delBtn:SetText("X")
+            delBtn:SetScript("OnClick", function()
+                table.remove(CONFIG.stackIndicatorList, idx)
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                ns.SaveCurrentProfile()
+                RebuildSIListUI()
+                if RefreshStacksGrid then RefreshStacksGrid() end
+            end)
+            delBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Remove")
+                GameTooltip:Show()
+            end)
+            delBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            local posBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+            posBtn:SetSize(56, 20)
+            posBtn:SetPoint("RIGHT", delBtn, "LEFT", -4, 0)
+            local resolvedPos = entry.position or sis.position or "TOP"
+            posBtn:SetText(resolvedPos == "BOTTOM" and "Bottom" or "Top")
+            posBtn:SetScript("OnClick", function()
+                local cur = entry.position or sis.position or "TOP"
+                local newPos = cur == "TOP" and "BOTTOM" or "TOP"
+                entry.position = newPos
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                ns.SaveCurrentProfile()
+                RebuildSIListUI()
+            end)
+            posBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Position")
+                GameTooltip:AddLine("Click to toggle between Top and Bottom.", 0.7, 0.7, 0.7, true)
+                GameTooltip:Show()
+            end)
+            posBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            local myPos = resolvedPos
+            local groupCount = (myPos == "BOTTOM") and bottomCount or topCount
+            if groupCount > 1 then
+                local function FindNeighbor(dir)
+                    local l = CONFIG.stackIndicatorList
+                    local step = dir == "up" and -1 or 1
+                    local k = idx + step
+                    while k >= 1 and k <= #l do
+                        local p = l[k].position or defaultPos
+                        if p == myPos then return k end
+                        k = k + step
+                    end
+                    return nil
+                end
+
+                local nextDown = FindNeighbor("down")
+                local nextUp = FindNeighbor("up")
+
+                local downBtn = CreateFrame("Button", nil, rf)
+                downBtn:SetSize(18, 16)
+                downBtn:SetPoint("RIGHT", posBtn, "LEFT", -6, 0)
+                downBtn:SetNormalAtlas("UI-ScrollBar-ScrollDownButton-Up")
+                downBtn:SetPushedAtlas("UI-ScrollBar-ScrollDownButton-Down")
+                downBtn:SetHighlightAtlas("UI-ScrollBar-ScrollDownButton-Highlight")
+                downBtn:SetDisabledAtlas("UI-ScrollBar-ScrollDownButton-Disabled")
+                if not nextDown then downBtn:Disable() end
+                downBtn:SetScript("OnClick", function()
+                    local target = FindNeighbor("down")
+                    if target then
+                        local l = CONFIG.stackIndicatorList
+                        l[idx], l[target] = l[target], l[idx]
+                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                        ns.SaveCurrentProfile()
+                        RebuildSIListUI()
+                    end
+                end)
+                downBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Move Down")
+                    GameTooltip:Show()
+                end)
+                downBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+                local upBtn = CreateFrame("Button", nil, rf)
+                upBtn:SetSize(18, 16)
+                upBtn:SetPoint("RIGHT", downBtn, "LEFT", -2, 0)
+                upBtn:SetNormalAtlas("UI-ScrollBar-ScrollUpButton-Up")
+                upBtn:SetPushedAtlas("UI-ScrollBar-ScrollUpButton-Down")
+                upBtn:SetHighlightAtlas("UI-ScrollBar-ScrollUpButton-Highlight")
+                upBtn:SetDisabledAtlas("UI-ScrollBar-ScrollUpButton-Disabled")
+                if not nextUp then upBtn:Disable() end
+                upBtn:SetScript("OnClick", function()
+                    local target = FindNeighbor("up")
+                    if target then
+                        local l = CONFIG.stackIndicatorList
+                        l[idx], l[target] = l[target], l[idx]
+                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                        ns.SaveCurrentProfile()
+                        RebuildSIListUI()
+                    end
+                end)
+                upBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Move Up")
+                    GameTooltip:Show()
+                end)
+                upBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            end
+
+            -- Row 2: Max Stacks + Overflow + OV Colour
+            local maxLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+            maxLabel:SetPoint("LEFT", rf, "LEFT", 12, -6)
+            maxLabel:SetText("Max Stacks:")
+
+            local maxEdit = CreateFrame("EditBox", nil, rf, "InputBoxTemplate")
+            maxEdit:SetSize(30, 18)
+            maxEdit:SetPoint("LEFT", maxLabel, "RIGHT", 4, 0)
+            maxEdit:SetAutoFocus(false)
+            maxEdit:SetNumeric(true)
+            maxEdit:SetText(tostring(entry.maxStacks or 3))
+            local function CommitMaxStacks(self)
+                local val = tonumber(self:GetText())
+                if val and val >= 1 and val <= 99 then
+                    entry.maxStacks = val
+                    -- Remove zones with fromStack > new max
+                    if entry.colorZones then
+                        for k = #entry.colorZones, 1, -1 do
+                            if entry.colorZones[k].fromStack > val then
+                                table.remove(entry.colorZones, k)
+                            end
+                        end
+                    end
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                    RebuildSIListUI()
+                else
+                    self:SetText(tostring(entry.maxStacks or 3))
+                end
+            end
+            maxEdit:SetScript("OnEnterPressed", function(self)
+                CommitMaxStacks(self)
+                self:ClearFocus()
+            end)
+            maxEdit:SetScript("OnEditFocusLost", CommitMaxStacks)
+            maxEdit:SetScript("OnEscapePressed", function(self)
+                self:SetText(tostring(entry.maxStacks or 3))
+                self:ClearFocus()
+            end)
+            maxEdit:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
+
+            local ovLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+            ovLabel:SetPoint("LEFT", maxEdit, "RIGHT", 14, 0)
+            ovLabel:SetText("Overflow:")
+
+            local ovEdit = CreateFrame("EditBox", nil, rf, "InputBoxTemplate")
+            ovEdit:SetSize(30, 18)
+            ovEdit:SetPoint("LEFT", ovLabel, "RIGHT", 4, 0)
+            ovEdit:SetAutoFocus(false)
+            ovEdit:SetNumeric(true)
+            ovEdit:SetText(tostring(entry.overflowMax or 0))
+            local function CommitOverflow(self)
+                local val = tonumber(self:GetText())
+                if val and val >= 0 and val <= 99 then
+                    entry.overflowMax = val > 0 and val or nil
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                else
+                    self:SetText(tostring(entry.overflowMax or 0))
+                end
+            end
+            ovEdit:SetScript("OnEnterPressed", function(self)
+                CommitOverflow(self)
+                self:ClearFocus()
+            end)
+            ovEdit:SetScript("OnEditFocusLost", CommitOverflow)
+            ovEdit:SetScript("OnEscapePressed", function(self)
+                self:SetText(tostring(entry.overflowMax or 0))
+                self:ClearFocus()
+            end)
+            ovEdit:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
+
+            local ovColorBtn = CreateFrame("Button", nil, rf)
+            ovColorBtn:SetSize(20, 20)
+            ovColorBtn:SetPoint("LEFT", ovEdit, "RIGHT", 6, 0)
+            local ovColorBg = ovColorBtn:CreateTexture(nil, "BACKGROUND")
+            ovColorBg:SetAllPoints()
+            ovColorBg:SetColorTexture(0, 0, 0, 1)
+            local ovColorTex = ovColorBtn:CreateTexture(nil, "OVERLAY")
+            ovColorTex:SetPoint("TOPLEFT", 1, -1)
+            ovColorTex:SetPoint("BOTTOMRIGHT", -1, 1)
+            local oc = entry.overflowColor or {1, 0.8, 0.2, 1}
+            ovColorTex:SetColorTexture(oc[1], oc[2], oc[3], oc[4] or 1)
+            ovColorBtn:SetScript("OnClick", function()
+                OpenInlineColorPicker(DeepCopy(oc), function(c)
+                    entry.overflowColor = c
+                    ovColorTex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                end)
+            end)
+            ovColorBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Overflow Colour")
+                GameTooltip:AddLine("Layered colour for stacks beyond the base max.", 0.7, 0.7, 0.7, true)
+                GameTooltip:Show()
+            end)
+            ovColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            local hideCheck = CreateFrame("CheckButton", nil, rf, "UICheckButtonTemplate")
+            hideCheck:SetSize(20, 20)
+            hideCheck:SetPoint("LEFT", ovColorBtn, "RIGHT", 14, 0)
+            hideCheck:SetChecked(entry.hideWhenEmpty or false)
+            hideCheck:SetScript("OnClick", function(self)
+                entry.hideWhenEmpty = self:GetChecked() or nil
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                ns.SaveCurrentProfile()
+            end)
+            local hideLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+            hideLabel:SetPoint("LEFT", hideCheck, "RIGHT", 2, 0)
+            hideLabel:SetText("Hide when empty")
+
+            -- Row 3: Colour Zones or Legacy Pip Colour
+            if entry.colorZones and #entry.colorZones > 0 then
+                local zonesLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+                zonesLabel:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", 12, 14)
+                zonesLabel:SetText("Zones:")
+
+                local clearZonesBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+                clearZonesBtn:SetSize(18, 18)
+                clearZonesBtn:SetPoint("LEFT", zonesLabel, "RIGHT", 4, 0)
+                clearZonesBtn:SetText("X")
+                clearZonesBtn:SetScript("OnClick", function()
+                    entry.color = DeepCopy(entry.colorZones[1] and entry.colorZones[1].color or entry.color or {0.8, 0.2, 0.1, 1})
+                    entry.colorZones = nil
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                    RebuildSIListUI()
+                end)
+                clearZonesBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Remove Zones")
+                    GameTooltip:AddLine("Revert to a single pip colour.", 0.7, 0.7, 0.7, true)
+                    GameTooltip:Show()
+                end)
+                clearZonesBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+                local zones = entry.colorZones
+                local zoneXOff = 76
+                for zi, zone in ipairs(zones) do
+                    local zBtn = CreateFrame("Button", nil, rf)
+                    zBtn:SetSize(20, 20)
+                    zBtn:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 10)
+                    local zBg = zBtn:CreateTexture(nil, "BACKGROUND")
+                    zBg:SetAllPoints()
+                    zBg:SetColorTexture(0, 0, 0, 1)
+                    local zTex = zBtn:CreateTexture(nil, "OVERLAY")
+                    zTex:SetPoint("TOPLEFT", 1, -1)
+                    zTex:SetPoint("BOTTOMRIGHT", -1, 1)
+                    local zc = zone.color or {0.8, 0.2, 0.1, 1}
+                    zTex:SetColorTexture(zc[1], zc[2], zc[3], zc[4] or 1)
+
+                    local zoneIdx = zi
+                    zBtn:SetScript("OnClick", function()
+                        OpenInlineColorPicker(DeepCopy(zc), function(c)
+                            entry.colorZones[zoneIdx].color = c
+                            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                            ns.SaveCurrentProfile()
+                            RebuildSIListUI()
+                        end)
+                    end)
+                    zBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Zone " .. zoneIdx .. " Colour")
+                        GameTooltip:AddLine("Pips from stack " .. zone.fromStack .. " use this colour.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    zBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    zoneXOff = zoneXOff + 26
+
+                    local zEdit = CreateFrame("EditBox", nil, rf, "InputBoxTemplate")
+                    zEdit:SetSize(28, 18)
+                    zEdit:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 11)
+                    zEdit:SetAutoFocus(false)
+                    zEdit:SetNumeric(true)
+                    zEdit:SetText(tostring(zone.fromStack))
+                    if zi == 1 then
+                        zEdit:Disable()
+                        zEdit:SetTextColor(0.5, 0.5, 0.5)
+                    end
+                    local function CommitZoneFrom(self)
+                        local val = tonumber(self:GetText())
+                        local maxS = entry.maxStacks or 3
+                        if val and val >= 1 and val <= maxS then
+                            entry.colorZones[zoneIdx].fromStack = val
+                            table.sort(entry.colorZones, function(a, b) return a.fromStack < b.fromStack end)
+                            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                            ns.SaveCurrentProfile()
+                            RebuildSIListUI()
+                        else
+                            self:SetText(tostring(zone.fromStack))
+                        end
+                    end
+                    zEdit:SetScript("OnEnterPressed", function(self)
+                        CommitZoneFrom(self)
+                        self:ClearFocus()
+                    end)
+                    zEdit:SetScript("OnEditFocusLost", CommitZoneFrom)
+                    zEdit:SetScript("OnEscapePressed", function(self)
+                        self:SetText(tostring(zone.fromStack))
+                        self:ClearFocus()
+                    end)
+                    zEdit:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
+                    zoneXOff = zoneXOff + 32
+
+                    if zi > 1 then
+                        local zDel = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+                        zDel:SetSize(18, 18)
+                        zDel:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 11)
+                        zDel:SetText("X")
+                        zDel:SetScript("OnClick", function()
+                            table.remove(entry.colorZones, zoneIdx)
+                            if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                            ns.SaveCurrentProfile()
+                            RebuildSIListUI()
+                        end)
+                        zDel:SetScript("OnEnter", function(self)
+                            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                            GameTooltip:SetText("Remove Zone")
+                            GameTooltip:Show()
+                        end)
+                        zDel:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                        zoneXOff = zoneXOff + 22
+                    end
+
+                    zoneXOff = zoneXOff + 8
+                end
+
+                if #zones < 5 then
+                    local addZoneBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+                    addZoneBtn:SetSize(28, 20)
+                    addZoneBtn:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 10)
+                    addZoneBtn:SetText("+")
+                    addZoneBtn:SetScript("OnClick", function()
+                        local maxS = entry.maxStacks or 3
+                        local lastZone = entry.colorZones[#entry.colorZones]
+                        local nextFrom = math.min((lastZone and lastZone.fromStack or 0) + 1, maxS)
+                        entry.colorZones[#entry.colorZones + 1] = {
+                            fromStack = nextFrom,
+                            color = DeepCopy(lastZone and lastZone.color or {0.8, 0.2, 0.1, 1}),
+                        }
+                        table.sort(entry.colorZones, function(a, b) return a.fromStack < b.fromStack end)
+                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                        ns.SaveCurrentProfile()
+                        RebuildSIListUI()
+                    end)
+                    addZoneBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Add Zone")
+                        GameTooltip:AddLine("Add a new colour zone.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    addZoneBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                end
+
+            else
+                -- Legacy single pip colour + Add Zones button
+                local colorBtn = CreateFrame("Button", nil, rf)
+                colorBtn:SetSize(20, 20)
+                colorBtn:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", 12, 10)
+                local colorBg = colorBtn:CreateTexture(nil, "BACKGROUND")
+                colorBg:SetAllPoints()
+                colorBg:SetColorTexture(0, 0, 0, 1)
+                local colorTex = colorBtn:CreateTexture(nil, "OVERLAY")
+                colorTex:SetPoint("TOPLEFT", 1, -1)
+                colorTex:SetPoint("BOTTOMRIGHT", -1, 1)
+                local ec = entry.color or {0.8, 0.2, 0.1, 1}
+                colorTex:SetColorTexture(ec[1], ec[2], ec[3], ec[4] or 1)
+
+                local colorLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+                colorLabel:SetPoint("LEFT", colorBtn, "RIGHT", 6, 0)
+                colorLabel:SetText("Pip Colour")
+
+                colorBtn:SetScript("OnClick", function()
+                    OpenInlineColorPicker(DeepCopy(ec), function(c)
+                        entry.color = c
+                        colorTex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                        ns.SaveCurrentProfile()
+                    end)
+                end)
+                colorBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Pip Colour")
+                    GameTooltip:AddLine("Click to change the pip fill colour.", 0.7, 0.7, 0.7, true)
+                    GameTooltip:Show()
+                end)
+                colorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+                local addZonesBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+                addZonesBtn:SetSize(84, 20)
+                addZonesBtn:SetPoint("LEFT", colorLabel, "RIGHT", 10, 0)
+                addZonesBtn:SetText("Add Zones")
+                addZonesBtn:SetScript("OnClick", function()
+                    local baseColor = DeepCopy(entry.color or {0.8, 0.2, 0.1, 1})
+                    local maxS = entry.maxStacks or 3
+                    local secondFrom = math.min(2, maxS)
+                    entry.colorZones = {
+                        {fromStack = 1, color = baseColor},
+                        {fromStack = secondFrom, color = DeepCopy(baseColor)},
+                    }
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                    RebuildSIListUI()
+                end)
+                addZonesBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Colour Zones")
+                    GameTooltip:AddLine("Set different pip colours at different stack counts.", 0.7, 0.7, 0.7, true)
+                    GameTooltip:Show()
+                end)
+                addZonesBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            end
+
+            siRowFrames[#siRowFrames + 1] = rf
+            rowY = rowY + 104
+        end
+
+        siListContainer:SetHeight(math.max(rowY, 1))
+        if UpdateStacksContentHeight then UpdateStacksContentHeight() end
+    end
+
+    -- Section 5: Available Buffs Grid
+    -- Anchored to siListContainer bottom so it moves when the list changes
+    local gridHeader = CreateSectionHeader(stacksContent, "Available Buffs")
+    gridHeader:SetPoint("TOPLEFT", siListContainer, "BOTTOMLEFT", 0, -16)
+
+    local gridDesc = stacksContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    gridDesc:SetPoint("TOPLEFT", gridHeader, "BOTTOMLEFT", 0, -6)
+    gridDesc:SetWidth(500)
+    gridDesc:SetJustifyH("LEFT")
+    gridDesc:SetSpacing(2)
+    gridDesc:SetText("Buff auras from the Cooldown Manager that mention stacking in their tooltip. Click to add as a stack indicator.")
+
+    local gridContainer = CreateFrame("Frame", nil, stacksContent)
+    gridContainer:SetPoint("TOPLEFT", gridDesc, "BOTTOMLEFT", 0, -8)
+    gridContainer:SetSize(520, 1)
+
+    local gridCache = {}
+    local gridCacheCount = 0
+
+    local function GetTrackedCooldownIDs()
+        local tracked = {}
+        local list = CONFIG.stackIndicatorList or {}
+        for _, entry in ipairs(list) do
+            if entry.cooldownID then
+                tracked[entry.cooldownID] = true
+            end
+        end
+        return tracked
+    end
+
+    UpdateStacksContentHeight = function()
+        local h = siListTopY + siListContainer:GetHeight() + 16 + 22 + 6 + gridDesc:GetStringHeight() + 8 + gridContainer:GetHeight() + 20
+        stacksContent:SetHeight(h)
+    end
+
+    local function ParseMaxStacks(spellID)
+        local ok, desc = pcall(C_Spell.GetSpellDescription, spellID)
+        if not ok or not desc then return 3 end
+        desc = desc:lower()
+        local n = desc:match("up%s+to%s+(%d+)%s+stack")
+            or desc:match("stacking%s+up%s+to%s+(%d+)")
+            or desc:match("maximum%s+of%s+(%d+)%s+stack")
+            or desc:match("max%s+(%d+)%s+stack")
+            or desc:match("(%d+)%s+stack")
+        if n then
+            n = tonumber(n)
+            if n and n >= 2 and n <= 99 then return n end
+        end
+        return 3
+    end
+
+    RefreshStacksGrid = function()
+        for i = 1, gridCacheCount do
+            if gridCache[i] then gridCache[i]:Hide() end
+        end
+
+        local seen = {}
+        local buffIDs = {}
+
+        local ok2, cat2 = pcall(function()
+            return C_CooldownViewer.GetCooldownViewerCategorySet(2, false)
+        end)
+        if ok2 and cat2 then
+            for _, id in ipairs(cat2) do
+                if not seen[id] then
+                    seen[id] = true
+                    buffIDs[#buffIDs + 1] = id
+                end
+            end
+        end
+
+        local ok3, cat3 = pcall(function()
+            return C_CooldownViewer.GetCooldownViewerCategorySet(3, false)
+        end)
+        if ok3 and cat3 then
+            for _, id in ipairs(cat3) do
+                if not seen[id] then
+                    seen[id] = true
+                    buffIDs[#buffIDs + 1] = id
+                end
+            end
+        end
+
+        local ok0, cat0 = pcall(function()
+            return C_CooldownViewer.GetCooldownViewerCategorySet(0, false)
+        end)
+        if ok0 and cat0 then
+            for _, id in ipairs(cat0) do
+                if not seen[id] then
+                    local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
+                    if infoOk and cdInfo and cdInfo.hasAura then
+                        seen[id] = true
+                        buffIDs[#buffIDs + 1] = id
+                    end
+                end
+            end
+        end
+
+        -- Filter to abilities whose tooltip mentions stacking
+        local filteredIDs = {}
+        for _, buffCdID in ipairs(buffIDs) do
+            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+            local spellID = infoOk and cdInfo and cdInfo.spellID
+            if spellID then
+                local descOk, desc = pcall(C_Spell.GetSpellDescription, spellID)
+                if descOk and desc and desc:lower():find("stack") then
+                    filteredIDs[#filteredIDs + 1] = buffCdID
+                end
+            end
+        end
+
+        local tracked = GetTrackedCooldownIDs()
+        local cols = 16
+        local iconSz = 30
+        local gap = 4
+        local gridIdx = 0
+
+        for i, buffCdID in ipairs(filteredIDs) do
+            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+            local spellID = infoOk and cdInfo and cdInfo.spellID
+            local tex = spellID and C_Spell.GetSpellTexture(spellID) or 134400
+            local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. buffCdID)
+
+            gridIdx = gridIdx + 1
+            local col = (gridIdx - 1) % cols
+            local rowIdx = math.floor((gridIdx - 1) / cols)
+
+            local btn = gridCache[gridIdx]
+            if not btn then
+                btn = CreateFrame("Button", nil, gridContainer)
+                btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                btn.iconTex = btn:CreateTexture(nil, "ARTWORK")
+                btn.iconTex:SetAllPoints()
+                btn.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                btn.trackedBorder = btn:CreateTexture(nil, "OVERLAY")
+                btn.trackedBorder:SetPoint("TOPLEFT", -2, 2)
+                btn.trackedBorder:SetPoint("BOTTOMRIGHT", 2, -2)
+                btn.trackedBorder:SetColorTexture(0, 0.8, 0, 0.5)
+                gridCache[gridIdx] = btn
+                gridCacheCount = math.max(gridCacheCount, gridIdx)
+            end
+
+            btn:Show()
+            btn:SetSize(iconSz, iconSz)
+            btn:ClearAllPoints()
+            btn:SetPoint("TOPLEFT", col * (iconSz + gap), -rowIdx * (iconSz + gap))
+            btn.iconTex:SetTexture(tex)
+
+            if tracked[buffCdID] then
+                btn.trackedBorder:Show()
+            else
+                btn.trackedBorder:Hide()
+            end
+
+            btn.cdID = buffCdID
+            btn.spellID = spellID
+            btn.spellName = spellName
+
+            btn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText(self.spellName, 1, 1, 1)
+                GameTooltip:AddLine("CooldownID: " .. self.cdID, 0.7, 0.7, 0.7)
+                if self.spellID then
+                    GameTooltip:AddLine("SpellID: " .. self.spellID, 0.7, 0.7, 0.7)
+                end
+                local currentTracked = GetTrackedCooldownIDs()
+                if currentTracked[self.cdID] then
+                    GameTooltip:AddLine("Already tracked — right click to remove", 0.5, 0.8, 0.5)
+                else
+                    GameTooltip:AddLine("Click to add", 0.5, 0.8, 0.5)
+                end
+                GameTooltip:Show()
+            end)
+            btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            btn:SetScript("OnClick", function(self, button)
+                local currentTracked = GetTrackedCooldownIDs()
+                if button == "RightButton" then
+                    if not currentTracked[self.cdID] then return end
+                    local list = CONFIG.stackIndicatorList or {}
+                    for k = #list, 1, -1 do
+                        if list[k].cooldownID == self.cdID then
+                            table.remove(list, k)
+                            break
+                        end
+                    end
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                    RebuildSIListUI()
+                    RefreshStacksGrid()
+                    return
+                end
+                if currentTracked[self.cdID] then return end
+                CONFIG.stackIndicatorList = CONFIG.stackIndicatorList or {}
+                CONFIG.stackIndicatorList[#CONFIG.stackIndicatorList + 1] = {
+                    cooldownID = self.cdID,
+                    auraSpellID = self.spellID or 0,
+                    maxStacks = ParseMaxStacks(self.spellID),
+                    color = DeepCopy(CONFIG.cooldownColor or {0.8, 0.2, 0.1, 1}),
+                }
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                ns.SaveCurrentProfile()
+                RebuildSIListUI()
+                RefreshStacksGrid()
+            end)
+        end
+
+        for i = gridIdx + 1, gridCacheCount do
+            if gridCache[i] then gridCache[i]:Hide() end
+        end
+
+        local totalRows = math.ceil(gridIdx / cols)
+        gridContainer:SetHeight(math.max(totalRows * (iconSz + gap), 1))
+        UpdateStacksContentHeight()
+
+        if gridIdx == 0 and not gridRetried then
+            gridRetried = true
+            C_Timer.After(1.5, function()
+                if stacksTab:IsShown() then RefreshStacksGrid() end
+            end)
+        end
+    end
+
+    RebuildSIListUI()
+
+    stacksContent:SetHeight(yOff + 20)
+
+    stacksTab:SetScript("OnShow", function()
+        enableCheck:SetChecked(CONFIG.stackIndicators or false)
+        local sis = CONFIG.stackIndicatorSettings or {}
+        siPositionDropdown:SetValue(sis.position or "TOP")
+        siGapSlider:SetValue(sis.gap or 2)
+        siPipHeightSlider:SetValue(sis.pipHeight or 6)
+        siPipSpacingSlider:SetValue(sis.pipSpacing or 1)
+        siRowSpacingSlider:SetValue(sis.rowSpacing or 1)
+        siBorderSizeSlider:SetValue(sis.borderSize or 1)
+        siGlowCheck:SetChecked(sis.glowAtMax ~= false)
+        siEmptyColourSwatch:SetColor(DeepCopy(sis.emptyColor or {0.12, 0.12, 0.12, 0.6}))
+        siBorderColourSwatch:SetColor(DeepCopy(sis.borderColor or CONFIG.bordercolor or {0, 0, 0, 1}))
+        siGlowColourSwatch:SetColor(DeepCopy(sis.glowColor or {1, 1, 1, 0.6}))
+        RebuildSIListUI()
+        RefreshStacksGrid()
+    end)
 end
 
 -- ============================================================================
@@ -1480,8 +2860,7 @@ local function BuildSettings()
                         self.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
                         CONFIG.cooldownColors = CONFIG.cooldownColors or {}
                         CONFIG.cooldownColors[cooldownID] = c
-                        ns.SaveCurrentProfile()
-                        ApplyLayoutToAllBars()
+                        DebouncedApplyAndSave()
                     end)
                 end)
                 row.cdColorBtn:SetScript("OnEnter", function(self)
@@ -1655,12 +3034,10 @@ local function BuildSettings()
                         buff1Slot.pairedCooldownID = buffCdID
                         buff1Slot.pairedColor = mappings[1].color
 
-                        if mappings[1].color then
-                            local bc = mappings[1].color
-                            buff1ColorBtn.tex:SetColorTexture(bc[1], bc[2], bc[3], bc[4] or 1)
-                            buff1ColorBtn:Show()
-                            buff1ColorBtn.procDot:SetShown(mappings[1].requireGlow == true)
-                        end
+                        local bc = mappings[1].color or (mappings[1].unit == "target" and CONFIG.debuffColor) or (mappings[1].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        buff1ColorBtn.tex:SetColorTexture(bc[1], bc[2], bc[3], bc[4] or 1)
+                        buff1ColorBtn:Show()
+                        buff1ColorBtn.procDot:SetShown(mappings[1].requireGlow == true)
                     end
                     -- Second mapping -> Buff 2 slot
                     if mappings[2] and mappings[2].buffCooldownIDs and mappings[2].buffCooldownIDs[1] then
@@ -1673,12 +3050,10 @@ local function BuildSettings()
                         buff2Slot.pairedCooldownID = buff2CdID
                         buff2Slot.pairedColor = mappings[2].color
 
-                        if mappings[2].color then
-                            local oc = mappings[2].color
-                            buff2ColorBtn.tex:SetColorTexture(oc[1], oc[2], oc[3], oc[4] or 1)
-                            buff2ColorBtn:Show()
-                            buff2ColorBtn.procDot:SetShown(mappings[2].requireGlow == true)
-                        end
+                        local oc = mappings[2].color or (mappings[2].unit == "target" and CONFIG.debuffColor) or (mappings[2].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        buff2ColorBtn.tex:SetColorTexture(oc[1], oc[2], oc[3], oc[4] or 1)
+                        buff2ColorBtn:Show()
+                        buff2ColorBtn.procDot:SetShown(mappings[2].requireGlow == true)
                     end
                 end
 
@@ -1695,7 +3070,6 @@ local function BuildSettings()
                             if m then
                                 if slotIndex == 1 then
                                     table.remove(m, 1)
-                                    if #m == 0 then CONFIG.buffMappings[cooldownID] = nil end
                                 elseif slotIndex == 2 and #m >= 2 then
                                     table.remove(m, 2)
                                 end
@@ -1733,7 +3107,8 @@ local function BuildSettings()
                             slot.icon:Show()
                             self.pairedCooldownID = buffCdID
 
-                            local defaultColor = DeepCopy(CONFIG.buffColor)
+                            local isDebuff = bSpellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSpellID)
+                            local defaultColor = isDebuff and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
                             if slotIndex == 2 then defaultColor[4] = 0.3 end
                             self.pairedColor = defaultColor
 
@@ -1746,6 +3121,7 @@ local function BuildSettings()
                                 buffCooldownIDs = {buffCdID},
                                 color = defaultColor,
                             }
+                            if isDebuff then mapping.unit = "target" end
                             EnrichWithLinkedSpells(mapping)
                             if slotIndex == 1 then
                                 CONFIG.buffMappings[cooldownID][1] = mapping
@@ -1806,7 +3182,8 @@ local function BuildSettings()
                             singleKey = next(mapData.spellColorMap)
                             if singleKey then singleColor = mapData.spellColorMap[singleKey] end
                         end
-                        local currentColor = singleColor or (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(CONFIG.buffColor)
+                        local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        local currentColor = singleColor or (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(defaultColor)
                         OpenInlineColorPicker(currentColor, function(c)
                             buff1ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
                             buff1Slot.pairedColor = c
@@ -1861,7 +3238,8 @@ local function BuildSettings()
                             singleKey = next(mapData.spellColorMap)
                             if singleKey then singleColor = mapData.spellColorMap[singleKey] end
                         end
-                        local currentColor = singleColor or (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(CONFIG.buffColor)
+                        local defaultColor2 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        local currentColor = singleColor or (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(defaultColor2)
                         currentColor[4] = currentColor[4] or 0.3
                         OpenInlineColorPicker(currentColor, function(c)
                             buff2ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
@@ -2340,7 +3718,7 @@ local function BuildSettings()
             local tipOk, data = pcall(C_TooltipInfo.GetSpellByID, sid)
             if tipOk and data and data.lines then
                 for _, line in ipairs(data.lines) do
-                    if line.leftText == SPELL_CAST_CHANNELED then return true end
+                    if not issecretvalue(line.leftText) and line.leftText == SPELL_CAST_CHANNELED then return true end
                 end
             end
             return false
@@ -2832,372 +4210,7 @@ local function BuildSettings()
     -- ========================================================================
     -- TAB C: COLOURS
     -- ========================================================================
-    local coloursTab = CreateFrame("Frame", nil, contentArea)
-    coloursTab:SetAllPoints()
-    coloursTab:Hide()
-    tabFrames[3] = coloursTab
-
-    local colourScroll, colourContent = CreateScrollableContent(coloursTab)
-
-    local colourY = 0
-    local function AddColourWidget(widget)
-        widget:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
-        colourY = colourY + widget:GetHeight() + 6
-    end
-
-    local function AddColourHeader(text)
-        colourY = colourY + 10
-        local h = CreateSectionHeader(colourContent, text)
-        h:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
-        colourY = colourY + 22
-    end
-
-    local function AddColourDescription(text)
-        local desc = colourContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        desc:SetPoint("TOPLEFT", colourContent, "TOPLEFT", 10, -colourY)
-        desc:SetWidth(500)
-        desc:SetJustifyH("LEFT")
-        desc:SetSpacing(2)
-        desc:SetText(text)
-        colourY = colourY + desc:GetStringHeight() + 6
-    end
-
-    -- Bar Colours
-    AddColourHeader("Bar Colours")
-    AddColourDescription("Default colours for bar types. Per-cooldown and per-slot colours set in the Bars tab take priority over these.")
-
-    local cdColourSwatch = CreateColorSwatch(colourContent, "Cooldown", DeepCopy(CONFIG.cooldownColor), function(c)
-        CONFIG.cooldownColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(cdColourSwatch)
-
-    local castColourSwatch = CreateColorSwatch(colourContent, "Cast", DeepCopy(CONFIG.castColor), function(c)
-        CONFIG.castColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(castColourSwatch)
-
-    local buffColourSwatch = CreateColorSwatch(colourContent, "Buff", DeepCopy(CONFIG.buffColor), function(c)
-        CONFIG.buffColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(buffColourSwatch)
-
-    local debuffColourSwatch = CreateColorSwatch(colourContent, "Debuff", DeepCopy(CONFIG.debuffColor), function(c)
-        CONFIG.debuffColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(debuffColourSwatch)
-
-    local petBuffColourSwatch = CreateColorSwatch(colourContent, "Pet Buff", DeepCopy(CONFIG.petBuffColor), function(c)
-        CONFIG.petBuffColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(petBuffColourSwatch)
-
-    -- Frame Colours
-    AddColourHeader("Frame Colours")
-    AddColourDescription("Background and border of the main Infall frame. These affect the container around all bars.")
-
-    local bgColourSwatch = CreateColorSwatch(colourContent, "Background", DeepCopy(CONFIG.bgcolor), function(c)
-        CONFIG.bgcolor = c
-        if ns.ApplyBackdrop then ns.ApplyBackdrop() end
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(bgColourSwatch)
-
-    local borderColourSwatch = CreateColorSwatch(colourContent, "Border", DeepCopy(CONFIG.bordercolor), function(c)
-        CONFIG.bordercolor = c
-        if ns.ApplyBackdrop then ns.ApplyBackdrop() end
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(borderColourSwatch)
-
-    -- Now Line / GCD
-    AddColourHeader("Now Line / GCD")
-    AddColourDescription("Colours for the now line, GCD bar and spark, and time reference lines.")
-
-    local nowLineColourSwatch = CreateColorSwatch(colourContent, "Now Line", DeepCopy(CONFIG.nowLineColor), function(c)
-        CONFIG.nowLineColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(nowLineColourSwatch)
-
-    local gcdColourSwatch = CreateColorSwatch(colourContent, "GCD Bar", DeepCopy(CONFIG.gcdColor), function(c)
-        CONFIG.gcdColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(gcdColourSwatch)
-
-    local gcdSparkColourSwatch = CreateColorSwatch(colourContent, "GCD Spark", DeepCopy(CONFIG.gcdSparkColor), function(c)
-        CONFIG.gcdSparkColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(gcdSparkColourSwatch)
-
-    local linesColourSwatch = CreateColorSwatch(colourContent, "Time Lines", DeepCopy(CONFIG.linesColor), function(c)
-        CONFIG.linesColor = c
-        ApplyLayoutToAllBars()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(linesColourSwatch)
-
-    -- Icon State Colours
-    AddColourHeader("Icon State Colours")
-    AddColourDescription("Tint applied to ability icons based on usability. Only visible when Reactive Icons is enabled in the Toggles tab.")
-
-    local iconUsableColourSwatch = CreateColorSwatch(colourContent, "Usable", DeepCopy(CONFIG.iconUsableColor), function(c)
-        CONFIG.iconUsableColor = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(iconUsableColourSwatch)
-
-    local iconManaColourSwatch = CreateColorSwatch(colourContent, "Not Enough Mana", DeepCopy(CONFIG.iconNotEnoughManaColor), function(c)
-        CONFIG.iconNotEnoughManaColor = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(iconManaColourSwatch)
-
-    local iconNotUsableColourSwatch = CreateColorSwatch(colourContent, "Not Usable", DeepCopy(CONFIG.iconNotUsableColor), function(c)
-        CONFIG.iconNotUsableColor = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(iconNotUsableColourSwatch)
-
-    local iconRangeColourSwatch = CreateColorSwatch(colourContent, "Out of Range", DeepCopy(CONFIG.iconNotInRangeColor), function(c)
-        CONFIG.iconNotInRangeColor = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(iconRangeColourSwatch)
-
-    -- Empowered Stage Colours
-    AddColourHeader("Empowered Stage Colours")
-    AddColourDescription("Colours for each empowered cast stage (IE Evoker abilities). Stages progress left to right as you hold the cast.")
-
-    local empowerStage1Swatch = CreateColorSwatch(colourContent, "Stage 1", DeepCopy(CONFIG.empowerStage1Color), function(c)
-        CONFIG.empowerStage1Color = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(empowerStage1Swatch)
-
-    local empowerStage2Swatch = CreateColorSwatch(colourContent, "Stage 2", DeepCopy(CONFIG.empowerStage2Color), function(c)
-        CONFIG.empowerStage2Color = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(empowerStage2Swatch)
-
-    local empowerStage3Swatch = CreateColorSwatch(colourContent, "Stage 3", DeepCopy(CONFIG.empowerStage3Color), function(c)
-        CONFIG.empowerStage3Color = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(empowerStage3Swatch)
-
-    local empowerStage4Swatch = CreateColorSwatch(colourContent, "Stage 4", DeepCopy(CONFIG.empowerStage4Color), function(c)
-        CONFIG.empowerStage4Color = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(empowerStage4Swatch)
-
-    -- Channel Colours
-    AddColourHeader("Channel Colours")
-    AddColourDescription("Colour for the chain window at the tail of a Disintegrate channel, showing when it's safe to clip and recast.")
-
-    local disintChainSwatch = CreateColorSwatch(colourContent, "Disintegrate Chain Window", DeepCopy(CONFIG.disintegrateChainColor), function(c)
-        CONFIG.disintegrateChainColor = c
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(disintChainSwatch)
-
-    -- Text Colours
-    AddColourHeader("Text Colours")
-    AddColourDescription("Default colours for charge and stack text on bars. Per-slot colours set in the Bars tab take priority over these.")
-
-    local chargeTextColourSwatch = CreateColorSwatch(colourContent, "Charge Text", DeepCopy(CONFIG.chargeTextColor), function(c)
-        CONFIG.chargeTextColor = c
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(chargeTextColourSwatch)
-
-    local stackTextColourSwatch = CreateColorSwatch(colourContent, "Stack Text", DeepCopy(CONFIG.stackTextColor), function(c)
-        CONFIG.stackTextColor = c
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackTextColourSwatch)
-
-    -- Font Settings
-    AddColourHeader("Font Settings")
-    AddColourDescription("Font used for charge counts and stack text on bars. Size and flags control readability. To add custom fonts, install LibSharedMedia-3.0 and a SharedMedia font pack (IE SharedMedia_MyMedia). Fonts from those packs will appear in the dropdown automatically.")
-
-    local fontOptions = GetFontOptions()
-    local fontDropdown = CreateDropdown(colourContent, "Font", fontOptions, CONFIG.font, function(v)
-        CONFIG.font = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end, true)
-    AddColourWidget(fontDropdown)
-
-    local fontSizeSlider = CreateSlider(colourContent, "Font Size", 8, 24, 1, CONFIG.fontSize, function(v)
-        CONFIG.fontSize = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(fontSizeSlider)
-
-    local fontFlagsDropdown = CreateDropdown(colourContent, "Font Flags", FONT_FLAG_OPTIONS, CONFIG.fontFlags, function(v)
-        CONFIG.fontFlags = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(fontFlagsDropdown)
-
-    -- Text Anchors
-    AddColourHeader("Charge Text Anchor")
-    AddColourDescription("Where charge count text is positioned on each bar. Offset sliders fine-tune placement from the anchor point.")
-
-    local chargeAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.chargeTextAnchor, function(v)
-        CONFIG.chargeTextAnchor = v
-        CONFIG.chargeTextRelPoint = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(chargeAnchorDropdown)
-
-    local chargeOffXSlider = CreateSlider(colourContent, "Charge Offset X", -20, 20, 1, CONFIG.chargeTextOffsetX, function(v)
-        CONFIG.chargeTextOffsetX = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(chargeOffXSlider)
-
-    local chargeOffYSlider = CreateSlider(colourContent, "Charge Offset Y", -20, 20, 1, CONFIG.chargeTextOffsetY, function(v)
-        CONFIG.chargeTextOffsetY = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(chargeOffYSlider)
-
-    AddColourHeader("Stack Text Anchor")
-    AddColourDescription("Where stack count text is positioned on each bar. Works the same way as charge text anchoring.")
-
-    local stackAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.stackTextAnchor, function(v)
-        CONFIG.stackTextAnchor = v
-        CONFIG.stackTextRelPoint = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackAnchorDropdown)
-
-    local stackOffXSlider = CreateSlider(colourContent, "Stack Offset X", -20, 20, 1, CONFIG.stackTextOffsetX, function(v)
-        CONFIG.stackTextOffsetX = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackOffXSlider)
-
-    local stackOffYSlider = CreateSlider(colourContent, "Stack Offset Y", -20, 20, 1, CONFIG.stackTextOffsetY, function(v)
-        CONFIG.stackTextOffsetY = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackOffYSlider)
-
-    -- Variant Name Text
-    AddColourHeader("Variant Name Text")
-    AddColourDescription("Colour, size, and position of variant name text on bars (IE Roll the Bones outcome names). Enable this feature in the Toggles tab. Adjusting these settings shows a preview on your bars.")
-
-    local variantTextColourSwatch = CreateColorSwatch(colourContent, "Variant Name Colour", DeepCopy(CONFIG.variantTextColor), function(c)
-        CONFIG.variantTextColor = c
-        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(variantTextColourSwatch)
-
-    local variantTextSizeSlider = CreateSlider(colourContent, "Variant Name Size", 6, 24, 1, CONFIG.variantTextSize, function(v)
-        CONFIG.variantTextSize = v
-        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(variantTextSizeSlider)
-
-    local variantAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.variantTextAnchor, function(v)
-        CONFIG.variantTextAnchor = v
-        CONFIG.variantTextRelPoint = v
-        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(variantAnchorDropdown)
-
-    local variantOffXSlider = CreateSlider(colourContent, "Variant Offset X", -50, 50, 1, CONFIG.variantTextOffsetX, function(v)
-        CONFIG.variantTextOffsetX = v
-        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(variantOffXSlider)
-
-    local variantOffYSlider = CreateSlider(colourContent, "Variant Offset Y", -20, 20, 1, CONFIG.variantTextOffsetY, function(v)
-        CONFIG.variantTextOffsetY = v
-        if ns.ShowVariantPreview then ns.ShowVariantPreview() end
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(variantOffYSlider)
-
-    colourContent:SetHeight(colourY + 20)
-
-    coloursTab:SetScript("OnShow", function()
-        if CONFIG.cooldownColor then cdColourSwatch:SetColor(DeepCopy(CONFIG.cooldownColor)) end
-        if CONFIG.castColor then castColourSwatch:SetColor(DeepCopy(CONFIG.castColor)) end
-        if CONFIG.buffColor then buffColourSwatch:SetColor(DeepCopy(CONFIG.buffColor)) end
-        if CONFIG.debuffColor then debuffColourSwatch:SetColor(DeepCopy(CONFIG.debuffColor)) end
-        if CONFIG.petBuffColor then petBuffColourSwatch:SetColor(DeepCopy(CONFIG.petBuffColor)) end
-        if CONFIG.bgcolor then bgColourSwatch:SetColor(DeepCopy(CONFIG.bgcolor)) end
-        if CONFIG.bordercolor then borderColourSwatch:SetColor(DeepCopy(CONFIG.bordercolor)) end
-        if CONFIG.nowLineColor then nowLineColourSwatch:SetColor(DeepCopy(CONFIG.nowLineColor)) end
-        if CONFIG.gcdColor then gcdColourSwatch:SetColor(DeepCopy(CONFIG.gcdColor)) end
-        if CONFIG.gcdSparkColor then gcdSparkColourSwatch:SetColor(DeepCopy(CONFIG.gcdSparkColor)) end
-        if CONFIG.linesColor then linesColourSwatch:SetColor(DeepCopy(CONFIG.linesColor)) end
-        if CONFIG.iconUsableColor then iconUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconUsableColor)) end
-        if CONFIG.iconNotEnoughManaColor then iconManaColourSwatch:SetColor(DeepCopy(CONFIG.iconNotEnoughManaColor)) end
-        if CONFIG.iconNotUsableColor then iconNotUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconNotUsableColor)) end
-        if CONFIG.iconNotInRangeColor then iconRangeColourSwatch:SetColor(DeepCopy(CONFIG.iconNotInRangeColor)) end
-        if CONFIG.empowerStage1Color then empowerStage1Swatch:SetColor(DeepCopy(CONFIG.empowerStage1Color)) end
-        if CONFIG.empowerStage2Color then empowerStage2Swatch:SetColor(DeepCopy(CONFIG.empowerStage2Color)) end
-        if CONFIG.empowerStage3Color then empowerStage3Swatch:SetColor(DeepCopy(CONFIG.empowerStage3Color)) end
-        if CONFIG.empowerStage4Color then empowerStage4Swatch:SetColor(DeepCopy(CONFIG.empowerStage4Color)) end
-        if CONFIG.disintegrateChainColor then disintChainSwatch:SetColor(DeepCopy(CONFIG.disintegrateChainColor)) end
-        if CONFIG.chargeTextColor then chargeTextColourSwatch:SetColor(DeepCopy(CONFIG.chargeTextColor)) end
-        if CONFIG.stackTextColor then stackTextColourSwatch:SetColor(DeepCopy(CONFIG.stackTextColor)) end
-        if CONFIG.variantTextColor then variantTextColourSwatch:SetColor(DeepCopy(CONFIG.variantTextColor)) end
-        fontDropdown:SetValue(CONFIG.font)
-        fontSizeSlider:SetValue(CONFIG.fontSize)
-        fontFlagsDropdown:SetValue(CONFIG.fontFlags)
-        chargeAnchorDropdown:SetValue(CONFIG.chargeTextAnchor)
-        chargeOffXSlider:SetValue(CONFIG.chargeTextOffsetX)
-        chargeOffYSlider:SetValue(CONFIG.chargeTextOffsetY)
-        stackAnchorDropdown:SetValue(CONFIG.stackTextAnchor)
-        stackOffXSlider:SetValue(CONFIG.stackTextOffsetX)
-        stackOffYSlider:SetValue(CONFIG.stackTextOffsetY)
-        variantTextSizeSlider:SetValue(CONFIG.variantTextSize)
-        variantAnchorDropdown:SetValue(CONFIG.variantTextAnchor)
-        variantOffXSlider:SetValue(CONFIG.variantTextOffsetX)
-        variantOffYSlider:SetValue(CONFIG.variantTextOffsetY)
-    end)
-
-    coloursTab:SetScript("OnHide", function()
-        if ns.HideVariantPreview then ns.HideVariantPreview() end
-    end)
+    BuildColoursTab(contentArea, tabFrames)
 
     -- ========================================================================
     -- TAB D: TOGGLES
@@ -3460,7 +4473,7 @@ local function BuildSettings()
     local profilesTab = CreateFrame("Frame", nil, contentArea)
     profilesTab:SetAllPoints()
     profilesTab:Hide()
-    tabFrames[5] = profilesTab
+    tabFrames[6] = profilesTab
 
     local profScroll, profContent = CreateScrollableContent(profilesTab)
 
@@ -3898,6 +4911,11 @@ local function BuildSettings()
     refreshSettingsUI = function()
         SelectTab(currentTab)
     end
+
+    -- ========================================================================
+    -- TAB F: STACKS
+    -- ========================================================================
+    BuildStacksTab(contentArea, tabFrames)
 
     -- ========================================================================
     -- REGISTRATION
