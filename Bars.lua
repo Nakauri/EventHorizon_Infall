@@ -175,6 +175,8 @@ local UpdateBuffState
 local UpdateStackText
 local UpdateDesaturation
 local ScanViewerFrames
+local UpdateAllSIPips
+local siIsBuilt = false
 
 -- Bar spans -past..+future; "now" at (past / totalSpan) from left.
 
@@ -1853,11 +1855,11 @@ UpdateBuffState = function(row, buffViewerFrames)
                                                 return mapData.spellColorMap[aData.spellId]
                                             end
                                         end)
-                                        if sOk and sColor then
+                                        if sOk and sColor and not mapData.color then
                                             matchedColor = sColor
                                             hasCustomColor = true
                                             row._cachedVariantColor = sColor
-                                        elseif row._cachedVariantColor then
+                                        elseif row._cachedVariantColor and not mapData.color then
                                             matchedColor = row._cachedVariantColor
                                             hasCustomColor = true
                                         end
@@ -2325,6 +2327,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             end
         else
             UpdateBars()
+        end
+        if siIsBuilt and CONFIG.stackIndicators then
+            UpdateAllSIPips()
         end
     end
 
@@ -3179,7 +3184,10 @@ local function ProcessSpecChange()
         if InfallDB.profiles[specKey] and ns.ApplyProfile then
             ns.ApplyProfile(InfallDB.profiles[specKey])
         elseif ns.SeedProfileFromClassConfig then
-            ns.SeedProfileFromClassConfig(specKey)
+            local profile = ns.SeedProfileFromClassConfig(specKey)
+            if profile and ns.ApplyProfile then
+                ns.ApplyProfile(profile)
+            end
         end
     end
 
@@ -3556,7 +3564,10 @@ loginInitFrame:SetScript("OnEvent", function()
         else
             -- first time for this spec
             if ns.SeedProfileFromClassConfig then
-                ns.SeedProfileFromClassConfig(specKey)
+                local profile = ns.SeedProfileFromClassConfig(specKey)
+                if profile and ns.ApplyProfile then
+                    ns.ApplyProfile(profile)
+                end
             end
         end
         if InfallDB.pendingMigration then
@@ -4405,7 +4416,7 @@ local stackContainerTop
 local stackContainerBottom
 local siHooksInstalled = false
 local indicatorRows = {}
-local siIsBuilt = false
+siIsBuilt = false
 local siRowPool = {}
 
 local function SnapPx(value, scale)
@@ -4606,7 +4617,7 @@ SyncStackContainerLayout = function()
     end
 end
 
-local function UpdateAllSIPips()
+UpdateAllSIPips = function()
     if not siHooksInstalled and EH_Parent then
         EH_Parent:HookScript("OnShow", function()
             if siIsBuilt and CONFIG.stackIndicators then
@@ -4815,21 +4826,11 @@ function ns.RebuildStackIndicators()
 end
 
 local siEventFrame = CreateFrame("Frame")
-siEventFrame:RegisterUnitEvent("UNIT_AURA", "player")
 siEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 siEventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 
-local lastSIUpdate = 0
-local SI_THROTTLE = 0.1
 siEventFrame:SetScript("OnEvent", function(self, event)
-    if event == "UNIT_AURA" then
-        local now = GetTime()
-        if now - lastSIUpdate < SI_THROTTLE then return end
-        lastSIUpdate = now
-        if siIsBuilt then
-            UpdateAllSIPips()
-        end
-    elseif event == "PLAYER_ENTERING_WORLD" then
+    if event == "PLAYER_ENTERING_WORLD" then
         C_Timer.After(2.5, function()
             if CONFIG.stackIndicators then
                 BuildSIIndicators()
