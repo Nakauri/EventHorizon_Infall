@@ -101,6 +101,7 @@ ns.CONFIG = {
     smoothBars = false,
     showPastBars = true,
     forceViewersAlways = true,
+    stackIndicators = false,
 }
 
 InfallDB = InfallDB or {}
