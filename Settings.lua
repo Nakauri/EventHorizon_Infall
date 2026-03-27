@@ -65,38 +65,8 @@ local function DebouncedApplyAndSave(extraFn)
     end)
 end
 
-local VARIANT_PALETTE = {
-    {0.9, 0.5, 0.1, 0.6},
-    {0.3, 0.8, 0.3, 0.6},
-    {0.9, 0.2, 0.9, 0.6},
-    {0.8, 0.8, 0.2, 0.6},
-    {0.2, 0.8, 0.8, 0.6},
-}
-
-local function EnrichWithLinkedSpells(mapData)
-    if not mapData or mapData.spellColorMap then return end
-    if mapData.color then return end
-    if not mapData.buffCooldownIDs or not mapData.buffCooldownIDs[1] then return end
-    if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
-
-    local buffCdID = mapData.buffCooldownIDs[1]
-    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
-    if not ok or not info then return end
-    if not info.linkedSpellIDs or #info.linkedSpellIDs <= 1 then return end
-
-    mapData.spellColorMap = {}
-    for i, linkedID in ipairs(info.linkedSpellIDs) do
-        mapData.spellColorMap[linkedID] = DeepCopy(VARIANT_PALETTE[((i - 1) % #VARIANT_PALETTE) + 1])
-    end
-end
-
 function ns.EnrichAllMappings()
-    if not CONFIG.buffMappings then return end
-    for _, mappings in pairs(CONFIG.buffMappings) do
-        for _, mapData in ipairs(mappings) do
-            EnrichWithLinkedSpells(mapData)
-        end
-    end
+    -- No-op (variant colour system removed)
 end
 
 function ns.AutoPopulateSelfBuffMappings()
@@ -121,7 +91,6 @@ function ns.AutoPopulateSelfBuffMappings()
                 if cdInfo.spellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
                     mapping.unit = "target"
                 end
-                EnrichWithLinkedSpells(mapping)
                 CONFIG.buffMappings[cooldownID] = { mapping }
                 created = true
             end
@@ -278,22 +247,11 @@ function ns.ApplyProfile(profile)
         end
     end
 
-    -- Strip stale spellColorMaps from old profiles where user set an explicit colour
+    -- Strip spellColorMaps from old profiles (variant colour system removed)
     if CONFIG.buffMappings then
         for _, mappings in pairs(CONFIG.buffMappings) do
             for _, mapData in ipairs(mappings) do
-                if mapData.color and mapData.spellColorMap then
-                    mapData.spellColorMap = nil
-                end
-            end
-        end
-    end
-
-    -- Auto-detect variant spells for any mapping missing spellColorMap
-    if CONFIG.buffMappings then
-        for _, mappings in pairs(CONFIG.buffMappings) do
-            for _, mapData in ipairs(mappings) do
-                EnrichWithLinkedSpells(mapData)
+                mapData.spellColorMap = nil
             end
         end
     end
@@ -885,10 +843,7 @@ local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Profiles"
 local tabFrames = {}
 local tabButtons = {}
 local currentTab = 1
-local hideVariantPopupFunc
-
 local function SelectTab(index)
-    if hideVariantPopupFunc then hideVariantPopupFunc() end
     currentTab = index
     for i, frame in ipairs(tabFrames) do
         if frame then frame:Hide() end
@@ -2461,8 +2416,8 @@ local function BuildSettings()
     topTitle:SetText("Cooldown Rows")
 
     -- Column headers (aligned with row layout)
-    local colHeaders = {"Show", "", "", "Ability", "Buff 1", "Buff 2", "Cast 1", "Cast 2", "Stack"}
-    local colPositions = {6, 30, 48, 76, 190, 240, 296, 346, 400}
+    local colHeaders = {"Show", "", "", "Ability", "Buff 1", "Buff 2", "Buff 3", "Cast 1", "Cast 2", "Stack"}
+    local colPositions = {6, 30, 48, 76, 190, 240, 290, 346, 396, 450}
 
     for i, text in ipairs(colHeaders) do
         local hdr = topPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -2566,119 +2521,6 @@ local function BuildSettings()
     statusText = bottomPanel:CreateFontString(nil, "OVERLAY", "GameFontGreen")
     statusText:SetPoint("BOTTOMRIGHT", -8, 6)
     statusText:SetText("")
-
-    -- Variant colour popup (for spellColorMap, IE Roll the Bones outcomes)
-    local variantPopup = CreateFrame("Frame", nil, settingsFrame, "BackdropTemplate")
-    variantPopup:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8x8",
-        edgeFile = "Interface\\Buttons\\WHITE8x8",
-        edgeSize = 1,
-    })
-    variantPopup:SetBackdropColor(0.1, 0.1, 0.15, 0.95)
-    variantPopup:SetBackdropBorderColor(0.3, 0.3, 0.4, 1)
-    variantPopup:SetFrameStrata("DIALOG")
-    variantPopup:EnableMouse(true)
-    variantPopup:Hide()
-
-    local variantPopupRows = {}
-    local variantPopupRowCount = 0
-
-    hideVariantPopupFunc = function() variantPopup:Hide() end
-
-    local function IsMultiVariant(mapData)
-        if not mapData or not mapData.spellColorMap then return false end
-        local firstKey = next(mapData.spellColorMap)
-        return firstKey and next(mapData.spellColorMap, firstKey) ~= nil
-    end
-
-    local function ShowVariantPopup(anchor, cooldownID, mapIndex)
-        if variantPopup:IsShown() then
-            variantPopup:Hide()
-            return
-        end
-
-        local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-        if not m or not m[mapIndex] or not m[mapIndex].spellColorMap then return end
-        local mapData = m[mapIndex]
-
-        for i = 1, variantPopupRowCount do
-            if variantPopupRows[i] then variantPopupRows[i]:Hide() end
-        end
-
-        variantPopup:ClearAllPoints()
-        variantPopup:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
-
-        local yOff = -8
-        local rowIdx = 0
-
-        -- Helper: create or reuse a popup row
-        local function GetPopupRow()
-            rowIdx = rowIdx + 1
-            local row = variantPopupRows[rowIdx]
-            if not row then
-                row = CreateFrame("Frame", nil, variantPopup)
-                row:SetSize(200, 20)
-                row.swatch = CreateFrame("Button", nil, row)
-                row.swatch:SetSize(16, 16)
-                row.swatch:SetPoint("LEFT", 8, 0)
-                local bg = row.swatch:CreateTexture(nil, "BACKGROUND")
-                bg:SetAllPoints()
-                bg:SetColorTexture(0, 0, 0, 1)
-                local tex = row.swatch:CreateTexture(nil, "OVERLAY")
-                tex:SetPoint("TOPLEFT", 1, -1)
-                tex:SetPoint("BOTTOMRIGHT", -1, 1)
-                row.swatch.tex = tex
-                row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-                row.label:SetPoint("LEFT", row.swatch, "RIGHT", 6, 0)
-                row.label:SetWidth(170)
-                row.label:SetJustifyH("LEFT")
-                variantPopupRows[rowIdx] = row
-            end
-            row:Show()
-            row:SetPoint("TOPLEFT", 0, yOff)
-            yOff = yOff - 22
-            return row
-        end
-
-        -- Default (fallback) colour
-        local dRow = GetPopupRow()
-        local baseColor = mapData.color or DeepCopy(CONFIG.buffColor)
-        dRow.swatch.tex:SetColorTexture(baseColor[1], baseColor[2], baseColor[3], baseColor[4] or 1)
-        dRow.label:SetText("Default (fallback)")
-        dRow.swatch:SetScript("OnClick", function()
-            OpenInlineColorPicker(baseColor, function(c)
-                dRow.swatch.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                mapData.color = c
-                ns.SaveCurrentProfile()
-            end)
-        end)
-
-        -- Variant rows sorted by spellID
-        local sortedIDs = {}
-        for spellId in pairs(mapData.spellColorMap) do
-            sortedIDs[#sortedIDs + 1] = spellId
-        end
-        table.sort(sortedIDs)
-
-        for _, spellId in ipairs(sortedIDs) do
-            local color = mapData.spellColorMap[spellId]
-            local vRow = GetPopupRow()
-            local spellName = C_Spell.GetSpellName(spellId) or ("SpellID: " .. spellId)
-            vRow.label:SetText(spellName)
-            vRow.swatch.tex:SetColorTexture(color[1], color[2], color[3], color[4] or 1)
-            vRow.swatch:SetScript("OnClick", function()
-                OpenInlineColorPicker(color, function(c)
-                    vRow.swatch.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                    mapData.spellColorMap[spellId] = c
-                    ns.SaveCurrentProfile()
-                end)
-            end)
-        end
-
-        variantPopupRowCount = math.max(variantPopupRowCount, rowIdx)
-        variantPopup:SetSize(220, math.abs(yOff) + 8)
-        variantPopup:Show()
-    end
 
     -- Slot frame (buff 1 or buff 2)
     local function CreateSlotFrame(parentRow, anchorFrame, anchorPoint, xOff)
@@ -2811,7 +2653,9 @@ local function BuildSettings()
                     row.buff1ColorBtn = CreateSlotColorBtn(row, row.buff1Slot)
                     row.buff2Slot = CreateSlotFrame(row, row.buff1ColorBtn, "RIGHT", 6)
                     row.buff2ColorBtn = CreateSlotColorBtn(row, row.buff2Slot)
-                    row.cast1Slot = CreateSlotFrame(row, row.buff2ColorBtn, "RIGHT", 12)
+                    row.buff3Slot = CreateSlotFrame(row, row.buff2ColorBtn, "RIGHT", 6)
+                    row.buff3ColorBtn = CreateSlotColorBtn(row, row.buff3Slot)
+                    row.cast1Slot = CreateSlotFrame(row, row.buff3ColorBtn, "RIGHT", 12)
                     row.cast1ColorBtn = CreateSlotColorBtn(row, row.cast1Slot)
                     row.cast2Slot = CreateSlotFrame(row, row.cast1ColorBtn, "RIGHT", 6)
                     row.cast2ColorBtn = CreateSlotColorBtn(row, row.cast2Slot)
@@ -2880,6 +2724,10 @@ local function BuildSettings()
                 row.buff2Slot.pairedCooldownID = nil
                 row.buff2Slot.pairedColor = nil
                 row.buff2ColorBtn:Hide()
+                row.buff3Slot.icon:Hide()
+                row.buff3Slot.pairedCooldownID = nil
+                row.buff3Slot.pairedColor = nil
+                row.buff3ColorBtn:Hide()
                 row.cast1Slot.icon:Hide()
                 row.cast1Slot.pairedSpellID = nil
                 row.cast1Slot.pairedColor = nil
@@ -2897,6 +2745,8 @@ local function BuildSettings()
                 local buff1ColorBtn = row.buff1ColorBtn
                 local buff2Slot = row.buff2Slot
                 local buff2ColorBtn = row.buff2ColorBtn
+                local buff3Slot = row.buff3Slot
+                local buff3ColorBtn = row.buff3ColorBtn
                 local cast1Slot = row.cast1Slot
                 local cast1ColorBtn = row.cast1ColorBtn
                 local cast2Slot = row.cast2Slot
@@ -2908,11 +2758,13 @@ local function BuildSettings()
                 local nameText = row.nameText
                 buff1Slot.slotType = "buff"
                 buff2Slot.slotType = "buff"
+                buff3Slot.slotType = "buff"
                 cast1Slot.slotType = "cast"
                 cast2Slot.slotType = "cast"
                 stackSlot.slotType = "stack"
                 allSlotFrames[#allSlotFrames + 1] = buff1Slot
                 allSlotFrames[#allSlotFrames + 1] = buff2Slot
+                allSlotFrames[#allSlotFrames + 1] = buff3Slot
                 allSlotFrames[#allSlotFrames + 1] = cast1Slot
                 allSlotFrames[#allSlotFrames + 1] = cast2Slot
                 allSlotFrames[#allSlotFrames + 1] = stackSlot
@@ -3007,6 +2859,29 @@ local function BuildSettings()
                 end)
                 buff2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+                -- Tooltips for Buff 3
+                buff3Slot:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    if self.pairedCooldownID then
+                        local tInfoOk, tInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, self.pairedCooldownID)
+                        local tSpellID = tInfoOk and tInfo and tInfo.spellID
+                        local tName = tSpellID and C_Spell.GetSpellName(tSpellID) or ("ID:" .. self.pairedCooldownID)
+                        GameTooltip:SetText("Buff 3: " .. tName, 1, 1, 1)
+                        GameTooltip:AddLine("CooldownID: " .. self.pairedCooldownID, 0.7, 0.7, 0.7)
+                        GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
+                        GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
+                    else
+                        GameTooltip:SetText("Buff 3 Slot (empty)", 0.6, 0.6, 0.6)
+                        if selectedBuff then
+                            GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
+                        else
+                            GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                        end
+                    end
+                    GameTooltip:Show()
+                end)
+                buff3Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
                 -- Look up by CDM cooldownID first, fall back to spellID.
                 local mappings = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                 if not mappings and spellID and spellID ~= cooldownID and CONFIG.buffMappings then
@@ -3051,6 +2926,22 @@ local function BuildSettings()
                         buff2ColorBtn:Show()
                         buff2ColorBtn.procDot:SetShown(mappings[2].requireGlow == true)
                     end
+                    -- Third mapping -> Buff 3 slot
+                    if mappings[3] and mappings[3].buffCooldownIDs and mappings[3].buffCooldownIDs[1] then
+                        local buff3CdID = mappings[3].buffCooldownIDs[1]
+                        local tInfoOk, tInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buff3CdID)
+                        local tSpellID = tInfoOk and tInfo and tInfo.spellID
+                        local tIcon = tSpellID and C_Spell.GetSpellTexture(tSpellID) or 134400
+                        buff3Slot.icon:SetTexture(tIcon)
+                        buff3Slot.icon:Show()
+                        buff3Slot.pairedCooldownID = buff3CdID
+                        buff3Slot.pairedColor = mappings[3].color
+
+                        local tc = mappings[3].color or (mappings[3].unit == "target" and CONFIG.debuffColor) or (mappings[3].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        buff3ColorBtn.tex:SetColorTexture(tc[1], tc[2], tc[3], tc[4] or 1)
+                        buff3ColorBtn:Show()
+                        buff3ColorBtn.procDot:SetShown(mappings[3].requireGlow == true)
+                    end
                 end
 
                 local function PairToSlot(slot, colorBtn, slotIndex)
@@ -3068,6 +2959,8 @@ local function BuildSettings()
                                     table.remove(m, 1)
                                 elseif slotIndex == 2 and #m >= 2 then
                                     table.remove(m, 2)
+                                elseif slotIndex == 3 and #m >= 3 then
+                                    table.remove(m, 3)
                                 end
                             end
                             ns.SaveCurrentProfile()
@@ -3085,12 +2978,19 @@ local function BuildSettings()
                             return
                         end
                         if selectedBuff then
-                            -- Enforce slot 1 before slot 2
+                            -- Enforce slot ordering
                             if slotIndex == 2 then
                                 local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                                 local slot1Valid = m and m[1] and m[1].buffCooldownIDs and #m[1].buffCooldownIDs > 0
                                 if not slot1Valid then
                                     statusText:SetText("|cffff6666Pair Buff 1 first before using Buff 2.|r")
+                                    return
+                                end
+                            elseif slotIndex == 3 then
+                                local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                                local slot2Valid = m and m[2] and m[2].buffCooldownIDs and #m[2].buffCooldownIDs > 0
+                                if not slot2Valid then
+                                    statusText:SetText("|cffff6666Pair Buff 1 and 2 first before using Buff 3.|r")
                                     return
                                 end
                             end
@@ -3105,7 +3005,7 @@ local function BuildSettings()
 
                             local isDebuff = bSpellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSpellID)
                             local defaultColor = isDebuff and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
-                            if slotIndex == 2 then defaultColor[4] = 0.3 end
+                            if slotIndex >= 2 then defaultColor[4] = 0.3 end
                             self.pairedColor = defaultColor
 
                             colorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
@@ -3118,12 +3018,7 @@ local function BuildSettings()
                                 color = defaultColor,
                             }
                             if isDebuff then mapping.unit = "target" end
-                            EnrichWithLinkedSpells(mapping)
-                            if slotIndex == 1 then
-                                CONFIG.buffMappings[cooldownID][1] = mapping
-                            else
-                                CONFIG.buffMappings[cooldownID][2] = mapping
-                            end
+                            CONFIG.buffMappings[cooldownID][slotIndex] = mapping
                             ns.SaveCurrentProfile()
                             LoadEssentialCooldowns()
                             CancelSelection()
@@ -3134,62 +3029,41 @@ local function BuildSettings()
 
                 buff1Slot:SetScript("OnClick", PairToSlot(buff1Slot, buff1ColorBtn, 1))
                 buff2Slot:SetScript("OnClick", PairToSlot(buff2Slot, buff2ColorBtn, 2))
+                buff3Slot:SetScript("OnClick", PairToSlot(buff3Slot, buff3ColorBtn, 3))
 
                 -- Colour picker for Buff 1
                 buff1ColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
                 buff1ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    if m and m[1] and IsMultiVariant(m[1]) then
-                        GameTooltip:SetText("Buff 1 Variant Colours")
-                        GameTooltip:AddLine("Click to change colours for each buff variant. Variant colours only resolve outside of instances.", 0.7, 0.7, 0.7, true)
-                        if m[1].requireGlow then
-                            GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
-                        end
-                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                    else
-                        GameTooltip:SetText("Buff 1 Colour")
-                        GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
-                        if m and m[1] and m[1].spellColorMap then
-                            GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                        end
+                    GameTooltip:SetText("Buff 1 Colour")
+                    GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                    if m and m[1] and m[1].requireGlow then
+                        GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
+                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 buff1ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff1ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[1] and m[1].spellColorMap then
+                        if m and m[1] then
                             m[1].requireGlow = not m[1].requireGlow
                             self.procDot:SetShown(m[1].requireGlow == true)
                             ns.SaveCurrentProfile()
                         end
                         return
                     end
-                    if m and m[1] and IsMultiVariant(m[1]) then
-                        ShowVariantPopup(buff1ColorBtn, cooldownID, 1)
-                    else
-                        -- Single colour: edit the spellColorMap entry directly if it exists, else mapData.color
-                        local mapData = m and m[1]
-                        local singleColor
-                        local singleKey
-                        if mapData and mapData.spellColorMap then
-                            singleKey = next(mapData.spellColorMap)
-                            if singleKey then singleColor = mapData.spellColorMap[singleKey] end
-                        end
-                        local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
-                        local currentColor = singleColor or (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(defaultColor)
-                        OpenInlineColorPicker(currentColor, function(c)
-                            buff1ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                            buff1Slot.pairedColor = c
-                            if mapData then
-                                mapData.color = c
-                                if singleKey then mapData.spellColorMap[singleKey] = c end
-                            end
-                            ns.SaveCurrentProfile()
-                        end)
-                    end
+                    local mapData = m and m[1]
+                    local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local currentColor = (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(defaultColor)
+                    OpenInlineColorPicker(currentColor, function(c)
+                        buff1ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                        buff1Slot.pairedColor = c
+                        if mapData then mapData.color = c end
+                        ns.SaveCurrentProfile()
+                    end)
                 end)
 
                 -- Colour picker for Buff 2
@@ -3197,56 +3071,71 @@ local function BuildSettings()
                 buff2ColorBtn:SetScript("OnEnter", function(self)
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    if m and m[2] and IsMultiVariant(m[2]) then
-                        GameTooltip:SetText("Buff 2 Variant Colours")
-                        GameTooltip:AddLine("Click to change colours for each buff variant. Variant colours only resolve outside of instances.", 0.7, 0.7, 0.7, true)
-                        if m[2].requireGlow then
-                            GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
-                        end
-                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                    else
-                        GameTooltip:SetText("Buff 2 Colour")
-                        GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
-                        if m and m[2] and m[2].spellColorMap then
-                            GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                        end
+                    GameTooltip:SetText("Buff 2 Colour")
+                    GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                    if m and m[2] and m[2].requireGlow then
+                        GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
+                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 buff2ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff2ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[2] and m[2].spellColorMap then
+                        if m and m[2] then
                             m[2].requireGlow = not m[2].requireGlow
                             self.procDot:SetShown(m[2].requireGlow == true)
                             ns.SaveCurrentProfile()
                         end
                         return
                     end
-                    if m and m[2] and IsMultiVariant(m[2]) then
-                        ShowVariantPopup(buff2ColorBtn, cooldownID, 2)
-                    else
-                        local mapData = m and m[2]
-                        local singleColor
-                        local singleKey
-                        if mapData and mapData.spellColorMap then
-                            singleKey = next(mapData.spellColorMap)
-                            if singleKey then singleColor = mapData.spellColorMap[singleKey] end
-                        end
-                        local defaultColor2 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
-                        local currentColor = singleColor or (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(defaultColor2)
-                        currentColor[4] = currentColor[4] or 0.3
-                        OpenInlineColorPicker(currentColor, function(c)
-                            buff2ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                            buff2Slot.pairedColor = c
-                            if mapData then
-                                mapData.color = c
-                                if singleKey then mapData.spellColorMap[singleKey] = c end
-                            end
-                            ns.SaveCurrentProfile()
-                        end)
+                    local mapData = m and m[2]
+                    local defaultColor2 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local currentColor = (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(defaultColor2)
+                    currentColor[4] = currentColor[4] or 0.3
+                    OpenInlineColorPicker(currentColor, function(c)
+                        buff2ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                        buff2Slot.pairedColor = c
+                        if mapData then mapData.color = c end
+                        ns.SaveCurrentProfile()
+                    end)
+                end)
+
+                -- Colour picker for Buff 3
+                buff3ColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                buff3ColorBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    GameTooltip:SetText("Buff 3 Colour")
+                    GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                    if m and m[3] and m[3].requireGlow then
+                        GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
+                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    GameTooltip:Show()
+                end)
+                buff3ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                buff3ColorBtn:SetScript("OnClick", function(self, button)
+                    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    if button == "RightButton" then
+                        if m and m[3] then
+                            m[3].requireGlow = not m[3].requireGlow
+                            self.procDot:SetShown(m[3].requireGlow == true)
+                            ns.SaveCurrentProfile()
+                        end
+                        return
+                    end
+                    local mapData = m and m[3]
+                    local defaultColor3 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local currentColor = (mapData and mapData.color) or buff3Slot.pairedColor or DeepCopy(defaultColor3)
+                    currentColor[4] = currentColor[4] or 0.3
+                    OpenInlineColorPicker(currentColor, function(c)
+                        buff3ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                        buff3Slot.pairedColor = c
+                        if mapData then mapData.color = c end
+                        ns.SaveCurrentProfile()
+                    end)
                 end)
 
                 -- Tooltips for Cast 1
