@@ -24,4 +24,5 @@ ClassConfig\Warrior.lua
 
 Serializer.lua
 Settings.lua
+ResourceBar.lua
 Bars.lua
