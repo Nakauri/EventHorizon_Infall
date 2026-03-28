@@ -31,6 +31,7 @@ local DISPLAY_KEYS = {
     "stackTextAnchor", "stackTextRelPoint", "stackTextOffsetX", "stackTextOffsetY",
     "variantTextSize",
     "variantTextAnchor", "variantTextRelPoint", "variantTextOffsetX", "variantTextOffsetY",
+    "growDirection",
 }
 
 local COLOR_KEYS = {
@@ -65,9 +66,6 @@ local function DebouncedApplyAndSave(extraFn)
     end)
 end
 
-function ns.EnrichAllMappings()
-    -- No-op (variant colour system removed)
-end
 
 function ns.AutoPopulateSelfBuffMappings()
     if InCombatLockdown() then return end
@@ -112,6 +110,36 @@ function ns.AutoPopulateSelfBuffMappings()
                         end
                     end
                 end
+            end
+        end
+    end
+
+    -- Cross-category buff pairing: match unmapped Category 0 abilities to
+    -- Category 1/2/3 entries with the same spellID
+    local buffCdBySpell = {}
+    for _, cat in ipairs({2, 3, 1}) do
+        local catOk, catIds = pcall(function()
+            return C_CooldownViewer.GetCooldownViewerCategorySet(cat, false)
+        end)
+        if catOk and catIds then
+            for _, bcdID in ipairs(catIds) do
+                local bInfoOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, bcdID)
+                if bInfoOk and bInfo and bInfo.spellID and not buffCdBySpell[bInfo.spellID] then
+                    buffCdBySpell[bInfo.spellID] = bcdID
+                end
+            end
+        end
+    end
+    for _, cooldownID in ipairs(cooldownIDs) do
+        if CONFIG.buffMappings[cooldownID] == nil then
+            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+            if infoOk and cdInfo and cdInfo.spellID and buffCdBySpell[cdInfo.spellID] then
+                local mapping = { buffCooldownIDs = { buffCdBySpell[cdInfo.spellID] } }
+                if C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
+                    mapping.unit = "target"
+                end
+                CONFIG.buffMappings[cooldownID] = { mapping }
+                created = true
             end
         end
     end
@@ -184,6 +212,9 @@ function ns.SeedProfileFromClassConfig(specKey)
     if ns.classConfigDefaults and ns.classConfigDefaults.stackIndicatorList and #ns.classConfigDefaults.stackIndicatorList > 0 then
         profile.stackIndicatorList = DeepCopy(ns.classConfigDefaults.stackIndicatorList)
     end
+    if ns.classConfigDefaults and ns.classConfigDefaults.resourceBar then
+        profile.resourceBar = DeepCopy(ns.classConfigDefaults.resourceBar)
+    end
 
     -- Capture current frame position (per-character)
     if EH_Parent then
@@ -247,7 +278,7 @@ function ns.ApplyProfile(profile)
         end
     end
 
-    -- Strip spellColorMaps from old profiles (variant colour system removed)
+    -- Strip stale spellColorMaps from old profiles
     if CONFIG.buffMappings then
         for _, mappings in pairs(CONFIG.buffMappings) do
             for _, mapData in ipairs(mappings) do
@@ -296,6 +327,7 @@ function ns.ApplyProfile(profile)
     if profile.stackIndicatorList then
         CONFIG.stackIndicatorList = DeepCopy(profile.stackIndicatorList)
     end
+    CONFIG.resourceBar = profile.resourceBar and DeepCopy(profile.resourceBar) or {}
 
     -- Restore per-profile frame position
     if profile.position and EH_Parent then
@@ -321,8 +353,17 @@ function ns.ApplyProfile(profile)
     if ns.ApplyECMVisibility then
         ns.ApplyECMVisibility()
     end
+    if ns.RebuildResourceBar then
+        ns.RebuildResourceBar()
+    end
     if ns.RebuildStackIndicators then
         ns.RebuildStackIndicators()
+    end
+    if ns.RefreshStacksTab then
+        ns.RefreshStacksTab()
+    end
+    if ns.RefreshResourceTab then
+        ns.RefreshResourceTab()
     end
 end
 
@@ -355,6 +396,7 @@ function ns.SaveCurrentProfile()
     profile.cooldownColors = DeepCopy(CONFIG.cooldownColors or {})
     profile.stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings or {})
     profile.stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {})
+    profile.resourceBar = DeepCopy(CONFIG.resourceBar or {})
 
     -- Save current frame position (per-character)
     if EH_Parent then
@@ -381,6 +423,7 @@ ns.classConfigDefaults = {
     cooldownColors = DeepCopy(CONFIG.cooldownColors or {}),
     stackIndicatorSettings = DeepCopy(CONFIG.stackIndicatorSettings or {}),
     stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {}),
+    resourceBar = DeepCopy(CONFIG.resourceBar or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
     ns.classConfigDefaults.toggles[key] = CONFIG[key]
@@ -656,7 +699,7 @@ local function CreateColorSwatch(parent, label, defaultColor, onChange)
     return container
 end
 
-local function CreateDropdown(parent, label, options, default, onChange, forceScroll)
+local function CreateDropdown(parent, label, options, default, onChange, forceScroll, searchable)
     local container = CreateFrame("Frame", nil, parent)
     container:SetSize(300, 44)
 
@@ -692,20 +735,32 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
     menuFrame:Hide()
 
     local maxVisible = 15
-    local needsScroll = forceScroll or (#options > maxVisible)
+    local needsScroll = forceScroll or searchable or (#options > maxVisible)
+    local searchHeight = searchable and 24 or 0
     local totalContentHeight = #options * 20
     local visibleItems = needsScroll and math.min(maxVisible, #options) or #options
-    local menuHeight = visibleItems * 20 + 4
+    local menuHeight = visibleItems * 20 + 4 + searchHeight
     local menuWidth = needsScroll and 220 or 200
     local btnWidth = 196
 
+    local searchBox, scrollFrame, scrollChild
+    local optButtons = {}
+
     local contentParent
     if needsScroll then
-        local scrollFrame = CreateFrame("ScrollFrame", nil, menuFrame, "UIPanelScrollFrameTemplate")
-        scrollFrame:SetPoint("TOPLEFT", 2, -2)
+        if searchable then
+            searchBox = CreateFrame("EditBox", nil, menuFrame, "InputBoxTemplate")
+            searchBox:SetSize(menuWidth - 28, 18)
+            searchBox:SetPoint("TOPLEFT", 6, -4)
+            searchBox:SetAutoFocus(false)
+            searchBox:SetFontObject("GameFontHighlightSmall")
+        end
+
+        scrollFrame = CreateFrame("ScrollFrame", nil, menuFrame, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetPoint("TOPLEFT", 2, -(2 + searchHeight))
         scrollFrame:SetPoint("BOTTOMRIGHT", -22, 2)
 
-        local scrollChild = CreateFrame("Frame", nil, scrollFrame)
+        scrollChild = CreateFrame("Frame", nil, scrollFrame)
         scrollChild:SetWidth(btnWidth)
         scrollChild:SetHeight(totalContentHeight)
         scrollFrame:SetScrollChild(scrollChild)
@@ -714,7 +769,7 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
         menuFrame:EnableMouseWheel(true)
         menuFrame:SetScript("OnMouseWheel", function(self, delta)
             local current = scrollFrame:GetVerticalScroll()
-            local maxScroll = math.max(0, totalContentHeight - (menuHeight - 4))
+            local maxScroll = math.max(0, scrollChild:GetHeight() - (menuHeight - 4 - searchHeight))
             local newScroll = current - (delta * 40)
             newScroll = math.max(0, math.min(maxScroll, newScroll))
             scrollFrame:SetVerticalScroll(newScroll)
@@ -748,14 +803,41 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
             if onChange then onChange(opt.value) end
         end)
 
+        optBtn._optText = opt.text
+        optButtons[i] = optBtn
     end
     menuFrame:SetSize(menuWidth, menuHeight)
+
+    if searchBox then
+        local function FilterOptions()
+            local query = (searchBox:GetText() or ""):lower()
+            local yPos = 0
+            for _, btn in ipairs(optButtons) do
+                if query == "" or btn._optText:lower():find(query, 1, true) then
+                    btn:ClearAllPoints()
+                    btn:SetPoint("TOPLEFT", 0, -yPos)
+                    btn:Show()
+                    yPos = yPos + 20
+                else
+                    btn:Hide()
+                end
+            end
+            scrollChild:SetHeight(math.max(yPos, 1))
+            if scrollFrame then scrollFrame:SetVerticalScroll(0) end
+        end
+        searchBox:SetScript("OnTextChanged", FilterOptions)
+        searchBox:SetScript("OnEscapePressed", function() searchBox:ClearFocus() end)
+    end
 
     button:SetScript("OnClick", function()
         if menuFrame:IsShown() then
             menuFrame:Hide()
         else
             menuFrame:Show()
+            if searchBox then
+                searchBox:SetText("")
+                searchBox:SetFocus()
+            end
         end
     end)
 
@@ -770,6 +852,7 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
     end)
     menuFrame:SetScript("OnHide", function()
         menuFrame:SetScript("OnUpdate", nil)
+        if searchBox then searchBox:SetText("") end
     end)
 
     container.button = button
@@ -777,11 +860,16 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
 
     function container:SetValue(v)
         button.selectedValue = v
+        local found = false
         for _, opt in ipairs(options) do
             if opt.value == v then
                 button:SetText(opt.text)
+                found = true
                 break
             end
+        end
+        if not found then
+            button:SetText("Select...")
         end
     end
 
@@ -839,7 +927,7 @@ end
 -- TAB SYSTEM
 -- ============================================================================
 
-local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Profiles"}
+local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Resource", "Profiles"}
 local tabFrames = {}
 local tabButtons = {}
 local currentTab = 1
@@ -1117,7 +1205,7 @@ local function BuildColoursTab(contentArea, tabFrames)
         CONFIG.font = v
         LoadEssentialCooldowns()
         ns.SaveCurrentProfile()
-    end, true)
+    end, true, true)
     AddColourWidget(fontDropdown)
 
     local fontSizeSlider = CreateSlider(colourContent, "Font Size", 8, 24, 1, CONFIG.fontSize, function(v)
@@ -1275,6 +1363,16 @@ end
 -- TAB F: STACKS
 -- ============================================================================
 
+local POWER_TYPE_INFO = {
+    [4]  = {name = "Combo Points",   max = 5, color = {1.0, 0.96, 0.41, 1}},
+    [5]  = {name = "Runes",          max = 6, color = {0.77, 0.12, 0.23, 1}},
+    [7]  = {name = "Soul Shards",    max = 5, color = {0.58, 0.51, 0.79, 1}},
+    [9]  = {name = "Holy Power",     max = 5, color = {0.96, 0.84, 0.09, 1}},
+    [12] = {name = "Chi",            max = 5, color = {0.71, 1.0, 0.92, 1}},
+    [16] = {name = "Arcane Charges", max = 4, color = {0.1, 0.5, 0.8, 1}},
+    [19] = {name = "Essence",        max = 5, color = {0.0, 0.8, 0.4, 1}},
+}
+
 local function BuildStacksTab(contentArea, tabFrames)
     local stacksTab = CreateFrame("Frame", nil, contentArea)
     stacksTab:SetAllPoints()
@@ -1426,6 +1524,7 @@ local function BuildStacksTab(contentArea, tabFrames)
 
     local siRowFrames = {}
     local RefreshStacksGrid
+    local RefreshPowerTypeGrid
     local gridRetried = false
     local UpdateStacksContentHeight
 
@@ -1472,25 +1571,35 @@ local function BuildStacksTab(contentArea, tabFrames)
             local icon = rf:CreateTexture(nil, "ARTWORK")
             icon:SetSize(32, 32)
             icon:SetPoint("TOPLEFT", rf, "TOPLEFT", 8, -8)
-            icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-            local displaySpellID = entry.auraSpellID
-            if (not displaySpellID or displaySpellID == 0) and entry.cooldownID then
-                local cdOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, entry.cooldownID)
-                if cdOk and cdInfo then displaySpellID = cdInfo.spellID end
-            end
-            local spellName = displaySpellID and C_Spell.GetSpellName(displaySpellID)
-            local spellIcon = spellName and C_Spell.GetSpellTexture(displaySpellID)
-            if spellIcon then
-                icon:SetTexture(spellIcon)
+
+            local resolvedName
+            if entry.indicatorType == "power" then
+                local pInfo = POWER_TYPE_INFO[entry.powerType]
+                local pColor = pInfo and pInfo.color or {0.5, 0.5, 0.5, 1}
+                icon:SetColorTexture(pColor[1], pColor[2], pColor[3], pColor[4] or 1)
+                resolvedName = pInfo and pInfo.name or ("Power " .. (entry.powerType or "?"))
             else
-                icon:SetColorTexture(0.3, 0.3, 0.3, 1)
+                icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                local displaySpellID = entry.auraSpellID
+                if (not displaySpellID or displaySpellID == 0) and entry.cooldownID then
+                    local cdOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, entry.cooldownID)
+                    if cdOk and cdInfo then displaySpellID = cdInfo.spellID end
+                end
+                local spellName = displaySpellID and C_Spell.GetSpellName(displaySpellID)
+                local spellIcon = spellName and C_Spell.GetSpellTexture(displaySpellID)
+                if spellIcon then
+                    icon:SetTexture(spellIcon)
+                else
+                    icon:SetColorTexture(0.3, 0.3, 0.3, 1)
+                end
+                resolvedName = spellName or ("ID: " .. (entry.cooldownID or entry.auraSpellID or "?"))
             end
 
             local nameText = rf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
             nameText:SetPoint("LEFT", icon, "RIGHT", 8, 0)
             nameText:SetWidth(200)
             nameText:SetJustifyH("LEFT")
-            nameText:SetText(spellName or ("ID: " .. (entry.cooldownID or entry.auraSpellID or "?")))
+            nameText:SetText(resolvedName)
 
             local delBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
             delBtn:SetSize(22, 22)
@@ -1502,6 +1611,7 @@ local function BuildStacksTab(contentArea, tabFrames)
                 ns.SaveCurrentProfile()
                 RebuildSIListUI()
                 if RefreshStacksGrid then RefreshStacksGrid() end
+                if RefreshPowerTypeGrid then RefreshPowerTypeGrid() end
             end)
             delBtn:SetScript("OnEnter", function(self)
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -1940,6 +2050,22 @@ local function BuildStacksTab(contentArea, tabFrames)
 
     local gridCache = {}
     local gridCacheCount = 0
+    local gridEmptyText
+
+    -- Section 6: Power Types
+    local powerHeader = CreateSectionHeader(stacksContent, "Power Types")
+    powerHeader:SetPoint("TOPLEFT", gridContainer, "BOTTOMLEFT", 0, -16)
+
+    local powerDesc = stacksContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    powerDesc:SetPoint("TOPLEFT", powerHeader, "BOTTOMLEFT", 0, -6)
+    powerDesc:SetWidth(500)
+    powerDesc:SetJustifyH("LEFT")
+    powerDesc:SetSpacing(2)
+    powerDesc:SetText("Class resource types like Holy Power, Chi, and Combo Points. Click to add as a pip indicator.")
+
+    local powerContainer = CreateFrame("Frame", nil, stacksContent)
+    powerContainer:SetPoint("TOPLEFT", powerDesc, "BOTTOMLEFT", 0, -8)
+    powerContainer:SetSize(520, 1)
 
     local function GetTrackedCooldownIDs()
         local tracked = {}
@@ -1952,8 +2078,21 @@ local function BuildStacksTab(contentArea, tabFrames)
         return tracked
     end
 
+    local function GetTrackedPowerTypes()
+        local tracked = {}
+        local list = CONFIG.stackIndicatorList or {}
+        for _, entry in ipairs(list) do
+            if entry.indicatorType == "power" and entry.powerType then
+                tracked[entry.powerType] = true
+            end
+        end
+        return tracked
+    end
+
     UpdateStacksContentHeight = function()
-        local h = siListTopY + siListContainer:GetHeight() + 16 + 22 + 6 + gridDesc:GetStringHeight() + 8 + gridContainer:GetHeight() + 20
+        local h = siListTopY + siListContainer:GetHeight()
+                + 16 + 22 + 6 + gridDesc:GetStringHeight() + 8 + gridContainer:GetHeight()
+                + 16 + 22 + 6 + powerDesc:GetStringHeight() + 8 + powerContainer:GetHeight() + 20
         stacksContent:SetHeight(h)
     end
 
@@ -2089,7 +2228,7 @@ local function BuildStacksTab(contentArea, tabFrames)
                 end
                 local currentTracked = GetTrackedCooldownIDs()
                 if currentTracked[self.cdID] then
-                    GameTooltip:AddLine("Already tracked — right click to remove", 0.5, 0.8, 0.5)
+                    GameTooltip:AddLine("Already tracked, right click to remove", 0.5, 0.8, 0.5)
                 else
                     GameTooltip:AddLine("Click to add", 0.5, 0.8, 0.5)
                 end
@@ -2137,19 +2276,175 @@ local function BuildStacksTab(contentArea, tabFrames)
         gridContainer:SetHeight(math.max(totalRows * (iconSz + gap), 1))
         UpdateStacksContentHeight()
 
-        if gridIdx == 0 and not gridRetried then
-            gridRetried = true
-            C_Timer.After(1.5, function()
-                if stacksTab:IsShown() then RefreshStacksGrid() end
+        if gridIdx == 0 then
+            if not gridEmptyText then
+                gridEmptyText = gridContainer:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+                gridEmptyText:SetPoint("TOPLEFT", 4, -4)
+                gridEmptyText:SetWidth(500)
+                gridEmptyText:SetJustifyH("LEFT")
+                gridEmptyText:SetText("No buff auras with stacks detected.")
+            end
+            gridEmptyText:Show()
+            gridContainer:SetHeight(30)
+            UpdateStacksContentHeight()
+
+            if not gridRetried then
+                gridRetried = true
+                C_Timer.After(1.5, function()
+                    if stacksTab:IsShown() then RefreshStacksGrid() end
+                end)
+            end
+        else
+            if gridEmptyText then gridEmptyText:Hide() end
+        end
+    end
+
+    -- Power Types grid
+    local powerGridCache = {}
+    local powerGridCacheCount = 0
+    local powerEmptyText
+
+    RefreshPowerTypeGrid = function()
+        for i = 1, powerGridCacheCount do
+            if powerGridCache[i] then powerGridCache[i]:Hide() end
+        end
+
+        local available = {}
+        for pType, pInfo in pairs(POWER_TYPE_INFO) do
+            local ok, maxP = pcall(UnitPowerMax, "player", pType)
+            if ok and maxP and not issecretvalue(maxP) and maxP > 0 then
+                available[#available + 1] = {powerType = pType, info = pInfo}
+            end
+        end
+        table.sort(available, function(a, b) return a.info.name < b.info.name end)
+
+        local tracked = GetTrackedPowerTypes()
+        local gridIdx = 0
+        local xOff = 0
+
+        for _, ptEntry in ipairs(available) do
+            local pType = ptEntry.powerType
+            local pInfo = ptEntry.info
+
+            gridIdx = gridIdx + 1
+            local btn = powerGridCache[gridIdx]
+            if not btn then
+                btn = CreateFrame("Button", nil, powerContainer, "BackdropTemplate")
+                btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                btn:SetBackdrop({
+                    bgFile = "Interface\\Buttons\\WHITE8x8",
+                    edgeFile = "Interface\\Buttons\\WHITE8x8",
+                    edgeSize = 1,
+                    insets = {left = 1, right = 1, top = 1, bottom = 1},
+                })
+                btn:SetBackdropColor(0.12, 0.12, 0.12, 0.8)
+                btn:SetBackdropBorderColor(0.3, 0.3, 0.3, 1)
+                btn.colorSq = btn:CreateTexture(nil, "ARTWORK")
+                btn.colorSq:SetSize(14, 14)
+                btn.colorSq:SetPoint("LEFT", btn, "LEFT", 6, 0)
+                btn.label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                btn.label:SetPoint("LEFT", btn.colorSq, "RIGHT", 4, 0)
+                btn.label:SetJustifyH("LEFT")
+                local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+                hl:SetAllPoints()
+                hl:SetColorTexture(0.3, 0.3, 0.5, 0.4)
+                powerGridCache[gridIdx] = btn
+                powerGridCacheCount = math.max(powerGridCacheCount, gridIdx)
+            end
+
+            btn:Show()
+            btn:SetSize(120, 24)
+            btn:ClearAllPoints()
+            btn:SetPoint("TOPLEFT", xOff, 0)
+            xOff = xOff + 124
+
+            btn.colorSq:SetColorTexture(pInfo.color[1], pInfo.color[2], pInfo.color[3], pInfo.color[4] or 1)
+            btn.label:SetText(pInfo.name)
+            btn.powerType = pType
+            btn.powerInfo = pInfo
+
+            if tracked[pType] then
+                btn:SetBackdropBorderColor(0, 0.8, 0, 0.8)
+            else
+                btn:SetBackdropBorderColor(0.3, 0.3, 0.3, 1)
+            end
+
+            btn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText(self.powerInfo.name, 1, 1, 1)
+                GameTooltip:AddLine("Max: " .. self.powerInfo.max, 0.7, 0.7, 0.7)
+                local currentTracked = GetTrackedPowerTypes()
+                if currentTracked[self.powerType] then
+                    GameTooltip:AddLine("Already tracked, right click to remove", 0.5, 0.8, 0.5)
+                else
+                    GameTooltip:AddLine("Click to add", 0.5, 0.8, 0.5)
+                end
+                GameTooltip:Show()
+            end)
+            btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            btn:SetScript("OnClick", function(self, button)
+                local currentTracked = GetTrackedPowerTypes()
+                if button == "RightButton" then
+                    if not currentTracked[self.powerType] then return end
+                    local list = CONFIG.stackIndicatorList or {}
+                    for k = #list, 1, -1 do
+                        if list[k].indicatorType == "power" and list[k].powerType == self.powerType then
+                            table.remove(list, k)
+                            break
+                        end
+                    end
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    ns.SaveCurrentProfile()
+                    RebuildSIListUI()
+                    RefreshPowerTypeGrid()
+                    return
+                end
+                if currentTracked[self.powerType] then return end
+                CONFIG.stackIndicatorList = CONFIG.stackIndicatorList or {}
+                local maxP = UnitPowerMax("player", self.powerType)
+                if issecretvalue(maxP) or not maxP or maxP <= 0 then maxP = self.powerInfo.max end
+                CONFIG.stackIndicatorList[#CONFIG.stackIndicatorList + 1] = {
+                    indicatorType = "power",
+                    powerType = self.powerType,
+                    maxStacks = maxP,
+                    color = DeepCopy(self.powerInfo.color),
+                }
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                ns.SaveCurrentProfile()
+                RebuildSIListUI()
+                RefreshPowerTypeGrid()
             end)
         end
+
+        for i = gridIdx + 1, powerGridCacheCount do
+            if powerGridCache[i] then powerGridCache[i]:Hide() end
+        end
+
+        powerContainer:SetHeight(gridIdx > 0 and 28 or 1)
+
+        if gridIdx == 0 then
+            if not powerEmptyText then
+                powerEmptyText = powerContainer:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+                powerEmptyText:SetPoint("TOPLEFT", 4, -4)
+                powerEmptyText:SetWidth(500)
+                powerEmptyText:SetJustifyH("LEFT")
+                powerEmptyText:SetText("No pip based power types for your class.")
+            end
+            powerEmptyText:Show()
+            powerContainer:SetHeight(24)
+        else
+            if powerEmptyText then powerEmptyText:Hide() end
+        end
+
+        UpdateStacksContentHeight()
     end
 
     RebuildSIListUI()
 
     stacksContent:SetHeight(yOff + 20)
 
-    stacksTab:SetScript("OnShow", function()
+    local function RefreshStacksTab()
         enableCheck:SetChecked(CONFIG.stackIndicators or false)
         local sis = CONFIG.stackIndicatorSettings or {}
         siPositionDropdown:SetValue(sis.position or "TOP")
@@ -2164,7 +2459,11 @@ local function BuildStacksTab(contentArea, tabFrames)
         siGlowColourSwatch:SetColor(DeepCopy(sis.glowColor or {1, 1, 1, 0.6}))
         RebuildSIListUI()
         RefreshStacksGrid()
-    end)
+        RefreshPowerTypeGrid()
+    end
+
+    stacksTab:SetScript("OnShow", RefreshStacksTab)
+    ns.RefreshStacksTab = RefreshStacksTab
 end
 
 -- ============================================================================
@@ -2386,7 +2685,7 @@ local function BuildSettings()
             return
         end
         if CooldownViewerSettings then
-            -- Close settings panel first so ShowUIPanel can open CDM
+            -- Close settings panel so ShowUIPanel can open CDM
             if SettingsPanel then
                 pcall(HideUIPanel, SettingsPanel)
             end
@@ -2468,7 +2767,7 @@ local function BuildSettings()
     castsPoolFrame:SetPoint("BOTTOMRIGHT", 0, 0)
     castsPoolFrame:Hide()
 
-    -- Forward-declared so SelectPoolTab and pool OnClick handlers can reference it
+    -- Forward-declared for pool tab handlers
     local statusText
 
     local function SelectPoolTab(tabIndex)
@@ -2594,7 +2893,7 @@ local function BuildSettings()
         wipe(allSlotFrames)
 
         local cooldownIDs = {}
-        -- Prefer the data provider (matches Bars.lua ordering), fall back to category set
+        -- Use data provider if available, fall back to category set
         local foundSource = false
         if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
             local dataProvider = CooldownViewerSettings:GetDataProvider()
@@ -3454,124 +3753,156 @@ local function BuildSettings()
     end
 
     -- Refresh Buff Pool
+    local buffSectionHeaders = {}
+    local buffSectionHeaderCount = 0
+
     RefreshBuffPool = function()
         for i = 1, buffPoolCacheCount do
             if buffPoolCache[i] then buffPoolCache[i]:Hide() end
         end
+        for i = 1, buffSectionHeaderCount do
+            if buffSectionHeaders[i] then buffSectionHeaders[i]:Hide() end
+        end
 
+        local sections = {
+            { cat = 2, label = "Tracked Buffs" },
+            { cat = 3, label = "Tracked Bars" },
+        }
+        local catLabel = {}
         local seen = {}
-        local buffIDs = {}
+        local totalCount = 0
 
-        local ok2, cat2 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(2, false)
-        end)
-        if ok2 and cat2 then
-            for _, id in ipairs(cat2) do
-                if not seen[id] then
-                    seen[id] = true
-                    buffIDs[#buffIDs + 1] = id
-                end
-            end
+        -- Use CDM DataProvider if available (matches CDM settings display)
+        local dataProvider
+        if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
+            dataProvider = CooldownViewerSettings:GetDataProvider()
         end
 
-        local ok3, cat3 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(3, false)
-        end)
-        if ok3 and cat3 then
-            for _, id in ipairs(cat3) do
-                if not seen[id] then
-                    seen[id] = true
-                    buffIDs[#buffIDs + 1] = id
+        for _, sec in ipairs(sections) do
+            sec.ids = {}
+            catLabel[sec.cat] = sec.label
+            local catIds
+            if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
+                local dpOk, dpResult = pcall(dataProvider.GetOrderedCooldownIDsForCategory, dataProvider, sec.cat)
+                if dpOk and dpResult and #dpResult > 0 then
+                    catIds = dpResult
                 end
             end
-        end
-
-        local ok0, cat0 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(0, false)
-        end)
-        if ok0 and cat0 then
-            for _, id in ipairs(cat0) do
-                if not seen[id] then
-                    local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
-                    if infoOk and cdInfo and cdInfo.hasAura then
+            if not catIds then
+                local catOk, catResult = pcall(function()
+                    return C_CooldownViewer.GetCooldownViewerCategorySet(sec.cat, false)
+                end)
+                if catOk and catResult then catIds = catResult end
+            end
+            if catIds then
+                for _, id in ipairs(catIds) do
+                    if not seen[id] then
                         seen[id] = true
-                        buffIDs[#buffIDs + 1] = id
+                        sec.ids[#sec.ids + 1] = id
+                        totalCount = totalCount + 1
                     end
                 end
             end
         end
 
-        -- Render grid (full width)
         local cols = 16
         local iconSz = 30
         local gap = 4
-        for i, buffCdID in ipairs(buffIDs) do
-            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
-            local spellID = infoOk and cdInfo and cdInfo.spellID
-            local tex = spellID and C_Spell.GetSpellTexture(spellID) or 134400
-            local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. buffCdID)
+        local yOff = 0
+        local btnIdx = 0
+        local headerIdx = 0
 
-            local col = (i - 1) % cols
-            local rowIdx = math.floor((i - 1) / cols)
+        for _, sec in ipairs(sections) do
+            if #sec.ids > 0 then
+                -- Section header
+                headerIdx = headerIdx + 1
+                local header = buffSectionHeaders[headerIdx]
+                if not header then
+                    header = buffsContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                    header:SetJustifyH("LEFT")
+                    buffSectionHeaders[headerIdx] = header
+                    buffSectionHeaderCount = math.max(buffSectionHeaderCount, headerIdx)
+                end
+                header:SetText(sec.label)
+                header:ClearAllPoints()
+                header:SetPoint("TOPLEFT", buffsContent, "TOPLEFT", 0, -yOff)
+                header:Show()
+                yOff = yOff + 18
 
-            -- Acquire from cache or create new
-            local btn = buffPoolCache[i]
-            if not btn then
-                btn = CreateFrame("Button", nil, buffsContent)
-                btn.iconTex = btn:CreateTexture(nil, "ARTWORK")
-                btn.iconTex:SetAllPoints()
-                btn.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-                btn.highlight = btn:CreateTexture(nil, "OVERLAY")
-                btn.highlight:SetPoint("TOPLEFT", -2, 2)
-                btn.highlight:SetPoint("BOTTOMRIGHT", 2, -2)
-                btn.highlight:SetColorTexture(1, 1, 0, 0.6)
-                buffPoolCache[i] = btn
-                buffPoolCacheCount = math.max(buffPoolCacheCount, i)
+                -- Icons
+                for i, buffCdID in ipairs(sec.ids) do
+                    btnIdx = btnIdx + 1
+                    local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+                    local spellID = infoOk and cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
+                    local tex = spellID and C_Spell.GetSpellTexture(spellID) or 134400
+                    local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. buffCdID)
+                    local secLabel = sec.label
+
+                    local col = (i - 1) % cols
+                    local rowIdx = math.floor((i - 1) / cols)
+
+                    local btn = buffPoolCache[btnIdx]
+                    if not btn then
+                        btn = CreateFrame("Button", nil, buffsContent)
+                        btn.iconTex = btn:CreateTexture(nil, "ARTWORK")
+                        btn.iconTex:SetAllPoints()
+                        btn.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                        btn.highlight = btn:CreateTexture(nil, "OVERLAY")
+                        btn.highlight:SetPoint("TOPLEFT", -2, 2)
+                        btn.highlight:SetPoint("BOTTOMRIGHT", 2, -2)
+                        btn.highlight:SetColorTexture(1, 1, 0, 0.6)
+                        buffPoolCache[btnIdx] = btn
+                        buffPoolCacheCount = math.max(buffPoolCacheCount, btnIdx)
+                    end
+
+                    btn:Show()
+                    btn:SetSize(iconSz, iconSz)
+                    btn:ClearAllPoints()
+                    btn:SetPoint("TOPLEFT", col * (iconSz + gap), -(yOff + rowIdx * (iconSz + gap)))
+                    btn.iconTex:SetTexture(tex)
+                    btn.highlight:Hide()
+
+                    btn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText(spellName, 1, 1, 1)
+                        GameTooltip:AddLine(secLabel, 0.5, 0.8, 1.0)
+                        GameTooltip:AddLine("CooldownID: " .. buffCdID, 0.7, 0.7, 0.7)
+                        if spellID then
+                            GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
+                        end
+                        GameTooltip:AddLine("Click to select, then click a Buff or Stack slot above.", 0.5, 0.8, 0.5, true)
+                        GameTooltip:Show()
+                    end)
+                    btn:SetScript("OnLeave", function()
+                        GameTooltip:Hide()
+                    end)
+
+                    btn:SetScript("OnClick", function(self)
+                        if selectedBuff == buffCdID then
+                            CancelSelection()
+                            statusText:SetText("")
+                            return
+                        end
+                        CancelSelection()
+                        selectedBuff = buffCdID
+                        selectedBuffFrame = self
+                        selectedType = "buff"
+                        btn.highlight:Show()
+                        HighlightAvailableSlots()
+                        statusText:SetText("|cff00ff00Selected:|r " .. spellName .. ", click a Buff or Stack slot above")
+                    end)
+                end
+
+                local secRows = math.ceil(#sec.ids / cols)
+                yOff = yOff + secRows * (iconSz + gap) + 6
             end
-
-            btn:Show()
-            btn:SetSize(iconSz, iconSz)
-            btn:ClearAllPoints()
-            btn:SetPoint("TOPLEFT", col * (iconSz + gap), -rowIdx * (iconSz + gap))
-            btn.iconTex:SetTexture(tex)
-            btn.highlight:Hide()
-
-            btn:SetScript("OnEnter", function(self)
-                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                GameTooltip:SetText(spellName, 1, 1, 1)
-                GameTooltip:AddLine("CooldownID: " .. buffCdID, 0.7, 0.7, 0.7)
-                if spellID then
-                    GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
-                end
-                GameTooltip:AddLine("Click to select, then click a Buff or Stack slot above.", 0.5, 0.8, 0.5, true)
-                GameTooltip:Show()
-            end)
-            btn:SetScript("OnLeave", function()
-                GameTooltip:Hide()
-            end)
-
-            btn:SetScript("OnClick", function(self)
-                if selectedBuff == buffCdID then
-                    CancelSelection()
-                    statusText:SetText("")
-                    return
-                end
-                CancelSelection()
-                selectedBuff = buffCdID
-                selectedBuffFrame = self
-                selectedType = "buff"
-                btn.highlight:Show()
-                HighlightAvailableSlots()
-                statusText:SetText("|cff00ff00Selected:|r " .. spellName .. ", click a Buff or Stack slot above")
-            end)
         end
 
-
-        for i = #buffIDs + 1, buffPoolCacheCount do
+        for i = btnIdx + 1, buffPoolCacheCount do
             if buffPoolCache[i] then buffPoolCache[i]:Hide() end
         end
 
-        if #buffIDs == 0 then
+        if totalCount == 0 then
             if not emptyBuffsText then
                 emptyBuffsText = buffsContent:CreateFontString(nil, "OVERLAY", "GameFontDisable")
                 emptyBuffsText:SetPoint("TOPLEFT", 4, -4)
@@ -3583,8 +3914,7 @@ local function BuildSettings()
             buffsContent:SetHeight(30)
         else
             if emptyBuffsText then emptyBuffsText:Hide() end
-            local totalRows = math.ceil(#buffIDs / cols)
-            buffsContent:SetHeight(math.max(totalRows * (iconSz + gap), 1))
+            buffsContent:SetHeight(math.max(yOff, 1))
         end
     end
 
@@ -3749,6 +4079,7 @@ local function BuildSettings()
     tabFrames[2] = displayTab
 
     local dispScroll, dispContent = CreateScrollableContent(displayTab)
+    local dispRefreshing = false
 
     local dispY = 0
     local function AddDispWidget(widget)
@@ -3779,7 +4110,7 @@ local function BuildSettings()
 
     local futureSlider = CreateSlider(dispContent, "Future (seconds)", 1, 60, 1, CONFIG.future, nil)
     AddDispWidget(futureSlider)
-    -- Future only applies on mouse-up (expensive: rebuilds all bar min/max)
+    -- Future applies on mouse-up only (rebuilds all bar min/max)
     futureSlider.slider:SetScript("OnMouseUp", function()
         CONFIG.future = futureSlider:GetValue()
         if ns.UpdateAllMinMax then ns.UpdateAllMinMax() end
@@ -4024,6 +4355,7 @@ local function BuildSettings()
     local curX, curY = GetFramePosition()
 
     local posXSlider = CreateSlider(dispContent, "X Offset", -1000, 1000, 1, curX, function(v)
+        if dispRefreshing then return end
         if EH_Parent then
             local point, _, relPoint, _, y = EH_Parent:GetPoint(1)
             point = point or "CENTER"
@@ -4036,7 +4368,8 @@ local function BuildSettings()
     end)
     AddDispWidget(posXSlider)
 
-    local posYSlider = CreateSlider(dispContent, "Y Offset", -600, 600, 1, curY, function(v)
+    local posYSlider = CreateSlider(dispContent, "Y Offset", -1000, 1000, 1, curY, function(v)
+        if dispRefreshing then return end
         if EH_Parent then
             local point, _, relPoint, x, _ = EH_Parent:GetPoint(1)
             point = point or "CENTER"
@@ -4055,9 +4388,17 @@ local function BuildSettings()
     end)
     AddDispWidget(smoothCheck)
 
+    local growUpCheck = CreateCheckbox(dispContent, "Grow Upward", "Frame grows upward when bars are added. Bottom edge stays fixed. Default is downward.", CONFIG.growDirection == "UP", function(v)
+        CONFIG.growDirection = v and "UP" or nil
+        if ns.NormalizeGrowAnchor then ns.NormalizeGrowAnchor() end
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(growUpCheck)
+
     dispContent:SetHeight(dispY + 20)
 
     displayTab:SetScript("OnShow", function()
+        dispRefreshing = true
         futureSlider:SetValue(CONFIG.future or 16)
         pastSlider:SetValue(CONFIG.past or 2.5)
         widthSlider:SetValue(CONFIG.width or 352)
@@ -4090,6 +4431,8 @@ local function BuildSettings()
         posXSlider:SetValue(px)
         posYSlider:SetValue(py)
         smoothCheck:SetChecked(CONFIG.smoothBars or false)
+        growUpCheck:SetChecked(CONFIG.growDirection == "UP")
+        dispRefreshing = false
     end)
 
     -- ========================================================================
@@ -4198,7 +4541,7 @@ local function BuildSettings()
 
     AddTogHeader("Variant Names")
 
-    local variantNamesCheck = CreateCheckbox(togContent, "Show Variant Names", "Show the name of aura variants on the bar (IE Roll the Bones outcomes). Variant colours only resolve outside of instances. Inside instances, the last known variant colour is used. This text label always works because spell names pass through the combat protection system.", CONFIG.showVariantNames or false, function(v)
+    local variantNamesCheck = CreateCheckbox(togContent, "Show Variant Names", "Show the name of aura variants on the bar, IE Roll the Bones outcomes. Spell names pass through the combat protection system so this always works in instances.", CONFIG.showVariantNames or false, function(v)
         CONFIG.showVariantNames = v
         ns.SaveCurrentProfile()
     end)
@@ -4358,7 +4701,7 @@ local function BuildSettings()
     local profilesTab = CreateFrame("Frame", nil, contentArea)
     profilesTab:SetAllPoints()
     profilesTab:Hide()
-    tabFrames[6] = profilesTab
+    tabFrames[7] = profilesTab
 
     local profScroll, profContent = CreateScrollableContent(profilesTab)
 
@@ -4801,6 +5144,23 @@ local function BuildSettings()
     -- TAB F: STACKS
     -- ========================================================================
     BuildStacksTab(contentArea, tabFrames)
+
+    -- ========================================================================
+    -- TAB G: RESOURCE BAR
+    -- ========================================================================
+    if ns.BuildResourceBarTab then
+        ns.BuildResourceBarTab(contentArea, tabFrames, {
+            CreateCheckbox = CreateCheckbox,
+            CreateSlider = CreateSlider,
+            CreateColorSwatch = CreateColorSwatch,
+            CreateSectionHeader = CreateSectionHeader,
+            CreateScrollableContent = CreateScrollableContent,
+            CreateDropdown = CreateDropdown,
+            GetFontOptions = GetFontOptions,
+            FONT_FLAG_OPTIONS = FONT_FLAG_OPTIONS,
+            ANCHOR_POINTS = ANCHOR_POINTS,
+        })
+    end
 
     -- ========================================================================
     -- REGISTRATION
