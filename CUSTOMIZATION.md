@@ -7,12 +7,14 @@ This guide explains every setting you can change in Infall.
 
 Type `/infall setup` or go to **Escape > Options > AddOns > EventHorizon Infall** to open the settings panel. From there you can change everything without editing files: bar layout, colours, fonts, toggles, buff pairings, cast pairings, stack tracking, and more. Changes are saved per character and per spec automatically.
 
-The settings panel has five tabs:
+The settings panel has seven tabs:
 
 - **Bars** shows all your Cooldown Manager abilities with visibility checkboxes, buff pairing, cast pairing, and stack tracking slots. Abilities with charges also show a "Show Charge" checkbox to toggle between split and single bar display. The bottom area has two pool tabs: "Buffs" shows CDM buffs and debuffs (for Buff and Stack slots), and "Casts" auto populates from your spellbook with casts and channels (for Cast slots). Click an icon in a pool, then click a slot on a row. Right click a paired slot to unpair. Each slot has a colour swatch for custom colours.
 - **Display** has sliders for bar width, height, spacing, padding, scale, timeline length, icon size, and more. Click any slider's number to type an exact value.
 - **Colours** lets you change every colour in the addon, plus font settings and text anchor positions.
 - **Toggles** has on/off switches for all features, plus Reload Bars and Reset Position buttons.
+- **Stacks** configures stack indicator pips, thin segmented strips that sit above or below the bar frame and fill as aura stacks increase. You can enable/disable them globally, set position, pip height, spacing, border, colours, glow at max stacks, and configure per-indicator colour zones and overflow stacks.
+- **Resource** configures the resource bar (focus, energy, mana, rage, etc) shown as a thin bar above or below the frame. Settings include position, height, gap, row order, colours, border, predictive power overlays (cost and gain), current value text, predictive value text, and tick marks at specific power values.
 - **Profiles** lets you save, load, and delete named profiles. Your settings are automatically saved per character and per spec, but named profiles let you share a setup across characters or keep backups. The Import / Export section at the bottom lets you export your active spec or all specs as a shareable string, and import strings from other characters of the same class.
 
 Most users will never need to edit files directly. The Settings GUI handles everything.
@@ -550,7 +552,7 @@ CONFIG.buffMappings = {
 
 When Lunar Eclipse is active, you see a blue bar. When Solar Eclipse is active, you see an orange overlay. If both were active, you'd see both layered and the colours merge.
 
-Only the first two entries are used. A third entry would be ignored. Sorry!
+Up to three entries are supported. The first is the primary bar, the second is a semi transparent overlay, and the third is a second overlay at a higher frame level. If you only need one or two, leave out the rest.
 
 ### Example: Track a Buff with Default Colour
 
@@ -590,39 +592,6 @@ CONFIG.buffMappings = {
 }
 ```
 
-### Variant Colours (Abilities With Multiple Outcomes)
-
-Some abilities have a single buff that changes identity depending on the outcome. Roll the Bones is the main example: it always applies the same buff (cooldownID 42743), but the spellID changes for each result (One of a Kind, Double Trouble, Triple Threat, Jackpot). Infall can colour the bar differently for each outcome.
-
-This is set up through `spellColorMap` in the buff mapping. The Settings GUI also handles this: when you click the colour swatch on a buff slot that has variant colours, a popup appears showing each variant with its own colour picker.
-
-```lua
-CONFIG.buffMappings = {
-    [11860] = {   -- Roll the Bones ability
-        {
-            buffCooldownIDs = {42743},
-            unit = "player",
-            color = {0.4, 0.4, 0.9, 0.6},   -- default colour (fallback)
-            spellColorMap = {
-                [1214933] = {0.3, 0.8, 0.3, 0.6},  -- One of a Kind (green)
-                [1214934] = {0.8, 0.8, 0.2, 0.6},  -- Double Trouble (yellow)
-                [1214935] = {0.9, 0.5, 0.1, 0.6},  -- Triple Threat (orange)
-                [1214937] = {0.9, 0.2, 0.9, 0.6},  -- Jackpot (magenta)
-            },
-        },
-    },
-}
-```
-
-The keys in `spellColorMap` are spellIDs for each outcome. When the buff is active, Infall reads the outcome's spellID and picks the matching colour.
-
-**Auto-detection:** If you pair a buff through the Settings GUI and that buff has linked spells in the Cooldown Manager, Infall automatically creates `spellColorMap` entries with distinct colours. You do not need to manually look up spellIDs for most abilities. Auto-detected colours can be customized afterwards through the colour picker popup.
-
-If you want to add variant colours manually (IE for a spell that auto-detection does not cover), add the `spellColorMap` table as shown above. When `spellColorMap` already exists, auto-detection is skipped and your manual colours are preserved.
-
-**Raid limitation:** Inside raid encounters, Blizzard restricts aura details (secret values). The bar colour falls back to the default `color` field during boss fights. The variant name label (see Variant Names below) still works everywhere because spell names pass through the combat protection system.
-
-
 ## Setting Up Stack Tracking
 
 Stack mappings show a number on the ability icon when a related buff has multiple stacks (like Starlord or Maelstrom Weapon stacks). One mapping per ability.
@@ -655,9 +624,9 @@ The number appears at the position set by `CONFIG.stackTextAnchor` (bottom left 
 
 ## Variant Names
 
-Abilities with variant colours (IE Roll the Bones) can also show the outcome name as text on the bar. When enabled, you see labels like "Double Trouble" or "Jackpot" right on the bar, so you can tell the outcome at a glance without relying on colour alone.
+Some abilities have a single buff that changes identity depending on the outcome (IE Roll the Bones). When variant names are enabled, you see labels like "Double Trouble" or "Jackpot" right on the bar, so you can tell the outcome at a glance.
 
-This feature is off by default. To enable it, open the Settings GUI (Toggles tab) and check "Variant Names." The text label works everywhere including inside raids, because spell names pass through Blizzard's combat protection system. This is especially useful during encounters where the variant colour falls back to default.
+This feature is off by default. To enable it, open the Settings GUI (Toggles tab) and check "Variant Names." The text label works everywhere including inside raids, because spell names pass through Blizzard's combat protection system.
 
 ### Customizing Variant Text
 
@@ -681,6 +650,106 @@ CONFIG.variantTextRelPoint = "LEFT"
 CONFIG.variantTextOffsetX = 5
 CONFIG.variantTextOffsetY = 0
 ```
+
+
+## Stack Indicators
+
+Stack indicators are segmented pip strips that sit above or below the bar frame and fill as aura stacks increase. They are separate from the stack text on icons (which shows a number). Stack indicators give you a visual bar that grows with stacks, with customizable colours at different stack thresholds.
+
+All configuration is done through the Settings GUI (Stacks tab). There are no slash commands or Core.lua settings for stack indicators.
+
+### Enabling Stack Indicators
+
+Open the Settings GUI and go to the **Stacks** tab. Check "Enable Stack Indicators" at the top. Stack indicators use the same aura mappings you set up in the Bars tab (Stack slot). Any ability with a Stack mapping gets a pip strip.
+
+### Display Settings
+
+- **Default Position**: Top or Bottom of the bar frame. Individual indicators can override this.
+- **Gap from Frame**: Pixel gap between the pip strip and the bar frame edge.
+- **Pip Height**: Height of each pip in pixels (4 to 16, default 6).
+- **Pip Spacing**: Gap between individual pips in pixels.
+- **Row Spacing**: Gap between multiple indicator rows.
+- **Border Size**: Border thickness around each pip.
+- **Glow at Max Stacks**: When enabled, a pulse glow overlay appears when an indicator reaches its maximum stacks.
+
+### Colours
+
+- **Empty Pip**: Colour of unfilled pip segments.
+- **Pip Border**: Border colour around each pip.
+- **Max Stack Glow**: Colour of the glow overlay at max stacks.
+
+### Per-Indicator Settings
+
+Each configured indicator shows its icon, name, max stacks, and position. You can:
+
+- **Change position** (Top/Bottom) per indicator, overriding the default.
+- **Set colour zones**: Assign different colours at different stack counts (IE green at 1, yellow at 2, red at 3). Each zone has a "from stack" threshold and a colour. Add multiple zones to create gradual colour changes as stacks build.
+- **Set overflow**: Layer a second colour for stacks beyond the base max (IE Maelstrom Weapon with 10 stacks showing the last 5 in a different colour).
+- **Remove** an indicator from the strip without removing its Stack mapping.
+
+Stack indicator settings save to your profile automatically.
+
+
+## Resource Bar
+
+The resource bar shows your current power (focus, energy, mana, rage, astral power, etc) as a thin bar above or below the bar frame. It auto-detects your power type and uses a class-appropriate default colour.
+
+All configuration is done through the Settings GUI (Resource tab).
+
+### Enabling the Resource Bar
+
+Open the Settings GUI and go to the **Resource** tab. Check "Enable Resource Bar" at the top. The bar appears immediately and tracks your current power in real time.
+
+### Appearance
+
+- **Position**: Top or Bottom of the bar frame.
+- **Bar Height**: Height in pixels (2 to 20, default 4).
+- **Gap from Frame**: Pixel gap between the resource bar and the bar frame edge.
+- **Row Order**: When you have stack indicators on the same side, controls the order of rows (first, last, or a specific position).
+- **Bar Colour**: The fill colour. Defaults to your class power colour. "Reset to Auto Colour" restores the default.
+- **Background Colour**: The background behind the fill.
+- **Border Colour and Size**: Border around the resource bar.
+
+### Predictive Power
+
+When enabled, shows overlays on the resource bar that preview the cost or gain of your current cast or channel.
+
+- **Enable Predictive Power**: Master toggle for cost and gain overlays.
+- **Gain Colour**: Overlay colour for power generation (IE focus regen during Cobra Shot).
+- **Cost Colour**: Overlay colour for power costs (IE Kill Command costing 35 focus).
+- **Power Generators**: If your class config defines `spellGeneration` entries, they appear here. Click a value to override it if the default is wrong for your build.
+
+Predictive power works for cast-time and channeled spells. Instant spells have no cast bar to predict during, so they do not show overlays.
+
+### Current Value Text
+
+Shows the current power value as a number on the resource bar.
+
+- **Show Current Value**: Toggle the text on or off.
+- **Font, Font Size, Font Flags**: Independent font settings.
+- **Colour**: Text colour.
+- **Text Anchor, Offset X, Offset Y**: Position the text on the bar.
+
+### Predictive Value Text
+
+Shows the predicted power change during casts and channels as text (IE "(+18)" or "(-35)").
+
+- **Show Predictive Value**: Toggle the text on or off.
+- **Show Parentheses**: Wrap the value in parentheses (IE "(+18)" vs "+18").
+- **Font, Font Size, Font Flags**: Independent font settings (inherits from current value text if not set).
+- **Colour**: Text colour.
+- **Anchor To**: Anchor the text to the current value text or to the resource bar itself.
+- **Relative Point, Text Anchor, Offset X, Offset Y**: Fine-tune positioning.
+
+### Tick Marks
+
+Vertical markers at specific power values on the resource bar (IE 35 for Kill Command cost, 50 for a threshold).
+
+- **Tick Width**: Width of each tick mark in pixels.
+- **Default Tick Colour**: Default colour for all tick marks.
+- **Add/Remove**: Type a power value and click Add. Each tick can have its own colour via the swatch. Click Remove to delete a tick.
+
+Resource bar settings save to your profile automatically.
 
 
 ## Writing a Class File From Scratch
@@ -891,6 +960,8 @@ These are adjusted with slash commands or from the Settings GUI (Toggles tab). T
 | Smooth bar animation | Settings GUI (Display tab) | off |
 | Show past bars | Settings GUI (Toggles tab) | on |
 | Variant names | Settings GUI (Toggles tab) | off |
+| Stack indicators | Settings GUI (Stacks tab) | off |
+| Resource bar | Settings GUI (Resource tab) | off |
 | Position | drag or `/infall pos X Y` | centre |
 
 ### Layout Preview Commands (Session Only)
