@@ -29,7 +29,91 @@ local SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "a
 local PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay", "lastPtr_third"}
 local HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay", "hidden_third"}
 
+-- ============================================================================
+-- EXTRAS: Racial + Potion lookup tables
+-- ============================================================================
+
+local RACE_RACIALS = {
+    Scourge            = { 7744 },
+    Tauren             = { 20549 },
+    Orc                = { 20572, 33697, 33702 },
+    BloodElf           = { 202719, 50613, 25046, 69179, 80483, 155145, 129597, 232633, 28730 },
+    Dwarf              = { 20594 },
+    Troll              = { 26297 },
+    Draenei            = { 28880 },
+    NightElf           = { 58984 },
+    Human              = { 59752 },
+    DarkIronDwarf      = { 265221 },
+    Gnome              = { 20589 },
+    HighmountainTauren = { 69041 },
+    Worgen             = { 68992 },
+    Goblin             = { 69070 },
+    Pandaren           = { 107079 },
+    MagharOrc          = { 274738 },
+    LightforgedDraenei = { 255647 },
+    VoidElf            = { 256948 },
+    KulTiran           = { 287712 },
+    ZandalariTroll     = { 291944 },
+    Vulpera            = { 312411 },
+    Mechagnome         = { 312924 },
+    Dracthyr           = { 357214, 368970 },
+    EarthenDwarf       = { 436344 },
+    Haranir            = { 1287685 },
+}
+
+-- Racial buff durations (seconds) for racials that grant a trackable buff
+local RACIAL_BUFF_DURATIONS = {
+    [26297]  = 12,   -- Berserking (Troll)
+    [20572]  = 15,   -- Blood Fury (Orc, melee AP)
+    [33697]  = 15,   -- Blood Fury (Orc, spell power)
+    [33702]  = 15,   -- Blood Fury (Orc, AP+SP)
+    [20594]  = 8,    -- Stoneform (Dwarf)
+    [265221] = 8,    -- Fireblood (Dark Iron Dwarf)
+    [274738] = 15,   -- Ancestral Call (Mag'har Orc)
+    [68992]  = 10,   -- Darkflight (Worgen)
+    [28880]  = 5,    -- Gift of the Naaru (Draenei)
+}
+
+-- Persistent extras timer cache (survives bar rebuilds within a session)
+ns._activeExtrasTimers = ns._activeExtrasTimers or {}
+
+local POTION_BUFFS = {
+    { buffSpellID = 1236616, itemID = 241309, name = "Light's Potential",          buffDuration = 30, cdDuration = 300 },
+    { buffSpellID = 1236998, itemID = 241293, name = "Draught of Rampant Abandon", buffDuration = 30, cdDuration = 300 },
+    { buffSpellID = 1236994, itemID = 241289, name = "Potion of Recklessness",     buffDuration = 30, cdDuration = 300 },
+    { buffSpellID = 1238443, itemID = 241297, name = "Potion of Zealotry",         buffDuration = 30, cdDuration = 300 },
+}
+
+local POTION_BUFF_LOOKUP = {}
+for _, pot in ipairs(POTION_BUFFS) do
+    POTION_BUFF_LOOKUP[pot.buffSpellID] = pot
+end
+
+local TRINKET_ITEMS = {
+    { spellID = 383781,  itemID = 193701, buffDuration = 20, cdDuration = 120 },  -- Algeth'ar Puzzle Box
+    { spellID = 1259633, itemID = 249344, buffDuration = 15, cdDuration = 90 },   -- Light Company Guidon
+    { spellID = 1260459, itemID = 249346, buffDuration = 15, cdDuration = 90 },   -- Vaelgor's Final Stare
+    { spellID = 1250508, itemID = 250144, buffDuration = 15, cdDuration = 120 },  -- Emberwing Feather
+    { spellID = 71564,   itemID = 50259,  buffDuration = 20, cdDuration = 180 },  -- Nevermelting Ice Crystal
+}
+
+local TRINKET_SPELL_LOOKUP = {}
+for _, tri in ipairs(TRINKET_ITEMS) do
+    TRINKET_SPELL_LOOKUP[tri.spellID] = tri
+end
+
 local function GetCooldownColor(row)
+    if row.isExtras then
+        local extras = CONFIG.extras
+        if extras then
+            for _, e in ipairs(extras) do
+                if e.key == row.extrasKey then
+                    return e.cdColor or CONFIG.cooldownColor
+                end
+            end
+        end
+        return CONFIG.cooldownColor
+    end
     local c = CONFIG.cooldownColors[row.cooldownID]
     return c or CONFIG.cooldownColor
 end
@@ -135,10 +219,8 @@ local function GetChargesWithOverride(spellID, baseSpellID)
 end
 
 local function PreCacheChargeSpells()
-    if InCombatLockdown() then return end
-
-    InfallDB.chargeSpells = InfallDB.chargeSpells or {}
-    InfallDB.chargeDurations = InfallDB.chargeDurations or {}
+    InfallDB.chargeSpells = {}
+    InfallDB.chargeDurations = {}
 
     local cooldownIDs = {}
     local success, result = pcall(function()
@@ -794,6 +876,20 @@ local function ApplyIconMode(row)
     end
 
     row.cdBar:SetStatusBarColor(unpack(GetCooldownColor(row)))
+    -- Extras buff colour (extras bars skip UpdateBuffState, so apply here)
+    if row.isExtras then
+        local extras = CONFIG.extras
+        if extras then
+            for _, e in ipairs(extras) do
+                if e.key == row.extrasKey then
+                    local bc = e.buffColor or CONFIG.buffColor
+                    row.buffBar:SetStatusBarColor(bc[1], bc[2], bc[3], bc[4] or 1)
+                    row.resolvedBuffColor = bc
+                    break
+                end
+            end
+        end
+    end
     if row.castTex then row.castTex:SetVertexColor(unpack(CONFIG.castColor)) end
     row.gcdBar:SetStatusBarColor(unpack(CONFIG.gcdColor))
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
@@ -971,6 +1067,35 @@ local function CreateHiddenCooldown(rowRef, timerType)
     return cd
 end
 
+-- Style the engine countdown FontString on first feed (position, size, colour from CONFIG)
+local function StyleCdText(row)
+    if row.cdTextCooldown and not row._cdTextStyled then
+        local fsOk, fs = pcall(row.cdTextCooldown.GetCountdownFontString, row.cdTextCooldown)
+        if fsOk and fs then
+            fs:ClearAllPoints()
+            fs:SetPoint(CONFIG.cdDurationTextAnchor, row.barTextOverlay, CONFIG.cdDurationTextRelPoint, CONFIG.cdDurationTextOffsetX, CONFIG.cdDurationTextOffsetY)
+            ApplyFont(fs, CONFIG.cdDurationTextSize or CONFIG.fontSize)
+            fs:SetTextColor(unpack(CONFIG.cdDurationTextColor))
+            row._cdTextStyled = true
+        end
+    end
+end
+
+-- Feed cdTextCooldown with toggle gate — single entry point for all cd duration text
+local function FeedCdText(row, durObj)
+    if not row.cdTextCooldown then return end
+    if not CONFIG.showCooldownDuration then
+        row.cdTextCooldown:SetCooldown(0, 0)
+        return
+    end
+    if durObj then
+        pcall(row.cdTextCooldown.SetCooldownFromDurationObject, row.cdTextCooldown, durObj, true)
+        StyleCdText(row)
+    else
+        row.cdTextCooldown:SetCooldown(0, 0)
+    end
+end
+
 local function FeedHiddenCooldown(rowRef, timerType, durObj)
     local keys = hiddenKeys[timerType]
     if not keys then return end
@@ -985,6 +1110,9 @@ local function FeedHiddenCooldown(rowRef, timerType, durObj)
     else
         cd:SetCooldown(0, 0)
     end
+
+    -- Feed duration text cooldown alongside cd timer
+    if timerType == "cd" then FeedCdText(rowRef, durObj) end
 end
 
 -- Event-driven charge bar fill via SetTimerDuration.
@@ -1156,6 +1284,23 @@ local function CreateCooldownBar(spellID, index)
     row.variantNameText:SetTextColor(unpack(CONFIG.variantTextColor))
     row.variantNameText:Hide()
 
+    -- Engine-driven cooldown duration text (text-only Cooldown frame).
+    -- Cooldown text addons may override font/colour/position; configure them to
+    -- ignore these frames if needed.
+    local cdTextOk, cdTextFrame = pcall(CreateFrame, "Cooldown", nil, row.barTextOverlay, "CooldownFrameTemplate")
+    if cdTextOk and cdTextFrame then
+        row.cdTextCooldown = cdTextFrame
+        row._cdTextStyled = false
+        cdTextFrame:SetAllPoints(row.barTextOverlay)
+        cdTextFrame:EnableMouse(false)
+        pcall(cdTextFrame.SetDrawSwipe, cdTextFrame, false)
+        pcall(cdTextFrame.SetDrawEdge, cdTextFrame, false)
+        pcall(cdTextFrame.SetDrawBling, cdTextFrame, false)
+        pcall(cdTextFrame.SetHideCountdownNumbers, cdTextFrame, not CONFIG.showCooldownDuration)
+        pcall(cdTextFrame.SetCountdownAbbrevThreshold, cdTextFrame, 60)
+        pcall(cdTextFrame.SetMinimumCountdownDuration, cdTextFrame, (CONFIG.cdTextMinDuration or 30) * 1000)
+    end
+
     -- Cooldown bar (top half for charge spells, full height otherwise).
     local nowPx = GetNowPixelOffset()
     local futureWidth = GetFutureWidth()
@@ -1325,23 +1470,28 @@ ResizeContainer = function()
         barHeight = CONFIG.height
     end
 
+    local yOff = 0
     for i, row in ipairs(cooldownBars) do
-        row:SetHeight(barHeight)
-        row.cdBar.fullHeight = barHeight
+        local rowHeight = barHeight
+        if not useStatic and row.isExtras and CONFIG.extrasHeight then
+            rowHeight = CONFIG.extrasHeight
+        end
+        row:SetHeight(rowHeight)
+        row.cdBar.fullHeight = rowHeight
         local maxC = row.maxCharges or 2
-        row.cdBar.laneHeight = (barHeight - (maxC - 1)) / maxC
+        row.cdBar.laneHeight = (rowHeight - (maxC - 1)) / maxC
 
         if row.isChargeSpell then
             local lH = row.cdBar.laneHeight
-            local bottomY = -(barHeight - lH)
+            local bottomY = -(rowHeight - lH)
             row.cdBar:SetHeight(lH)
             if row.depletedWrapper then
                 local futW = GetFutureWidth()
                 local nowOff = GetBarOffset() + GetNowPixelOffset()
-                row.depletedIndicator:SetSize(futW, barHeight)
+                row.depletedIndicator:SetSize(futW, rowHeight)
                 row.notDepletedWrapper:ClearAllPoints()
                 row.notDepletedWrapper:SetPoint("TOPLEFT", row.depletedIndicator:GetStatusBarTexture(), "TOPLEFT")
-                row.notDepletedWrapper:SetPoint("BOTTOMRIGHT", row, "TOPLEFT", nowOff + futW, -barHeight)
+                row.notDepletedWrapper:SetPoint("BOTTOMRIGHT", row, "TOPLEFT", nowOff + futW, -rowHeight)
                 row.depletedCdBar:SetHeight(lH)
                 row.depletedHelperBar:SetHeight(lH)
                 row.depletedHelperBar:ClearAllPoints()
@@ -1374,7 +1524,7 @@ ResizeContainer = function()
                 local slotPx = row._chargeSlotPx or 0
                 for j = 1, row.maxCharges - 2 do
                     if row.middleClipIndicators and row.middleClipIndicators[j] then
-                        row.middleClipIndicators[j]:SetSize(GetFutureWidth(), barHeight)
+                        row.middleClipIndicators[j]:SetSize(GetFutureWidth(), rowHeight)
                     end
                     local ml = row.middleLanes[j]
                     if ml then
@@ -1398,27 +1548,28 @@ ResizeContainer = function()
                 end
             end
         else
-            row.cdBar:SetHeight(barHeight)
+            row.cdBar:SetHeight(rowHeight)
         end
-        row.castFrame:SetHeight(barHeight)
-        row.buffBar:SetHeight(barHeight)
-        row.buffBarOverlay:SetHeight(barHeight)
-        row.buffBarThird:SetHeight(barHeight)
-        row.gcdBar:SetHeight(barHeight)
-        row.gcdSpark:SetHeight(barHeight)
+        row.castFrame:SetHeight(rowHeight)
+        row.buffBar:SetHeight(rowHeight)
+        row.buffBarOverlay:SetHeight(rowHeight)
+        row.buffBarThird:SetHeight(rowHeight)
+        row.gcdBar:SetHeight(rowHeight)
+        row.gcdSpark:SetHeight(rowHeight)
         if row.nowLine then
-            row.nowLine:SetHeight(barHeight)
+            row.nowLine:SetHeight(rowHeight)
         end
         for _, clip in ipairs({row.pastCdClip, row.pastBuffClip, row.pastOverlayClip, row.pastThirdClip, row.pastCastClip}) do
-            if clip then clip:SetHeight(barHeight) end
+            if clip then clip:SetHeight(rowHeight) end
         end
 
         row:ClearAllPoints()
-        row:SetPoint("TOPLEFT", EH_Parent, "TOPLEFT", CONFIG.paddingLeft, -CONFIG.paddingTop - ((i - 1) * (barHeight + CONFIG.spacing)))
+        row:SetPoint("TOPLEFT", EH_Parent, "TOPLEFT", CONFIG.paddingLeft, -CONFIG.paddingTop - yOff)
+        yOff = yOff + rowHeight + CONFIG.spacing
     end
 
     if not useStatic then
-        local contentHeight = (numBars * barHeight) + ((numBars - 1) * CONFIG.spacing)
+        local contentHeight = yOff > 0 and (yOff - CONFIG.spacing) or 0
         local totalHeight = CONFIG.paddingTop + contentHeight + CONFIG.paddingBottom
         EH_Parent:SetHeight(totalHeight)
     end
@@ -1743,6 +1894,7 @@ end
 
 local function UpdateRowCooldown(row)
     if row.isChargeSpell then return end
+    if row.extrasType == "potion" or row.extrasType == "trinket" then return end
     
     local successCD, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
     
@@ -1849,6 +2001,7 @@ local _overlayBuffEntry = {}
 local _thirdBuffEntry = {}
 
 UpdateBuffState = function(row, buffViewerFrames)
+    if row.isExtras then return end
     -- Each mapping entry owns a fixed lane: [1] = primary, [2] = overlay, [3] = third.
     local primaryBuff, overlayBuff, thirdBuff
     local mappings = row.cooldownID and CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
@@ -2472,7 +2625,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
             -- CD past slide
             if not row.isChargeSpell and row.hidden_cd then
-                local cdActive = row.hidden_cd:IsShown()
+                local cdActive = row._extrasCdExpiry and true or row.hidden_cd:IsShown()
                 if cdActive and not row.activeCdSlide then
                     row.activeCdSlide = SpawnPastSlide(row, row.pastCdClip, GetCooldownColor(row), row.cdBar.fullHeight or CONFIG.height, 0)
                 elseif not cdActive and row.activeCdSlide then
@@ -2536,6 +2689,33 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     ok, val = pcall(row.activeBuffThirdDuration.GetRemainingDuration, row.activeBuffThirdDuration)
                 end
                 if ok then row.buffBarThird:SetValue(val, interp) else row.buffBarThird:Hide() end
+            end
+
+            -- Extras expiry cleanup (replaces OCD which doesn't fire for addon timers)
+            if row._extrasBuffExpiry and GetTime() >= row._extrasBuffExpiry then
+                row._extrasBuffExpiry = nil
+                row.activeBuffDuration = nil
+                row.buffBar:Hide()
+                if row.activeBuffSlide then
+                    DetachPastSlide(row.activeBuffSlide)
+                    row.activeBuffSlide = nil
+                end
+                local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
+                if cache then cache.buffExpiry = nil end
+            end
+            if row._extrasCdExpiry and GetTime() >= row._extrasCdExpiry then
+                row._extrasCdExpiry = nil
+                row.activeCooldown = nil
+                row.cdBar:Hide()
+                if row.cooldownFrame then row.cooldownFrame:Hide() end
+                if row.activeCdSlide then
+                    DetachPastSlide(row.activeCdSlide)
+                    row.activeCdSlide = nil
+                end
+                if row.cdTextCooldown then row.cdTextCooldown:SetCooldown(0, 0) end
+                UpdateDesaturation(row)
+                local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
+                if cache then cache.cdExpiry = nil end
             end
 
             -- Charge bars
@@ -2787,6 +2967,16 @@ local function ResetBarState(bar)
 
     bar._buffDirty = false
     bar._cachedChargeInfo = nil
+    bar.isExtras = nil
+    bar.extrasType = nil
+    bar.extrasKey = nil
+    bar._potionBuffDuration = nil
+    bar._potionCdDuration = nil
+    bar._potionBuffSpellID = nil
+    bar._extrasAuraInstanceID = nil
+    bar._extrasItemID = nil
+    bar._extrasBuffExpiry = nil
+    bar._extrasCdExpiry = nil
     bar._totemSlot = nil
     bar._totemCooldownFed = false
     bar._overlayTotemSlot = nil
@@ -2808,12 +2998,13 @@ local function ResetBarState(bar)
     if bar.notDepletedWrapper then bar.notDepletedWrapper:Hide() end
     if bar.middleLanes then
         for _, ml in ipairs(bar.middleLanes) do
-            ml.depletedChargeBar:SetAlpha(0)
-            ml.depletedHelperBar:SetAlpha(0)
+            ml.depletedChargeBar:Hide()
+            ml.depletedHelperBar:Hide()
             ml.activeSlide = nil
         end
     end
-    if bar.notDepletedHelperBar then bar.notDepletedHelperBar:SetAlpha(0) end
+    if bar.notDepletedHelperBar then bar.notDepletedHelperBar:Hide() end
+    if bar.ndHelperSpacer then bar.ndHelperSpacer:Hide() end
     if bar.pastSlides then
         for _, slide in ipairs(bar.pastSlides) do
             slide.tex:Hide()
@@ -2829,6 +3020,12 @@ local function ResetBarState(bar)
     bar.chargeText:Hide()
     bar.stackText:Hide()
     if bar.variantNameText then bar.variantNameText:Hide() end
+    if bar.cdTextCooldown then
+        bar.cdTextCooldown:SetCooldown(0, 0)
+        pcall(bar.cdTextCooldown.SetHideCountdownNumbers, bar.cdTextCooldown, not CONFIG.showCooldownDuration)
+        pcall(bar.cdTextCooldown.SetMinimumCountdownDuration, bar.cdTextCooldown, (CONFIG.cdTextMinDuration or 30) * 1000)
+        bar._cdTextStyled = false
+    end
 
     -- reused bars need font re-applied
     ApplyFont(bar.chargeText, CONFIG.fontSize)
@@ -3228,12 +3425,113 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     bar:SetPoint("TOPLEFT", EH_Parent, "TOPLEFT", CONFIG.paddingLeft, -CONFIG.paddingTop - ((index - 1) * (CONFIG.height + CONFIG.spacing)))
 end
 
+-- ============================================================================
+-- EXTRAS: Auto-detect racials + potions
+-- ============================================================================
+
+local function DetectExtras()
+    local extras = CONFIG.extras or {}
+    local existingKeys = {}
+    for _, e in ipairs(extras) do existingKeys[e.key] = true end
+
+    -- Racials: detect from race
+    local _, raceKey = UnitRace("player")
+    local racials = raceKey and RACE_RACIALS[raceKey]
+    if racials then
+        for _, spellID in ipairs(racials) do
+            if IsPlayerSpell(spellID) then
+                local key = "racial_" .. spellID
+                if not existingKeys[key] then
+                    local cdID = spellID
+                    pcall(function()
+                        local utilIDs = C_CooldownViewer.GetCooldownViewerCategorySet(1, false)
+                        if utilIDs then
+                            for _, uid in ipairs(utilIDs) do
+                                local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, uid)
+                                if ok and info and info.spellID == spellID then
+                                    cdID = uid
+                                    return
+                                end
+                            end
+                        end
+                    end)
+                    extras[#extras + 1] = {
+                        key = key, type = "racial", spellID = spellID,
+                        cooldownID = cdID, enabled = false,
+                    }
+                    existingKeys[key] = true
+                end
+            end
+        end
+    end
+
+    -- Potions: always available
+    for _, pot in ipairs(POTION_BUFFS) do
+        local key = "potion_" .. pot.buffSpellID
+        if not existingKeys[key] then
+            extras[#extras + 1] = {
+                key = key, type = "potion", spellID = pot.buffSpellID,
+                buffDuration = pot.buffDuration, cdDuration = pot.cdDuration,
+                enabled = false,
+            }
+            existingKeys[key] = true
+        end
+    end
+
+    -- Trinkets: detect if in bags or equipped, remove if gone
+    local ownedTrinkets = {}
+    for _, tri in ipairs(TRINKET_ITEMS) do
+        local found = false
+        for _, slot in ipairs({13, 14}) do
+            local itemID = GetInventoryItemID("player", slot)
+            if itemID == tri.itemID then found = true break end
+        end
+        if not found then
+            for bag = 0, 4 do
+                local numSlots = C_Container.GetContainerNumSlots(bag)
+                for bagSlot = 1, numSlots do
+                    local info = C_Container.GetContainerItemInfo(bag, bagSlot)
+                    if info and info.itemID == tri.itemID then
+                        found = true
+                        break
+                    end
+                end
+                if found then break end
+            end
+        end
+        if found then
+            local key = "trinket_" .. tri.spellID
+            ownedTrinkets[key] = true
+            if not existingKeys[key] then
+                extras[#extras + 1] = {
+                    key = key, type = "trinket", spellID = tri.spellID,
+                    itemID = tri.itemID,
+                    buffDuration = tri.buffDuration, cdDuration = tri.cdDuration,
+                    enabled = false,
+                }
+                existingKeys[key] = true
+            end
+        end
+    end
+    -- Mark trinkets unavailable/available based on ownership (preserves settings)
+    for _, e in ipairs(extras) do
+        if e.type == "trinket" then
+            e._unavailable = not ownedTrinkets[e.key] or nil
+        end
+    end
+
+    CONFIG.extras = extras
+end
+ns.DetectExtras = DetectExtras
+
 LoadEssentialCooldowns = function()
     CleanupActiveCast()
     activeCast = nil
     for _, bar in ipairs(cooldownBars) do bar:Hide() end
     wipe(cooldownBars)
-    
+
+    DetectExtras()
+
     local sortedSpellIDs = {}
     local sortedCooldownIDs = {}
     if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
@@ -3319,6 +3617,114 @@ LoadEssentialCooldowns = function()
         table.insert(cooldownBars, bar)
     end
     
+    -- Extras bars (racials, potions, trinkets) — always at bottom
+    if CONFIG.extras then
+        for _, extra in ipairs(CONFIG.extras) do
+            if extra.enabled and not extra._unavailable then
+                local nextIdx = #cooldownBars + 1
+                local bar = barPool[nextIdx]
+                if bar then
+                    ResetBarState(bar)
+                else
+                    bar = CreateCooldownBar(extra.spellID, nextIdx)
+                    table.insert(barPool, bar)
+                end
+
+                bar.spellID = extra.spellID
+                bar.baseSpellID = extra.spellID
+                bar.cooldownID = extra.cooldownID or extra.spellID
+                bar.isExtras = true
+                bar.extrasType = extra.type
+                bar.extrasKey = extra.key
+                bar.isChargeSpell = false
+                bar.maxCharges = 1
+                bar.hasCharges = false
+                bar._isMultiVariant = false
+                bar._buffCooldownIDs = nil
+
+                local spellInfo = C_Spell.GetSpellInfo(extra.spellID)
+                if spellInfo then
+                    bar.icon:SetTexture(spellInfo.iconID)
+                    bar.spellName = spellInfo.name
+                end
+                bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
+                local buffColor = extra.buffColor or CONFIG.buffColor
+                bar.buffBar:SetStatusBarColor(buffColor[1], buffColor[2], buffColor[3], buffColor[4] or 1)
+                bar.resolvedBuffColor = buffColor
+                bar.cdBar:SetHeight(bar.cdBar.fullHeight or CONFIG.height)
+
+                if extra.type == "potion" or extra.type == "trinket" then
+                    bar._potionBuffDuration = extra.buffDuration
+                    bar._potionCdDuration = extra.cdDuration
+                    bar._potionBuffSpellID = extra.spellID
+                    bar._extrasAuraInstanceID = nil
+                    bar._extrasItemID = extra.itemID or (POTION_BUFF_LOOKUP[extra.spellID] and POTION_BUFF_LOOKUP[extra.spellID].itemID)
+                end
+
+                -- Restore active timers from persistent cache (survives bar rebuilds)
+                local cached = ns._activeExtrasTimers[extra.key]
+                if cached then
+                    local now = GetTime()
+                    if cached.buffExpiry and cached.buffExpiry > now and cached.buffDuration then
+                        local buffDurObj = C_DurationUtil.CreateDuration()
+                        buffDurObj:SetTimeFromStart(cached.buffExpiry - cached.buffDuration, cached.buffDuration)
+                        bar.activeBuffDuration = buffDurObj
+                        bar._extrasBuffExpiry = cached.buffExpiry
+                        bar.buffBar:SetValue(0)
+                        bar.buffBar:Show()
+                    end
+                    if cached.cdExpiry and cached.cdExpiry > now and cached.cdDuration then
+                        local cdDurObj = C_DurationUtil.CreateDuration()
+                        cdDurObj:SetTimeFromStart(cached.cdExpiry - cached.cdDuration, cached.cdDuration)
+                        bar.activeCooldown = cdDurObj
+                        bar._extrasCdExpiry = cached.cdExpiry
+                        bar.cdBar:Show()
+                        FeedCdText(bar, cdDurObj)
+                    end
+                end
+
+                -- Item CD recovery via item API (survives /reload, non-secret)
+                if (extra.type == "potion" or extra.type == "trinket") and not bar._extrasCdExpiry then
+                    local itemID = extra.itemID or (POTION_BUFF_LOOKUP[extra.spellID] and POTION_BUFF_LOOKUP[extra.spellID].itemID)
+                    if itemID then
+                        local ok, startTime, duration = pcall(C_Item.GetItemCooldown, itemID)
+                        if ok and startTime and startTime > 0 and duration and duration > 2 then
+                            local expiry = startTime + duration
+                            local now = GetTime()
+                            if expiry > now then
+                                local cdDurObj = C_DurationUtil.CreateDuration()
+                                cdDurObj:SetTimeFromStart(startTime, duration)
+                                bar.activeCooldown = cdDurObj
+                                bar._extrasCdExpiry = expiry
+                                bar.cdBar:Show()
+                                FeedCdText(bar, cdDurObj)
+                                ns._activeExtrasTimers[extra.key] = ns._activeExtrasTimers[extra.key] or {}
+                                ns._activeExtrasTimers[extra.key].cdExpiry = expiry
+                                ns._activeExtrasTimers[extra.key].cdDuration = duration
+                            end
+                        end
+                    end
+                end
+
+                bar:Show()
+                table.insert(cooldownBars, bar)
+            end
+        end
+    end
+
+    -- Reorder extras to top if configured
+    if CONFIG.extrasPosition == "TOP" then
+        local extras = {}
+        local cdm = {}
+        for _, bar in ipairs(cooldownBars) do
+            if bar.isExtras then extras[#extras + 1] = bar
+            else cdm[#cdm + 1] = bar end
+        end
+        wipe(cooldownBars)
+        for _, bar in ipairs(extras) do cooldownBars[#cooldownBars + 1] = bar end
+        for _, bar in ipairs(cdm) do cooldownBars[#cooldownBars + 1] = bar end
+    end
+
     -- Hide text on unused pooled bars
     for i = #cooldownBars + 1, #barPool do
         local bar = barPool[i]
@@ -3334,10 +3740,12 @@ LoadEssentialCooldowns = function()
 end
 
 local function ProcessSpecChange()
-    specChangePending = false
     local myToken = specChangeToken
     local specKey = ns.GetSpecKey and ns.GetSpecKey()
-    if not specKey then return end
+    if not specKey then
+        specChangePending = false
+        return
+    end
 
     if specKey ~= ns.currentSpecKey then
         ns.currentSpecKey = specKey
@@ -3351,8 +3759,15 @@ local function ProcessSpecChange()
         end
     end
 
-    PreCacheChargeSpells()
-    LoadEssentialCooldowns()
+    local ok, err = pcall(function()
+        PreCacheChargeSpells()
+        LoadEssentialCooldowns()
+    end)
+    if not ok then
+        print("|cffff0000[Infall] Error during spec change rebuild:|r", tostring(err))
+    end
+
+    specChangePending = false
 
     C_Timer.After(0, function()
         if myToken ~= specChangeToken then return end
@@ -3441,6 +3856,7 @@ EH_Parent:RegisterUnitEvent("UNIT_AURA", "player", "target", "pet")
 EH_Parent:RegisterEvent("PLAYER_REGEN_DISABLED")
 EH_Parent:RegisterEvent("PLAYER_REGEN_ENABLED")
 EH_Parent:RegisterEvent("PLAYER_TARGET_CHANGED")
+EH_Parent:RegisterEvent("BAG_UPDATE_COOLDOWN")
 
 -- ECM visibility (per-viewer)
 local ecmFrameNames = {
@@ -3642,19 +4058,27 @@ loginInitFrame:SetScript("OnEvent", function()
         local top = EH_Parent:GetTop()
         if not left or not bottom or not top then return end
 
-        local curPoint = select(1, EH_Parent:GetPoint(1))
+        -- GetLeft/GetTop/GetBottom return in frame-scaled space
+        local s = EH_Parent:GetScale() or 1
+        left = left * s
+        bottom = bottom * s
+        top = top * s
+
+        local halfW = UIParent:GetWidth() / 2
+        local halfH = UIParent:GetHeight() / 2
+        local xOff = (left - halfW) / s
+        local yOff
 
         if CONFIG.growDirection == "UP" then
-            if curPoint == "BOTTOMLEFT" then return end
+            yOff = (bottom - halfH) / s
             EH_Parent:ClearAllPoints()
-            EH_Parent:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left, bottom)
-            InfallDB.position = { point = "BOTTOMLEFT", relPoint = "BOTTOMLEFT", x = left, y = bottom }
+            EH_Parent:SetPoint("BOTTOMLEFT", UIParent, "CENTER", xOff, yOff)
+            InfallDB.position = { point = "BOTTOMLEFT", relPoint = "CENTER", x = xOff, y = yOff }
         else
-            if curPoint ~= "BOTTOMLEFT" then return end
-            local ty = top - UIParent:GetHeight()
+            yOff = (top - halfH) / s
             EH_Parent:ClearAllPoints()
-            EH_Parent:SetPoint("TOPLEFT", UIParent, "TOPLEFT", left, ty)
-            InfallDB.position = { point = "TOPLEFT", relPoint = "TOPLEFT", x = left, y = ty }
+            EH_Parent:SetPoint("TOPLEFT", UIParent, "CENTER", xOff, yOff)
+            InfallDB.position = { point = "TOPLEFT", relPoint = "CENTER", x = xOff, y = yOff }
         end
     end
     ns.NormalizeGrowAnchor = NormalizeGrowAnchor
@@ -3668,12 +4092,7 @@ loginInitFrame:SetScript("OnEvent", function()
     end)
     EH_Parent:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
-        if CONFIG.growDirection == "UP" then
-            NormalizeGrowAnchor()
-        else
-            local point, _, relPoint, x, y = self:GetPoint()
-            InfallDB.position = { point = point, relPoint = relPoint, x = x, y = y }
-        end
+        NormalizeGrowAnchor()
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
     end)
 
@@ -3682,9 +4101,6 @@ loginInitFrame:SetScript("OnEvent", function()
         EH_Parent:ClearAllPoints()
         EH_Parent:SetPoint(pos.point, UIParent, pos.relPoint, pos.x, pos.y)
     end
-    NormalizeGrowAnchor()
-    
-    ApplyECMVisibility()
 
     local setAlphaGuard = {}
     for _, name in ipairs(ecmFrameNames) do
@@ -3799,6 +4215,7 @@ loginInitFrame:SetScript("OnEvent", function()
     end
 
     -- must be after profile loading sets CONFIG
+    NormalizeGrowAnchor()
     ApplyCastBarVisibility()
     if CONFIG.clickthrough then
         EH_Parent:EnableMouse(false)
@@ -3852,13 +4269,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             InfallDB.chargeSpells = InfallDB.chargeSpells or {}
             InfallDB.chargeDurations = InfallDB.chargeDurations or {}
 
-            if ns.ApplyBackdrop then
-                ns.ApplyBackdrop()
-            end
-            
-            EH_Parent:SetScale(CONFIG.scale)
-            EH_Parent:SetWidth(CONFIG.paddingLeft + CONFIG.iconSize + (CONFIG.iconGap or 10) + CONFIG.width + CONFIG.paddingRight)
-            
             print("|cff00ff00[Infall]|r Loaded. Type |cffffff00/infall setup|r for settings or |cffffff00/infall|r for commands.")
         end
         
@@ -3931,7 +4341,92 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 break
             end
         end
-        
+
+        -- Potion extras detection (spellID from event is NeverSecret, works in combat)
+        if POTION_BUFF_LOOKUP[spellID] then
+            for _, row in ipairs(cooldownBars) do
+                if row.extrasType == "potion" and row._potionBuffSpellID == spellID then
+                    local now = GetTime()
+                    -- Buff timer (manual DurObj for 30Hz fill, expiry timestamp for cleanup)
+                    local buffDurObj = C_DurationUtil.CreateDuration()
+                    buffDurObj:SetTimeFromStart(now, row._potionBuffDuration)
+                    row.activeBuffDuration = buffDurObj
+                    row._extrasBuffExpiry = now + row._potionBuffDuration
+                    if not row.buffBar:IsShown() then
+                        row.buffBar:SetValue(0)
+                    end
+                    row.buffBar:Show()
+                    -- CD timer (5 min shared potion CD)
+                    local cdDurObj = C_DurationUtil.CreateDuration()
+                    cdDurObj:SetTimeFromStart(now, row._potionCdDuration)
+                    row.activeCooldown = cdDurObj
+                    row._extrasCdExpiry = now + row._potionCdDuration
+                    if not row.cdBar:IsShown() then row.cdBar:Show() end
+                    FeedCdText(row, cdDurObj)
+                    -- Save to persistent timer cache
+                    ns._activeExtrasTimers[row.extrasKey] = {
+                        buffExpiry = row._extrasBuffExpiry,
+                        buffDuration = row._potionBuffDuration,
+                        cdExpiry = row._extrasCdExpiry,
+                        cdDuration = row._potionCdDuration,
+                    }
+                    break
+                end
+            end
+        end
+
+        -- Trinket extras detection (same pattern as potions)
+        if TRINKET_SPELL_LOOKUP[spellID] then
+            for _, row in ipairs(cooldownBars) do
+                if row.extrasType == "trinket" and row._potionBuffSpellID == spellID then
+                    local now = GetTime()
+                    local buffDurObj = C_DurationUtil.CreateDuration()
+                    buffDurObj:SetTimeFromStart(now, row._potionBuffDuration)
+                    row.activeBuffDuration = buffDurObj
+                    row._extrasBuffExpiry = now + row._potionBuffDuration
+                    if not row.buffBar:IsShown() then
+                        row.buffBar:SetValue(0)
+                    end
+                    row.buffBar:Show()
+                    local cdDurObj = C_DurationUtil.CreateDuration()
+                    cdDurObj:SetTimeFromStart(now, row._potionCdDuration)
+                    row.activeCooldown = cdDurObj
+                    row._extrasCdExpiry = now + row._potionCdDuration
+                    if not row.cdBar:IsShown() then row.cdBar:Show() end
+                    FeedCdText(row, cdDurObj)
+                    ns._activeExtrasTimers[row.extrasKey] = {
+                        buffExpiry = row._extrasBuffExpiry,
+                        buffDuration = row._potionBuffDuration,
+                        cdExpiry = row._extrasCdExpiry,
+                        cdDuration = row._potionCdDuration,
+                    }
+                    break
+                end
+            end
+        end
+
+        -- Racial extras buff detection (hardcoded durations, same pattern as potions)
+        for _, row in ipairs(cooldownBars) do
+            if row.extrasType == "racial" and row.spellID == spellID then
+                local buffDuration = RACIAL_BUFF_DURATIONS[spellID]
+                if buffDuration then
+                    local now = GetTime()
+                    local buffDurObj = C_DurationUtil.CreateDuration()
+                    buffDurObj:SetTimeFromStart(now, buffDuration)
+                    row.activeBuffDuration = buffDurObj
+                    row._extrasBuffExpiry = now + buffDuration
+                    if not row.buffBar:IsShown() then
+                        row.buffBar:SetValue(0)
+                    end
+                    row.buffBar:Show()
+                    ns._activeExtrasTimers[row.extrasKey] = ns._activeExtrasTimers[row.extrasKey] or {}
+                    ns._activeExtrasTimers[row.extrasKey].buffExpiry = row._extrasBuffExpiry
+                    ns._activeExtrasTimers[row.extrasKey].buffDuration = buffDuration
+                end
+                break
+            end
+        end
+
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
         specChangeToken = specChangeToken + 1
@@ -3946,7 +4441,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
     elseif event == "SPELLS_CHANGED" then
         if specChangePending then
             local myToken = specChangeToken
-            C_Timer.After(0.5, function()
+            C_Timer.After(2.5, function()
                 if myToken == specChangeToken and specChangePending then
                     ProcessSpecChange()
                 end
@@ -4039,7 +4534,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "UNIT_AURA" then
         local unit, updateInfo = ...
-        
+
         if updateInfo and updateInfo.removedAuraInstanceIDs then
             for _, removedID in ipairs(updateInfo.removedAuraInstanceIDs) do
                 for _, row in ipairs(cooldownBars) do
@@ -4060,10 +4555,56 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         if row.buffBarThird then row.buffBarThird:Hide() end
                         FeedHiddenCooldown(row, "third", nil)
                     end
+                    -- Extras buff removal (racials only; potions/trinkets use expiry timer)
+                    if row.isExtras and row.extrasType ~= "potion" and row.extrasType ~= "trinket" and row._extrasAuraInstanceID == removedID then
+                        row._extrasAuraInstanceID = nil
+                        row._extrasBuffExpiry = nil
+                        row.activeBuffDuration = nil
+                        row.buffBar:Hide()
+                        FeedHiddenCooldown(row, "buff", nil)
+                        local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
+                        if cache then cache.buffExpiry = nil end
+                    end
                 end
             end
         end
-        
+
+        -- Extras buff detection via addedAuras (racials + potions)
+        if unit == "player" and updateInfo and updateInfo.addedAuras then
+            for _, auraData in ipairs(updateInfo.addedAuras) do
+                local aSpellId = auraData.spellId
+                if aSpellId and not (issecretvalue and issecretvalue(aSpellId)) then
+                    for _, row in ipairs(cooldownBars) do
+                        if row.isExtras then
+                            local matchID = row._potionBuffSpellID or row.spellID
+                            if matchID == aSpellId then
+                                row._extrasAuraInstanceID = auraData.auraInstanceID
+                                local durOk, durObj = pcall(C_UnitAuras.GetAuraDuration, "player", auraData.auraInstanceID)
+                                if durOk and durObj then
+                                    row.activeBuffDuration = durObj
+                                    FeedHiddenCooldown(row, "buff", durObj)
+                                    if not row.buffBar:IsShown() then
+                                        row.buffBar:SetValue(0)
+                                        row.buffBar:Show()
+                                    end
+                                end
+                                -- Potion/trinket CD timer (racials get CD via UpdateRowCooldown instead)
+                                if row.extrasType == "potion" or row.extrasType == "trinket" then
+                                    local cdDurObj = C_DurationUtil.CreateDuration()
+                                    cdDurObj:SetTimeFromStart(GetTime(), row._potionCdDuration)
+                                    row.activeCooldown = cdDurObj
+                                    row.hidden_cd:SetCooldown(GetTime(), row._potionCdDuration)
+                                    if not row.cdBar:IsShown() then row.cdBar:Show() end
+                                    FeedCdText(row, cdDurObj)
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
         local now = GetTime()
         if now - lastUnitAuraUpdate >= UNIT_AURA_THROTTLE then
             lastUnitAuraUpdate = now
@@ -4141,6 +4682,28 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         ScheduleDeferredUpdate(0.05)
         ScheduleDeferredUpdate(0.1)
         ScheduleDeferredUpdate(0.2)
+
+    elseif event == "BAG_UPDATE_COOLDOWN" then
+        -- Detect server-side CD resets for extras (potions/trinkets)
+        for _, row in ipairs(cooldownBars) do
+            if row._extrasCdExpiry and row._extrasItemID then
+                local ok, startTime, duration = pcall(C_Item.GetItemCooldown, row._extrasItemID)
+                if ok and (not startTime or startTime == 0 or not duration or duration <= 2) then
+                    row._extrasCdExpiry = nil
+                    row.activeCooldown = nil
+                    row.cdBar:Hide()
+                    if row.cooldownFrame then row.cooldownFrame:Hide() end
+                    if row.activeCdSlide then
+                        DetachPastSlide(row.activeCdSlide)
+                        row.activeCdSlide = nil
+                    end
+                    if row.cdTextCooldown then row.cdTextCooldown:SetCooldown(0, 0) end
+                    UpdateDesaturation(row)
+                    local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
+                    if cache then cache.cdExpiry = nil; cache.cdDuration = nil end
+                end
+            end
+        end
     end
 end)
 
@@ -4596,6 +5159,46 @@ ns.HideVariantPreview = function()
     for _, row in ipairs(cooldownBars) do
         if row.variantNameText then
             row.variantNameText:Hide()
+        end
+    end
+end
+
+ns.ShowDurationPreview = function()
+    for _, row in ipairs(cooldownBars) do
+        if row.cdTextCooldown then
+            -- Feed first so engine creates the font string
+            row.cdTextCooldown:SetHideCountdownNumbers(false)
+            row.cdTextCooldown:SetMinimumCountdownDuration(0)
+            row.cdTextCooldown:SetCooldown(GetTime(), 105)
+            -- Now style it
+            local fsOk, fs = pcall(row.cdTextCooldown.GetCountdownFontString, row.cdTextCooldown)
+            if fsOk and fs then
+                ApplyFont(fs, CONFIG.cdDurationTextSize or CONFIG.fontSize)
+                fs:SetTextColor(unpack(CONFIG.cdDurationTextColor))
+                fs:ClearAllPoints()
+                fs:SetPoint(CONFIG.cdDurationTextAnchor, row.barTextOverlay, CONFIG.cdDurationTextRelPoint, CONFIG.cdDurationTextOffsetX, CONFIG.cdDurationTextOffsetY)
+            end
+        end
+    end
+end
+
+ns.HideDurationPreview = function()
+    for _, row in ipairs(cooldownBars) do
+        if row.cdTextCooldown then
+            row.cdTextCooldown:SetCooldown(0, 0)
+            row.cdTextCooldown:SetHideCountdownNumbers(not CONFIG.showCooldownDuration)
+            row.cdTextCooldown:SetMinimumCountdownDuration((CONFIG.cdTextMinDuration or 30) * 1000)
+            local fsOk, fs = pcall(row.cdTextCooldown.GetCountdownFontString, row.cdTextCooldown)
+            if fsOk and fs then fs:SetText("") end
+        end
+    end
+end
+
+ns.UpdateDurationTextSettings = function()
+    for _, row in ipairs(cooldownBars) do
+        if row.cdTextCooldown then
+            row.cdTextCooldown:SetHideCountdownNumbers(not CONFIG.showCooldownDuration)
+            row.cdTextCooldown:SetMinimumCountdownDuration((CONFIG.cdTextMinDuration or 30) * 1000)
         end
     end
 end

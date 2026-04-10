@@ -73,7 +73,16 @@ ns.CONFIG = {
     variantTextRelPoint = "LEFT",
     variantTextOffsetX = 5,
     variantTextOffsetY = 0,
-    
+
+    showCooldownDuration = false,
+    cdTextMinDuration = 30,
+    cdDurationTextColor = {1, 1, 1, 1},
+    cdDurationTextSize = 12,
+    cdDurationTextAnchor = "RIGHT",
+    cdDurationTextRelPoint = "RIGHT",
+    cdDurationTextOffsetX = -2,
+    cdDurationTextOffsetY = 0,
+
     scale = 1.0,
     
     -- nil = frame grows with bar count, number = fixed px height; bars shrink to fit
