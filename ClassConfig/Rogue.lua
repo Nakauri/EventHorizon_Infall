@@ -48,12 +48,6 @@ CONFIG.buffMappings = {
             buffCooldownIDs = {42743},
             unit = "player",
             color = {0.4, 0.4, 0.9, 0.6},
-            spellColorMap = {
-                [1214933] = {0.3, 0.8, 0.3, 0.6},  -- One of a Kind
-                [1214934] = {0.8, 0.8, 0.2, 0.6},  -- Double Trouble
-                [1214935] = {0.9, 0.5, 0.1, 0.6},  -- Triple Threat
-                [1214937] = {0.9, 0.2, 0.9, 0.6},  -- Jackpot
-            },
         },
     },
 }

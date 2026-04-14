@@ -42,9 +42,14 @@ CONFIG.extraCasts = {
 -- ============================================================================
 
 CONFIG.buffMappings = {
-    -- [cooldownID] = {
-    --     {buffCooldownIDs = {N}, unit = "player", color = {r, g, b, a}},
-    -- },
+    -- Pyroblast: Heating Up / Hot Streak (variants auto-detected from CDM)
+    [35691] = {
+        {
+            buffCooldownIDs = {161645},
+            unit = "player",
+            color = {0.9, 0.4, 0.1, 0.6},
+        },
+    },
 }
 
 -- ============================================================================
@@ -54,6 +59,20 @@ CONFIG.buffMappings = {
 
 CONFIG.stackMappings = {
     -- [cooldownID] = {buffCooldownID = N, unit = "player"},
+}
+
+-- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- Arcane: Arcane Charge generation from cast time spells
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [30451] = {  -- Arcane Blast
+        base = 1,
+        talents = {
+            {spellID = 383676, bonus = 1},  -- Impetus
+        },
+    },
 }
 
 -- ============================================================================

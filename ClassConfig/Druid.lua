@@ -95,6 +95,33 @@ CONFIG.stackMappings = {
 }
 
 -- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- base = astral power generated on cast, talents = conditional bonuses
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [190984] = {  -- Wrath
+        base = 8,
+        talents = {
+            {spellID = 114107, bonus = 3, requiresAura = 48517, requiresCdmBuff = 78},  -- Soul of the Forest during Solar Eclipse
+        },
+    },
+    [194153] = {  -- Starfire
+        base = 10,
+        talents = {
+            {spellID = 114107, bonus = 4, requiresAura = 48518, requiresCdmBuff = 76},  -- Soul of the Forest during Lunar Eclipse
+        },
+    },
+    [164812] = {base = 6},   -- Moonfire
+    [164815] = {base = 6},   -- Sunfire
+    [202770] = {base = 40},  -- Fury of Elune (total over channel)
+    [205636] = {base = 20},  -- Force of Nature
+    [274281] = {base = 10},  -- New Moon
+    [274282] = {base = 20},  -- Half Moon
+    [274283] = {base = 40},  -- Full Moon
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================

@@ -116,3 +116,32 @@ CONFIG.stackMappings = {}
 
 -- CONFIG.hiddenCooldownIDs = CONFIG.hiddenCooldownIDs or {}
 -- CONFIG.hiddenCooldownIDs[12345] = true
+
+-- ============================================================================
+-- STACK INDICATORS
+-- ============================================================================
+
+-- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- base = focus generated on cast, talents = conditional bonuses
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [56641] = {  -- Steady Shot
+        base = 10,
+        talents = {
+            {spellID = 450379, bonus = 5},  -- Invigorating Pulse
+        },
+    },
+}
+
+CONFIG.stackIndicatorList = {
+    {
+        cooldownID = 3664,
+        maxStacks = 10,
+        overflowMax = 20,
+        color = {0.9, 0.5, 0.3, 1},
+        overflowColor = {1, 0.82, 0.2, 1},
+        position = "TOP",
+    },
+}

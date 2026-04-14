@@ -3768,6 +3768,7 @@ local function ProcessSpecChange()
     end
 
     specChangePending = false
+    if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
 
     C_Timer.After(0, function()
         if myToken ~= specChangeToken then return end
@@ -3885,17 +3886,21 @@ local function ApplyECMVisibility()
             local key = ecmViewerKey[name]
             if key and CONFIG[key] then
                 pcall(function() frame:SetAlpha(0) end)
-                -- Disable mouse on item frames
+                -- Disable mouse on main frame and all item frames
+                pcall(function() frame:EnableMouse(false) end)
                 pcall(function()
                     for itemFrame in frame.itemFramePool:EnumerateActive() do
                         itemFrame:SetMouseMotionEnabled(false)
+                        itemFrame:SetMouseClickEnabled(false)
                     end
                 end)
             else
                 pcall(function() frame:UpdateSystemSettingOpacity() end)
+                pcall(function() frame:EnableMouse(true) end)
                 pcall(function()
                     for itemFrame in frame.itemFramePool:EnumerateActive() do
                         itemFrame:SetMouseMotionEnabled(true)
+                        itemFrame:SetMouseClickEnabled(true)
                     end
                 end)
             end
@@ -4114,8 +4119,30 @@ loginInitFrame:SetScript("OnEvent", function()
                     setAlphaGuard[self] = true
                     self:SetAlpha(0)
                     setAlphaGuard[self] = nil
+                    -- Re-disable mouse on item frames after CDM opacity reset
+                    pcall(function()
+                        self:EnableMouse(false)
+                        for itemFrame in self.itemFramePool:EnumerateActive() do
+                            itemFrame:SetMouseMotionEnabled(false)
+                            itemFrame:SetMouseClickEnabled(false)
+                        end
+                    end)
                 end
             end)
+            -- Re-disable mouse after CDM layout rebuilds (login, spec swap, zone transition)
+            if frame.RefreshLayout then
+                hooksecurefunc(frame, "RefreshLayout", function(self)
+                    if key and CONFIG[key] then
+                        pcall(function()
+                            self:EnableMouse(false)
+                            for itemFrame in self.itemFramePool:EnumerateActive() do
+                                itemFrame:SetMouseMotionEnabled(false)
+                                itemFrame:SetMouseClickEnabled(false)
+                            end
+                        end)
+                    end
+                end)
+            end
         end
     end
 
@@ -4148,6 +4175,18 @@ loginInitFrame:SetScript("OnEvent", function()
                 InstallBuffFrameHooks(frame)
                 MarkBuffDirtyForCdID(cdID)
                 viewerScanDirty = true
+
+                -- Disable mouse on item frames assigned to hidden viewers
+                local viewerName = viewer:GetName()
+                if viewerName then
+                    local hideKey = ecmViewerKey[viewerName]
+                    if hideKey and CONFIG[hideKey] then
+                        pcall(function()
+                            frame:SetMouseMotionEnabled(false)
+                            frame:SetMouseClickEnabled(false)
+                        end)
+                    end
+                end
             end)
         end
         if CooldownViewerItemDataMixin.ClearCooldownID then
@@ -4431,6 +4470,13 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
         specChangeToken = specChangeToken + 1
         specChangePending = true
+        -- Re-disable mouse on hidden viewers while CDM rebuilds
+        if AnyViewerHidden() and ns.ApplyECMVisibility then
+            ns.ApplyECMVisibility()
+            C_Timer.After(0.5, function() if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end end)
+            C_Timer.After(1.0, function() if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end end)
+            C_Timer.After(1.5, function() if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end end)
+        end
         local myToken = specChangeToken
         C_Timer.After(2, function()
             if myToken == specChangeToken and specChangePending then

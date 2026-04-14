@@ -57,6 +57,19 @@ CONFIG.stackMappings = {
 }
 
 -- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- Shadow: Insanity generation from cast time / channeled spells
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [8092]   = {base = 6},   -- Mind Blast (has cast time at lower levels)
+    [15407]  = {base = 18},  -- Mind Flay (channeled, total over full channel)
+    [391403] = {base = 12},  -- Mind Flay: Insanity (channeled, shorter duration)
+    [34914]  = {base = 4},   -- Vampiric Touch
+    [263165] = {base = 24},  -- Void Torrent (channeled, total over full channel)
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================

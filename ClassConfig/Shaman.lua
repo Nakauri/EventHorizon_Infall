@@ -57,6 +57,24 @@ CONFIG.stackMappings = {
 }
 
 -- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- Elemental: Maelstrom generation from cast time spells
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [188196] = {  -- Lightning Bolt
+        base = 6,
+    },
+    [51505] = {  -- Lava Burst
+        base = 8,
+        talents = {
+            {spellID = 1273485, bonus = 1},  -- Lava Flows
+        },
+    },
+    [188443] = {base = 2},  -- Chain Lightning (per target, prediction uses single target)
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================

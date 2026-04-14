@@ -57,6 +57,21 @@ CONFIG.stackMappings = {
 }
 
 -- ============================================================================
+-- SPELL GENERATION (resource bar predictive power)
+-- Destruction: Soul Shard generation (in shard units, 1 shard = 10 fragments)
+-- ============================================================================
+
+CONFIG.spellGeneration = {
+    [29722] = {  -- Incinerate
+        base = 0.2,  -- 2 fragments
+        talents = {
+            {spellID = 387173, bonus = 0.2},  -- Diabolic Embers (+2 fragments)
+        },
+    },
+    [6353] = {base = 1},  -- Soul Fire (1 full shard)
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================
