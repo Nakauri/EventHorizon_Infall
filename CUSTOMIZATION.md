@@ -267,6 +267,18 @@ These two features are toggled in game with slash commands or from the Settings 
 
 This is useful if you already know your rotation by feel and just want compact timeline bars without the visual noise of icons, or if you want Infall to take up less horizontal screen space.
 
+### Custom Bar Icon
+
+By default every bar shows the icon of its Cooldown Manager ability, and that icon can change at runtime when a spell transforms (IE Mindbender becomes Shadowfiend). You can override it with a fixed icon of your own choosing. This is purely cosmetic and changes nothing about what the bar tracks.
+
+A common use case: you put a spell like Tentacle Slam on the same Cooldown Manager slot as Vampiric Touch and end up with Tentacle Slam's icon on the VT bar. The custom icon override lets you lock the icon back to VT while the bar keeps tracking whatever the Cooldown Manager has in that slot.
+
+**How to set it:** open the Settings GUI (Bars tab), find the row you want, and left click its icon. A spell picker opens. Type part of a spell name and click a result. A small green dot appears in the corner of the icon to show it's overridden. Right click the icon to clear the override and go back to the default.
+
+**What the override does:** it replaces the texture displayed on the bar's icon slot. Nothing else. The bar still tracks the same cooldown, buffs, casts, and stacks it did before.
+
+**What the override doesn't do:** it freezes the icon in place, so reactive icon updates (like Mindbender becoming Shadowfiend mid fight) won't show visually while the override is active. That's the trade off.
+
 ### Buff Layer Order
 
 `/infall bufflayer` (or `/infall bl`) controls whether buff and debuff bars render above or below cooldown bars within each row.

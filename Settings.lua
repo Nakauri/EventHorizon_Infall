@@ -177,6 +177,7 @@ function ns.SeedProfileFromClassConfig(specKey)
         cooldownColors = {},
         stackIndicatorSettings = {},
         stackIndicatorList = {},
+        customIcons = {},
     }
 
     for _, key in ipairs(TOGGLE_KEYS) do
@@ -316,6 +317,7 @@ function ns.ApplyProfile(profile)
     CONFIG.stackIndicatorList = profile.stackIndicatorList and DeepCopy(profile.stackIndicatorList) or {}
     CONFIG.resourceBar = profile.resourceBar and DeepCopy(profile.resourceBar) or {}
     CONFIG.extras = profile.extras and DeepCopy(profile.extras) or {}
+    CONFIG.customIcons = profile.customIcons and DeepCopy(profile.customIcons) or {}
 
     -- Restore per-profile frame position
     if profile.position and EH_Parent then
@@ -389,6 +391,7 @@ function ns.SaveCurrentProfile()
     profile.stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {})
     profile.resourceBar = DeepCopy(CONFIG.resourceBar or {})
     profile.extras = DeepCopy(CONFIG.extras or {})
+    profile.customIcons = DeepCopy(CONFIG.customIcons or {})
 
     -- Save current frame position (per-character)
     if EH_Parent then
@@ -417,6 +420,7 @@ ns.classConfigDefaults = {
     stackIndicatorList = DeepCopy(CONFIG.stackIndicatorList or {}),
     resourceBar = DeepCopy(CONFIG.resourceBar or {}),
     extras = DeepCopy(CONFIG.extras or {}),
+    customIcons = DeepCopy(CONFIG.customIcons or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
     ns.classConfigDefaults.toggles[key] = CONFIG[key]
@@ -992,6 +996,296 @@ local function OpenInlineColorPicker(currentColor, onChange)
     }
     ColorPickerFrame:SetupColorPickerAndShow(info)
 end
+
+-- ============================================================================
+-- SHARED SPELL PICKER
+-- Opens a searchable popup listing the player's learned spells (including
+-- passives). Used by the Stacks tab and the custom icon override in Bars tab.
+-- ============================================================================
+
+local spellPickerFrame
+local spellPickerCache
+local spellPickerCacheDirty = true
+local spellPickerCurrentOpts
+
+local function BuildSpellPickerCache()
+    local list = {}
+    local seen = {}
+
+    local getTabs = C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines
+    local getLine = C_SpellBook and C_SpellBook.GetSpellBookSkillLineInfo
+    local getItem = C_SpellBook and C_SpellBook.GetSpellBookItemInfo
+    if not (getTabs and getLine and getItem) then
+        spellPickerCache = list
+        spellPickerCacheDirty = false
+        return list
+    end
+
+    local playerBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
+    local spellType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Spell
+    local numTabs = getTabs() or 0
+    for t = 1, numTabs do
+        local info = getLine(t)
+        if info and not info.shouldHide then
+            local offset = info.itemIndexOffset or 0
+            local count = info.numSpellBookItems or 0
+            for i = 1, count do
+                local idx = offset + i
+                local ok, data = pcall(getItem, idx, playerBank)
+                if ok and data and data.spellID and not seen[data.spellID] then
+                    local typeOk = (spellType == nil) or (data.itemType == spellType)
+                    if typeOk then
+                        seen[data.spellID] = true
+                        local name = data.name or C_Spell.GetSpellName(data.spellID)
+                        if name and name ~= "" then
+                            local icon = data.iconID or C_Spell.GetSpellTexture(data.spellID) or 134400
+                            list[#list + 1] = {
+                                spellID = data.spellID,
+                                name = name,
+                                nameLower = name:lower(),
+                                icon = icon,
+                                tab = info.name,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return a.nameLower < b.nameLower end)
+    spellPickerCache = list
+    spellPickerCacheDirty = false
+    return list
+end
+
+local spellPickerInvalidator
+local function EnsureSpellPickerInvalidator()
+    if spellPickerInvalidator then return end
+    spellPickerInvalidator = CreateFrame("Frame")
+    spellPickerInvalidator:RegisterEvent("SPELLS_CHANGED")
+    spellPickerInvalidator:RegisterEvent("LEARNED_SPELL_IN_SKILL_LINE")
+    spellPickerInvalidator:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    spellPickerInvalidator:SetScript("OnEvent", function()
+        spellPickerCacheDirty = true
+    end)
+end
+
+local function BuildSpellPickerFrame()
+    if spellPickerFrame then return spellPickerFrame end
+
+    local f = CreateFrame("Frame", "InfallSpellPicker", UIParent, "BackdropTemplate")
+    f:SetSize(300, 380)
+    f:SetFrameStrata("FULLSCREEN_DIALOG")
+    f:SetToplevel(true)
+    f:EnableMouse(true)
+    f:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8x8",
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
+        edgeSize = 1,
+        insets = {left = 1, right = 1, top = 1, bottom = 1},
+    })
+    f:SetBackdropColor(0.08, 0.08, 0.08, 0.96)
+    f:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+    f:Hide()
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetTextColor(1, 0.82, 0, 1)
+    f.title = title
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButtonNoScripts")
+    closeBtn:SetPoint("TOPRIGHT", 2, 2)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local searchBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    searchBox:SetSize(270, 20)
+    searchBox:SetPoint("TOPLEFT", 14, -30)
+    searchBox:SetAutoFocus(false)
+    searchBox:SetFontObject("ChatFontNormal")
+    searchBox:SetScript("OnEscapePressed", function(self)
+        if self:GetText() ~= "" then
+            self:SetText("")
+        else
+            f:Hide()
+        end
+    end)
+    f.searchBox = searchBox
+
+    local searchHint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    searchHint:SetPoint("LEFT", searchBox, "LEFT", 4, 0)
+    searchHint:SetText("Type a spell name...")
+    f.searchHint = searchHint
+
+    local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", 10, -56)
+    scrollFrame:SetPoint("BOTTOMRIGHT", -28, 30)
+
+    local scrollChild = CreateFrame("Frame", nil, scrollFrame)
+    scrollChild:SetSize(260, 1)
+    scrollFrame:SetScrollChild(scrollChild)
+    f.scrollFrame = scrollFrame
+    f.scrollChild = scrollChild
+
+    local emptyText = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    emptyText:SetPoint("TOP", 0, -20)
+    emptyText:SetWidth(240)
+    emptyText:SetJustifyH("CENTER")
+    emptyText:SetText("No matches. Try part of the spell name.")
+    emptyText:Hide()
+    f.emptyText = emptyText
+
+    local footer = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    footer:SetPoint("BOTTOMLEFT", 12, 10)
+    footer:SetPoint("BOTTOMRIGHT", -12, 10)
+    footer:SetJustifyH("LEFT")
+    f.footer = footer
+
+    f.rowCache = {}
+    f.rowCacheCount = 0
+
+    local function Refresh()
+        local query = (searchBox:GetText() or ""):lower()
+        if query == "" then
+            searchHint:Show()
+        else
+            searchHint:Hide()
+        end
+
+        if spellPickerCacheDirty or not spellPickerCache then
+            BuildSpellPickerCache()
+        end
+
+        local results = {}
+        local opts = spellPickerCurrentOpts
+        local extras = opts and opts.extraSources
+        if extras then
+            for _, e in ipairs(extras) do
+                if query == "" or (e.nameLower or (e.name or ""):lower()):find(query, 1, true) then
+                    results[#results + 1] = e
+                end
+            end
+        end
+
+        local seenIDs = {}
+        for _, e in ipairs(results) do
+            if e.spellID then seenIDs[e.spellID] = true end
+        end
+
+        for _, e in ipairs(spellPickerCache) do
+            if not seenIDs[e.spellID] and (query == "" or e.nameLower:find(query, 1, true)) then
+                results[#results + 1] = e
+                seenIDs[e.spellID] = true
+                if #results >= 200 then break end
+            end
+        end
+
+        for i = 1, f.rowCacheCount do
+            if f.rowCache[i] then f.rowCache[i]:Hide() end
+        end
+
+        local rowH = 24
+        local y = 0
+        for i, entry in ipairs(results) do
+            local row = f.rowCache[i]
+            if not row then
+                row = CreateFrame("Button", nil, scrollChild)
+                row:SetSize(260, rowH)
+                row.icon = row:CreateTexture(nil, "ARTWORK")
+                row.icon:SetSize(18, 18)
+                row.icon:SetPoint("LEFT", 4, 0)
+                row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                row.name:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+                row.name:SetPoint("RIGHT", -52, 0)
+                row.name:SetJustifyH("LEFT")
+                row.id = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+                row.id:SetPoint("RIGHT", -6, 0)
+                row.id:SetJustifyH("RIGHT")
+                local hl = row:CreateTexture(nil, "HIGHLIGHT")
+                hl:SetAllPoints()
+                hl:SetColorTexture(0.3, 0.3, 0.5, 0.4)
+                row:SetScript("OnEnter", function(self)
+                    if self._tagText then
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText(self._tagText, 0.7, 0.7, 0.7)
+                        GameTooltip:Show()
+                    end
+                end)
+                row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                f.rowCache[i] = row
+                f.rowCacheCount = math.max(f.rowCacheCount, i)
+            end
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", 0, -y)
+            row.icon:SetTexture(entry.icon or 134400)
+            row.name:SetText(entry.name)
+            row.id:SetText(tostring(entry.spellID or ""))
+            row._tagText = entry.tag or entry.tab
+            row._spellID = entry.spellID
+            row._entry = entry
+            row:SetScript("OnClick", function(self)
+                if spellPickerCurrentOpts and spellPickerCurrentOpts.onSelect then
+                    spellPickerCurrentOpts.onSelect(self._entry.spellID, self._entry.name, self._entry.icon, self._entry)
+                end
+                f:Hide()
+            end)
+            row:Show()
+            y = y + rowH
+        end
+
+        scrollChild:SetHeight(math.max(y, 1))
+        scrollFrame:SetVerticalScroll(0)
+
+        if #results == 0 then
+            emptyText:Show()
+        else
+            emptyText:Hide()
+        end
+
+        footer:SetText(#results .. " spell" .. (#results == 1 and "" or "s"))
+    end
+    f.Refresh = Refresh
+
+    searchBox:SetScript("OnTextChanged", Refresh)
+
+    f:SetScript("OnHide", function()
+        spellPickerCurrentOpts = nil
+        searchBox:SetText("")
+    end)
+
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then self:Hide() end
+    end)
+    f:EnableKeyboard(true)
+    f:SetPropagateKeyboardInput(false)
+
+    spellPickerFrame = f
+    return f
+end
+
+local function OpenSpellPicker(opts)
+    EnsureSpellPickerInvalidator()
+    local f = BuildSpellPickerFrame()
+    spellPickerCurrentOpts = opts or {}
+    f.title:SetText(opts and opts.title or "Pick a Spell")
+
+    if opts and opts.anchor then
+        f:ClearAllPoints()
+        f:SetPoint("TOPLEFT", opts.anchor, "TOPRIGHT", 6, 0)
+    else
+        f:ClearAllPoints()
+        f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    end
+
+    f.searchBox:SetText("")
+    f:Show()
+    f:Raise()
+    f.searchBox:SetFocus()
+    f.Refresh()
+end
+
+ns.OpenSpellPicker = OpenSpellPicker
 
 -- ============================================================================
 -- TAB BUILDERS
@@ -2082,7 +2376,7 @@ local function BuildStacksTab(contentArea, tabFrames)
     gridDesc:SetWidth(500)
     gridDesc:SetJustifyH("LEFT")
     gridDesc:SetSpacing(2)
-    gridDesc:SetText("Buff auras from the Cooldown Manager that mention stacking in their tooltip. Click to add as a stack indicator.")
+    gridDesc:SetText("Buff auras from the Cooldown Manager. Click to add as a stack indicator. If a buff isn't here, add it to the Cooldown Manager first.")
 
     local gridContainer = CreateFrame("Frame", nil, stacksContent)
     gridContainer:SetPoint("TOPLEFT", gridDesc, "BOTTOMLEFT", 0, -8)
@@ -2199,18 +2493,10 @@ local function BuildStacksTab(contentArea, tabFrames)
             end
         end
 
-        -- Filter to abilities whose tooltip mentions stacking
-        local filteredIDs = {}
-        for _, buffCdID in ipairs(buffIDs) do
-            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
-            local spellID = infoOk and cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
-            if spellID then
-                local descOk, desc = pcall(C_Spell.GetSpellDescription, spellID)
-                if descOk and desc and desc:lower():find("stack") then
-                    filteredIDs[#filteredIDs + 1] = buffCdID
-                end
-            end
-        end
+        -- Show every CDM buff aura. The tooltip word "stack" is an unreliable
+        -- filter — some stacking auras (IE Shadow Techniques) never say it.
+        -- Picking a non-stacking buff still works; it just shows 0 or 1 pip.
+        local filteredIDs = buffIDs
 
         local tracked = GetTrackedCooldownIDs()
         local cols = 16
@@ -2988,6 +3274,17 @@ local function BuildSettings()
                     row.abilIcon:SetSize(24, 24)
                     row.abilIcon:SetPoint("LEFT", row.cdColorBtn, "RIGHT", 4, 0)
                     row.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                    row.iconBtn = CreateFrame("Button", nil, row)
+                    row.iconBtn:SetAllPoints(row.abilIcon)
+                    row.iconBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                    local iconHl = row.iconBtn:CreateTexture(nil, "HIGHLIGHT")
+                    iconHl:SetAllPoints()
+                    iconHl:SetColorTexture(1, 0.82, 0, 0.18)
+                    row.iconOverrideDot = row:CreateTexture(nil, "OVERLAY")
+                    row.iconOverrideDot:SetSize(6, 6)
+                    row.iconOverrideDot:SetPoint("TOPRIGHT", row.abilIcon, "TOPRIGHT", 1, 1)
+                    row.iconOverrideDot:SetColorTexture(0.2, 1, 0.2, 1)
+                    row.iconOverrideDot:Hide()
                     row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
                     row.nameText:SetPoint("LEFT", row.abilIcon, "RIGHT", 4, 0)
                     row.nameText:SetWidth(106)
@@ -3018,11 +3315,58 @@ local function BuildSettings()
                 row:Show()
                 row:ClearAllPoints()
                 row:SetPoint("TOPLEFT", 0, -yOffset)
-                row.abilIcon:SetTexture(spellIcon)
+                local customIconID = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
+                local displayIcon = customIconID and C_Spell.GetSpellTexture(customIconID) or spellIcon
+                row.abilIcon:SetTexture(displayIcon)
                 row.abilIcon:SetDesaturated(isHidden and true or false)
+                if customIconID then
+                    row.iconOverrideDot:Show()
+                else
+                    row.iconOverrideDot:Hide()
+                end
                 row.nameText:SetText(spellName)
                 row.nameText:SetTextColor(isHidden and 0.5 or 1, isHidden and 0.5 or 0.82, isHidden and 0.5 or 0)
                 row.cb:SetChecked(not isHidden)
+
+                row.iconBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Bar Icon", 1, 1, 1)
+                    local cur = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
+                    if cur then
+                        local curName = C_Spell.GetSpellName(cur) or ("ID:" .. cur)
+                        GameTooltip:AddLine("Custom: " .. curName, 0.4, 1, 0.4, true)
+                        GameTooltip:AddLine("Left click to change. Right click to reset to the spell's own icon.", 0.7, 0.7, 0.7, true)
+                    else
+                        GameTooltip:AddLine("Left click to pick a custom icon. Right click resets to default.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:AddLine(" ", 1, 1, 1)
+                        GameTooltip:AddLine("Note: a custom icon stays fixed and won't change when the spell transforms (IE Mindbender to Shadowfiend).", 0.6, 0.6, 0.8, true)
+                    end
+                    GameTooltip:Show()
+                end)
+                row.iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                row.iconBtn:SetScript("OnClick", function(self, button)
+                    if button == "RightButton" then
+                        if CONFIG.customIcons and CONFIG.customIcons[cooldownID] then
+                            CONFIG.customIcons[cooldownID] = nil
+                            ns.SaveCurrentProfile()
+                            row.abilIcon:SetTexture(spellIcon)
+                            row.iconOverrideDot:Hide()
+                        end
+                        return
+                    end
+                    OpenSpellPicker({
+                        title = "Choose Bar Icon",
+                        anchor = self,
+                        onSelect = function(pickedID, pickedName, pickedIcon)
+                            CONFIG.customIcons = CONFIG.customIcons or {}
+                            CONFIG.customIcons[cooldownID] = pickedID
+                            ns.SaveCurrentProfile()
+                            local tex = pickedIcon or C_Spell.GetSpellTexture(pickedID)
+                            if tex then row.abilIcon:SetTexture(tex) end
+                            row.iconOverrideDot:Show()
+                        end,
+                    })
+                end)
 
                 local cdOverride = CONFIG.cooldownColors and CONFIG.cooldownColors[cooldownID]
                 local cdColor = cdOverride or CONFIG.cooldownColor

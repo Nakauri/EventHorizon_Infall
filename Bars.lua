@@ -1870,11 +1870,19 @@ local function MirrorECMState(row, cooldownViewerFrames)
         end
     end
 
-    -- Mirror ECM icon texture
+    -- Mirror ECM icon texture (unless a custom icon override is set)
     if not CONFIG.hideIcons then
-        local texOk, tex = pcall(getIconTexture, ecmFrame)
-        if texOk and tex then
-            row.icon:SetTexture(tex)
+        local customID = CONFIG.customIcons and CONFIG.customIcons[row.cooldownID]
+        if customID then
+            local customTex = C_Spell.GetSpellTexture(customID)
+            if customTex then
+                row.icon:SetTexture(customTex)
+            end
+        else
+            local texOk, tex = pcall(getIconTexture, ecmFrame)
+            if texOk and tex then
+                row.icon:SetTexture(tex)
+            end
         end
     end
     
@@ -3150,10 +3158,12 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     
     local spellInfo = C_Spell.GetSpellInfo(spellID)
     if spellInfo then
-        bar.icon:SetTexture(spellInfo.iconID)
         bar.spellName = spellInfo.name
+        local customID = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
+        local customTex = customID and C_Spell.GetSpellTexture(customID)
+        bar.icon:SetTexture(customTex or spellInfo.iconID)
     end
-    
+
     bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
     if isChargeSpell then
@@ -3644,8 +3654,11 @@ LoadEssentialCooldowns = function()
 
                 local spellInfo = C_Spell.GetSpellInfo(extra.spellID)
                 if spellInfo then
-                    bar.icon:SetTexture(spellInfo.iconID)
                     bar.spellName = spellInfo.name
+                    local extraCooldownID = extra.cooldownID or extra.spellID
+                    local customID = CONFIG.customIcons and CONFIG.customIcons[extraCooldownID]
+                    local customTex = customID and C_Spell.GetSpellTexture(customID)
+                    bar.icon:SetTexture(customTex or spellInfo.iconID)
                 end
                 bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
                 local buffColor = extra.buffColor or CONFIG.buffColor
@@ -5517,8 +5530,8 @@ UpdateAllSIPips = function()
             if config.indicatorType == "power" and config.powerType then
                 local ok, power = pcall(UnitPower, "player", config.powerType)
                 if ok then applications = power end
-            else
-                local buffFrame = config.cooldownID and persistentBuffMap[config.cooldownID]
+            elseif config.cooldownID then
+                local buffFrame = persistentBuffMap[config.cooldownID]
                 if buffFrame and buffFrame.auraInstanceID ~= nil then
                     local unit = buffFrame.auraDataUnit or "player"
                     local ok, auraData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, buffFrame.auraInstanceID)
