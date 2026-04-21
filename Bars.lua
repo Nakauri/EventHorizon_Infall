@@ -5039,6 +5039,7 @@ SlashCmdList["INFALL"] = function(msg)
             if n and n >= 0.5 and n <= 3.0 then
                 CONFIG.scale = n
                 EH_Parent:SetScale(n)
+                if ns.SyncStackContainerLayout then ns.SyncStackContainerLayout() end
                 if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
                 print("|cff00ff00[Infall]|r Scale set to " .. n)
             else
@@ -5425,7 +5426,6 @@ local function SyncStackLayout()
     local pipHeight = settings.pipHeight or 6
     local pipSpacing = settings.pipSpacing or 1
     local rowSpacing = settings.rowSpacing or 1
-    local containerWidth = EH_Parent:GetWidth()
 
     local function LayoutContainer(container, rows, isBottom)
         if not container then return end
@@ -5436,6 +5436,13 @@ local function SyncStackLayout()
         else
             container:SetPoint("BOTTOMLEFT", EH_Parent, "TOPLEFT", 0, gap)
             container:SetPoint("BOTTOMRIGHT", EH_Parent, "TOPRIGHT", 0, gap)
+        end
+
+        local containerWidth = container:GetWidth()
+        if not containerWidth or containerWidth <= 0 then
+            local ehScale = EH_Parent:GetScale() or 1
+            local cScale = container:GetScale() or 1
+            containerWidth = EH_Parent:GetWidth() * ehScale / cScale
         end
 
         local totalHeight = 0
@@ -5464,12 +5471,13 @@ local function SyncStackLayout()
                 local onePx = 768 / select(2, GetPhysicalScreenSize()) / es
                 local snap = function(v) return math.floor(v / onePx + 0.5) * onePx end
                 local snappedSpacing = snap(pipSpacing)
-                local idealPipW = (containerWidth - (numPips - 1) * snappedSpacing) / numPips
+                local snappedContainerW = snap(containerWidth)
+                local idealPipW = (snappedContainerW - (numPips - 1) * snappedSpacing) / numPips
                 local stride = idealPipW + snappedSpacing
                 for j, pip in ipairs(rowData.pips) do
                     local idx = j - 1
                     local startX = snap(idx * stride)
-                    local endX = (j == numPips) and containerWidth or snap(idx * stride + idealPipW)
+                    local endX = (j == numPips) and snappedContainerW or snap(idx * stride + idealPipW)
                     pip:ClearAllPoints()
                     pip:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", startX, 0)
                     pip:SetSize(endX - startX, rowH)
@@ -5516,6 +5524,7 @@ SyncStackContainerLayout = function()
         SyncStackLayout()
     end
 end
+ns.SyncStackContainerLayout = SyncStackContainerLayout
 
 UpdateAllSIPips = function()
     local list = GetSIList()
@@ -5649,6 +5658,9 @@ local function BuildSIIndicators()
         EH_Parent:HookScript("OnHide", function()
             if stackContainerTop then stackContainerTop:Hide() end
             if stackContainerBottom then stackContainerBottom:Hide() end
+        end)
+        EH_Parent:HookScript("OnSizeChanged", function()
+            if siIsBuilt then SyncStackLayout() end
         end)
         siHooksInstalled = true
     end

@@ -4797,6 +4797,7 @@ local function BuildSettings()
     local scaleSlider = CreateSlider(dispContent, "Scale", 0.5, 3.0, 0.05, CONFIG.scale, function(v)
         CONFIG.scale = v
         if EH_Parent then EH_Parent:SetScale(v) end
+        if ns.SyncStackContainerLayout then ns.SyncStackContainerLayout() end
         ns.SaveCurrentProfile()
     end)
     AddDispWidget(scaleSlider)
