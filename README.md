@@ -22,7 +22,7 @@ For class-specific spell configs, see the `ClassConfig/` folder. For a full guid
 
 `/infall` or `/infallhelp` for the full command list. Key commands:
 
-- `/infall setup` open settings
+- `/infall setup` or `/ehz` open settings
 - `/infall lock` / `/infall unlock` toggle frame dragging
 - `/infall scale <n>` set UI scale
 - `/infall reload` rebuild bars from CDM
