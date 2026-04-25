@@ -70,6 +70,16 @@ CONFIG.spellGeneration = {
 }
 
 -- ============================================================================
+-- CHARGE OVERFLOW
+-- For spells where a proc temporarily bumps maxCharges beyond the base value
+-- (granting a bonus charge). Locks the addon's lane count to trueMax so the
+-- bar never builds a 3rd lane in past or future regions.
+-- ============================================================================
+CONFIG.chargeOverflow = {
+    [8092] = { trueMax = 2 },  -- Mind Blast / Shadowy Insight
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================

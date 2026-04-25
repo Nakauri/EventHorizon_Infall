@@ -236,9 +236,14 @@ local function PreCacheChargeSpells()
             local resolvedID = (ovOk and ovID and ovID ~= spellID) and ovID or spellID
             local chargeInfo = GetChargesWithOverride(resolvedID, spellID)
             if chargeInfo and chargeInfo.maxCharges then
+                local override = CONFIG.chargeOverflow and CONFIG.chargeOverflow[spellID]
+                local cachedMax = chargeInfo.maxCharges
+                if override and override.trueMax and cachedMax > override.trueMax then
+                    cachedMax = override.trueMax
+                end
                 InfallDB.chargeSpells[cooldownID] = {
                     hasChargeMechanic = true,
-                    maxCharges = chargeInfo.maxCharges
+                    maxCharges = cachedMax
                 }
                 pcall(function()
                     if chargeInfo.cooldownDuration and chargeInfo.cooldownDuration > 0 then
@@ -1096,7 +1101,7 @@ local function FeedCdText(row, durObj)
     end
 end
 
-local function FeedHiddenCooldown(rowRef, timerType, durObj)
+local function FeedHiddenCooldown(rowRef, timerType, durObj, clearIfZero)
     local keys = hiddenKeys[timerType]
     if not keys then return end
     local cd = rowRef[keys.frame]
@@ -1105,8 +1110,9 @@ local function FeedHiddenCooldown(rowRef, timerType, durObj)
     if durObj == oldPtr then return end
     rowRef[keys.ptr] = durObj
 
+    local doClearIfZero = clearIfZero ~= false
     if durObj then
-        pcall(cd.SetCooldownFromDurationObject, cd, durObj, true)
+        pcall(cd.SetCooldownFromDurationObject, cd, durObj, doClearIfZero)
     else
         cd:SetCooldown(0, 0)
     end
@@ -1129,7 +1135,7 @@ FeedChargeBarTimers = function(row)
 
     local chargeOk, chargeDurObj = pcall(C_Spell.GetSpellChargeDuration, row.spellID)
     if not chargeOk then chargeDurObj = nil end
-    local cdOk, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
+    local cdOk, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID, true)
     if not cdOk then cdDurObj = nil end
     local cdInfoOk, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
     local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
@@ -1155,7 +1161,11 @@ FeedChargeBarTimers = function(row)
     row._chargeDurObj = chargeDurObj
     row._cdDurObj = cdDurObj
 
-    FeedHiddenCooldown(row, "charge", chargeDurObj)
+    FeedHiddenCooldown(row, "charge", chargeDurObj, false)
+    if chargesOk and chargeInfo and chargeInfo.isActive == false then
+        if row.hidden_charge then row.hidden_charge:SetCooldown(0, 0) end
+        row.lastPtr_charge = nil
+    end
     FeedHiddenCooldown(row, "cd", cdDurObj)
 
     if chargeDurObj and IMM_INTERP and REMAIN_DIR then
@@ -1890,7 +1900,7 @@ local function MirrorECMState(row, cooldownViewerFrames)
     if row.hasCharges then
         local ok, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
         if ok and chargeInfo then
-            row.chargeText:SetText(chargeInfo.currentCharges)
+            row.chargeText:SetText(chargeInfo.currentCharges .. "")
             row.chargeText:Show()
         else
             row.chargeText:Hide()
@@ -2742,6 +2752,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                             if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
                         end
                     end
+                    if row.chargeText and row.hasCharges then
+                        row.chargeText:SetText(cc .. "")
+                    end
                 end
 
                 local chargeDurObj = row._chargeDurObj
@@ -3096,28 +3109,33 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     local isChargeSpell = false
     local chargeInfo = GetChargesWithOverride(bar.spellID, spellID)
     local detectedMaxCharges
-    
+    local chargeOverride = CONFIG.chargeOverflow and CONFIG.chargeOverflow[bar.baseSpellID]
+    local maxCap = chargeOverride and chargeOverride.trueMax or nil
+
     if chargeInfo and chargeInfo.maxCharges then
         if issecretvalue and issecretvalue(chargeInfo.maxCharges) then
             -- Fall back to SavedVariables cache
             local saved = InfallDB.chargeSpells and InfallDB.chargeSpells[cooldownID]
             if saved then
                 local savedMax = type(saved) == "table" and saved.maxCharges or (saved == true and 2)
+                if maxCap and savedMax and savedMax > maxCap then savedMax = maxCap end
                 if savedMax and savedMax > 1 then
                     isChargeSpell = true
                     detectedMaxCharges = savedMax
                 end
             end
         else
-            if chargeInfo.maxCharges > 1 then
+            local effectiveMax = chargeInfo.maxCharges
+            if maxCap and effectiveMax > maxCap then effectiveMax = maxCap end
+            if effectiveMax > 1 then
                 isChargeSpell = true
-                detectedMaxCharges = chargeInfo.maxCharges
+                detectedMaxCharges = effectiveMax
             end
             InfallDB.chargeSpells = InfallDB.chargeSpells or {}
-            if chargeInfo.maxCharges > 1 then
+            if effectiveMax > 1 then
                 InfallDB.chargeSpells[cooldownID] = {
                     hasChargeMechanic = true,
-                    maxCharges = chargeInfo.maxCharges
+                    maxCharges = effectiveMax
                 }
             else
                 InfallDB.chargeSpells[cooldownID] = nil
@@ -3135,10 +3153,37 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
 
     bar.isChargeSpell = isChargeSpell
 
+    local prevMaxCharges = bar.maxCharges
     if isChargeSpell then
         bar.maxCharges = detectedMaxCharges or 2
     else
         bar.maxCharges = 1
+    end
+
+    if prevMaxCharges and prevMaxCharges ~= bar.maxCharges then
+        local cdColor = GetCooldownColor(bar)
+        if bar.activeChargeSlide then
+            bar.activeChargeSlide.tex:SetAlpha(bar.activeChargeSlide.color[4] or cdColor[4] or 0.5)
+            DetachPastSlide(bar.activeChargeSlide)
+            bar.activeChargeSlide = nil
+            bar._chargeSpawnTime = nil
+        end
+        if bar.activeDepletedSlide then
+            bar.activeDepletedSlide.tex:SetAlpha(bar.activeDepletedSlide.color[4] or cdColor[4] or 0.5)
+            DetachPastSlide(bar.activeDepletedSlide)
+            bar.activeDepletedSlide = nil
+            bar._depletedSpawnTime = nil
+        end
+        if bar.middleLanes then
+            for _, ml in ipairs(bar.middleLanes) do
+                if ml.activeSlide then
+                    ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or cdColor[4] or 0.5)
+                    DetachPastSlide(ml.activeSlide)
+                    ml.activeSlide = nil
+                    ml._slideSpawnTime = nil
+                end
+            end
+        end
     end
     
     if isChargeSpell and chargeInfo then
@@ -3241,12 +3286,12 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.notDepletedWrapper:Show()
 
         local bottomY = -(barHeight - laneH)
-        bar.depletedCdBar:SetParent(bar)
+        bar.depletedCdBar:SetParent(bar.depletedWrapper)
         bar.depletedCdBar:SetFrameLevel(bar:GetFrameLevel() + 1)
         bar.depletedCdBar:ClearAllPoints()
         bar.depletedCdBar:SetSize(futureWidth, laneH)
         bar.depletedCdBar:SetMinMaxValues(0, CONFIG.future)
-        bar.depletedCdBar:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
+        bar.depletedCdBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", 0, 0)
         bar.depletedCdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         local bottomSlotPx = (maxC - 1) * slotPx
@@ -3416,7 +3461,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         end
 
         bar.cdBar:Hide()
-    
+
     else
         if bar.depletedWrapper then
             bar.depletedWrapper:Hide()
@@ -4707,9 +4752,14 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                     local cInfo = GetChargesWithOverride(row.spellID, row.baseSpellID)
                     if cInfo and cInfo.currentCharges then
                         if not issecretvalue(cInfo.maxCharges) then
-                            row.maxCharges = cInfo.maxCharges
+                            local override = CONFIG.chargeOverflow and CONFIG.chargeOverflow[row.baseSpellID]
+                            local effectiveMax = cInfo.maxCharges
+                            if override and override.trueMax and effectiveMax > override.trueMax then
+                                effectiveMax = override.trueMax
+                            end
+                            row.maxCharges = effectiveMax
                             local bH = row.cdBar.fullHeight or CONFIG.height
-                            row.cdBar.laneHeight = (bH - (cInfo.maxCharges - 1)) / cInfo.maxCharges
+                            row.cdBar.laneHeight = (bH - (effectiveMax - 1)) / effectiveMax
                         end
                     end
                     FeedChargeBarTimers(row)
@@ -4767,6 +4817,19 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 end)
 
 -- Slash commands
+
+SLASH_INFALLSETUP1 = "/ehz"
+SlashCmdList["INFALLSETUP"] = function()
+    if InCombatLockdown() then
+        print("|cff00ff00[Infall]|r Cannot open settings in combat.")
+        return
+    end
+    if ns.OpenSettings then
+        ns.OpenSettings()
+    else
+        print("|cff00ff00[Infall]|r Settings not loaded yet.")
+    end
+end
 
 SLASH_INFALL1 = "/infall"
 SlashCmdList["INFALL"] = function(msg)

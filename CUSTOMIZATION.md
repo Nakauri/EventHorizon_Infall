@@ -5,7 +5,7 @@ This guide explains every setting you can change in Infall.
 
 ## Settings GUI (The Easy Way)
 
-Type `/infall setup` or go to **Escape > Options > AddOns > EventHorizon Infall** to open the settings panel. From there you can change everything without editing files: bar layout, colours, fonts, toggles, buff pairings, cast pairings, stack tracking, and more. Changes are saved per character and per spec automatically.
+Type `/ehz` (or `/infall setup`) or go to **Escape > Options > AddOns > EventHorizon Infall** to open the settings panel. From there you can change everything without editing files: bar layout, colours, fonts, toggles, buff pairings, cast pairings, stack tracking, and more. Changes are saved per character and per spec automatically.
 
 The settings panel has seven tabs:
 
@@ -78,7 +78,7 @@ These flip a feature on or off each time you run them. Changes are saved to your
 |---|---|
 | `/infall` | Show all available commands |
 | `/infall reload` | Reload cooldown bars (use after changing WoW cooldown settings if they're stuck). Also available as `/infall r` |
-| `/infall setup` | Open the Infall settings panel (ESC > Options > AddOns > EventHorizon Infall) |
+| `/infall setup` | Open the Infall settings panel (ESC > Options > AddOns > EventHorizon Infall). Also available as `/ehz` |
 | `/infall reactive` | Toggle reactive icon colouring where icons change colour based on usability, range, and mana. Also enables cooldown swirl overlays on icons |
 | `/infall desat` | Toggle greying out icons while the ability is on cooldown |
 | `/infall redshift` | Toggle Redshift, which hides the frame when you're out of combat with no target. Also available as `/infall rs` |

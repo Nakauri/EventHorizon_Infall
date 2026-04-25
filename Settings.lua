@@ -2820,7 +2820,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.2")
+    versionText:SetText("v1.3.3")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
