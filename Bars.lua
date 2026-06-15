@@ -985,6 +985,7 @@ local function UpdateAllMinMax()
         if row.cdBar then row.cdBar:SetMinMaxValues(0, CONFIG.future) end
         if row.buffBar then row.buffBar:SetMinMaxValues(0, CONFIG.future) end
         if row.buffBarOverlay then row.buffBarOverlay:SetMinMaxValues(0, CONFIG.future) end
+        if row.buffBarThird then row.buffBarThird:SetMinMaxValues(0, CONFIG.future) end
         if row.gcdBar then row.gcdBar:SetMinMaxValues(0, CONFIG.future) end
     end
 end
@@ -1157,7 +1158,6 @@ FeedChargeBarTimers = function(row)
         end
     end
 
-    row._cachedChargeInfo = chargesOk and chargeInfo or nil
     row._chargeDurObj = chargeDurObj
     row._cdDurObj = cdDurObj
 
@@ -1237,7 +1237,7 @@ local function CreateCooldownBar(spellID, index)
     fadeOut:SetSmoothing("IN_OUT")
     fadeOut:SetStartDelay(0.6)
     
-    local spellInfo = C_Spell.GetSpellInfo(spellID)
+    local spellInfo = spellID and C_Spell.GetSpellInfo(spellID) or nil
     if spellInfo then
         row.icon:SetTexture(spellInfo.iconID)
         row.spellName = spellInfo.name
@@ -1295,8 +1295,6 @@ local function CreateCooldownBar(spellID, index)
     row.variantNameText:Hide()
 
     -- Engine-driven cooldown duration text (text-only Cooldown frame).
-    -- Cooldown text addons may override font/colour/position; configure them to
-    -- ignore these frames if needed.
     local cdTextOk, cdTextFrame = pcall(CreateFrame, "Cooldown", nil, row.barTextOverlay, "CooldownFrameTemplate")
     if cdTextOk and cdTextFrame then
         row.cdTextCooldown = cdTextFrame
@@ -1359,7 +1357,6 @@ local function CreateCooldownBar(spellID, index)
     row.lastPtr_buff = nil
     row.lastPtr_overlay = nil
     row.lastPtr_third = nil
-    row.wasOnGCD = false
 
     -- Cast bar texture
     row.castFrame = CreateFrame("Frame", nil, row)
@@ -1913,26 +1910,17 @@ end
 local function UpdateRowCooldown(row)
     if row.isChargeSpell then return end
     if row.extrasType == "potion" or row.extrasType == "trinket" then return end
+    if row.extrasType == "custom" then return end
     
-    local successCD, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID)
-    
-    -- When isOnGCD, only the GCD is active.
-    local cdInfoSuccess, cdInfo = pcall(C_Spell.GetSpellCooldown, row.spellID)
-    local isOnGCD = cdInfoSuccess and cdInfo and cdInfo.isOnGCD
+    -- ignoreGCD=true returns the real cooldown, zero-span during a pure GCD.
+    local successCD, cdDurObj = pcall(C_Spell.GetSpellCooldownDuration, row.spellID, true)
 
-    -- GCD falling edge: clear hidden frame, skip feed
-    local gcdJustEnded = row.wasOnGCD and not isOnGCD
-    row.wasOnGCD = isOnGCD or false
-    if gcdJustEnded and row.hidden_cd then
-        row.hidden_cd:SetCooldown(0, 0)
-        row.lastPtr_cd = nil
-    end
+    -- Zero-span clears hidden_cd; IsShown() then gates the bar.
+    FeedHiddenCooldown(row, "cd", successCD and cdDurObj or nil)
 
-    if successCD and cdDurObj and not isOnGCD and not gcdJustEnded then
+    if successCD and cdDurObj and row.hidden_cd and row.hidden_cd:IsShown() then
         row.activeCooldown = cdDurObj
         if not row.cdBar:IsShown() then row.cdBar:Show() end
-
-        FeedHiddenCooldown(row, "cd", cdDurObj)
 
         if CONFIG.reactiveIcons and not CONFIG.hideIcons and row.cooldownFrame and cdDurObj ~= row.lastCdDurObj then
             pcall(row.cooldownFrame.SetCooldownFromDurationObject, row.cooldownFrame, cdDurObj, false)
@@ -1944,11 +1932,6 @@ local function UpdateRowCooldown(row)
         row.cdBar:Hide()
         row.lastCdDurObj = nil
         if row.cooldownFrame then row.cooldownFrame:Hide() end
-        -- Clear stale hidden_cd timer
-        if row.hidden_cd and row.hidden_cd:IsShown() then
-            row.hidden_cd:SetCooldown(0, 0)
-            row.lastPtr_cd = nil
-        end
     end
 end
 
@@ -2019,7 +2002,7 @@ local _overlayBuffEntry = {}
 local _thirdBuffEntry = {}
 
 UpdateBuffState = function(row, buffViewerFrames)
-    if row.isExtras then return end
+    if row.isExtras and row.extrasType ~= "custom" then return end
     -- Each mapping entry owns a fixed lane: [1] = primary, [2] = overlay, [3] = third.
     local primaryBuff, overlayBuff, thirdBuff
     local mappings = row.cooldownID and CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
@@ -2738,7 +2721,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
             -- Charge bars
             if row.isChargeSpell and row.depletedWrapper then
-                -- Per-frame charge count feed (SI pip pattern: fresh API → SetValue)
+                -- Per-frame charge count feed
                 local cOk, cInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
                 if cOk and cInfo then
                     local cc = cInfo.currentCharges
@@ -2979,7 +2962,6 @@ local function ResetBarState(bar)
     bar.lastPtr_buff = nil
     bar.lastPtr_overlay = nil
     bar.lastPtr_third = nil
-    bar.wasOnGCD = false
     if bar.hidden_cd then bar.hidden_cd:SetCooldown(0, 0) end
     if bar.hidden_charge then bar.hidden_charge:SetCooldown(0, 0) end
     if bar.hidden_buff then bar.hidden_buff:SetCooldown(0, 0) end
@@ -2987,7 +2969,6 @@ local function ResetBarState(bar)
     if bar.hidden_third then bar.hidden_third:SetCooldown(0, 0) end
 
     bar._buffDirty = false
-    bar._cachedChargeInfo = nil
     bar.isExtras = nil
     bar.extrasType = nil
     bar.extrasKey = nil
@@ -3681,13 +3662,16 @@ LoadEssentialCooldowns = function()
                 if bar then
                     ResetBarState(bar)
                 else
-                    bar = CreateCooldownBar(extra.spellID, nextIdx)
+                    bar = CreateCooldownBar(extra.spellID or extra.iconSpellID, nextIdx)
                     table.insert(barPool, bar)
                 end
 
-                bar.spellID = extra.spellID
-                bar.baseSpellID = extra.spellID
-                bar.cooldownID = extra.cooldownID or extra.spellID
+                local isCustom = extra.type == "custom"
+                local iconSourceID = isCustom and extra.iconSpellID or extra.spellID
+
+                bar.spellID = isCustom and nil or extra.spellID
+                bar.baseSpellID = isCustom and nil or extra.spellID
+                bar.cooldownID = isCustom and extra.key or (extra.cooldownID or extra.spellID)
                 bar.isExtras = true
                 bar.extrasType = extra.type
                 bar.extrasKey = extra.key
@@ -3697,13 +3681,18 @@ LoadEssentialCooldowns = function()
                 bar._isMultiVariant = false
                 bar._buffCooldownIDs = nil
 
-                local spellInfo = C_Spell.GetSpellInfo(extra.spellID)
+                local spellInfo = iconSourceID and C_Spell.GetSpellInfo(iconSourceID)
                 if spellInfo then
-                    bar.spellName = spellInfo.name
-                    local extraCooldownID = extra.cooldownID or extra.spellID
-                    local customID = CONFIG.customIcons and CONFIG.customIcons[extraCooldownID]
+                    bar.spellName = isCustom and (extra.label or "Custom Row") or spellInfo.name
+                    local lookupID = bar.cooldownID
+                    local customID = CONFIG.customIcons and CONFIG.customIcons[lookupID]
                     local customTex = customID and C_Spell.GetSpellTexture(customID)
-                    bar.icon:SetTexture(customTex or spellInfo.iconID)
+                    -- For custom rows, prefer the stored picker texture so spec overrides cannot remap the icon.
+                    local resolvedIcon = (isCustom and extra.iconTexture) or customTex or spellInfo.iconID
+                    bar.icon:SetTexture(resolvedIcon)
+                elseif isCustom then
+                    bar.spellName = extra.label or "Custom Row"
+                    bar.icon:SetTexture(extra.iconTexture or 134400)
                 end
                 bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
                 local buffColor = extra.buffColor or CONFIG.buffColor
@@ -3719,8 +3708,13 @@ LoadEssentialCooldowns = function()
                     bar._extrasItemID = extra.itemID or (POTION_BUFF_LOOKUP[extra.spellID] and POTION_BUFF_LOOKUP[extra.spellID].itemID)
                 end
 
+                if isCustom then
+                    bar.cdBar:Hide()
+                    bar.activeCooldown = nil
+                end
+
                 -- Restore active timers from persistent cache (survives bar rebuilds)
-                local cached = ns._activeExtrasTimers[extra.key]
+                local cached = (not isCustom) and ns._activeExtrasTimers[extra.key] or nil
                 if cached then
                     local now = GetTime()
                     if cached.buffExpiry and cached.buffExpiry > now and cached.buffDuration then
@@ -4472,7 +4466,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- Trinket extras detection (same pattern as potions)
+        -- Trinket extras detection
         if TRINKET_SPELL_LOOKUP[spellID] then
             for _, row in ipairs(cooldownBars) do
                 if row.extrasType == "trinket" and row._potionBuffSpellID == spellID then
@@ -4502,7 +4496,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- Racial extras buff detection (hardcoded durations, same pattern as potions)
+        -- Racial extras buff detection (hardcoded durations)
         for _, row in ipairs(cooldownBars) do
             if row.extrasType == "racial" and row.spellID == spellID then
                 local buffDuration = RACIAL_BUFF_DURATIONS[spellID]
@@ -4659,8 +4653,8 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         if row.buffBarThird then row.buffBarThird:Hide() end
                         FeedHiddenCooldown(row, "third", nil)
                     end
-                    -- Extras buff removal (racials only; potions/trinkets use expiry timer)
-                    if row.isExtras and row.extrasType ~= "potion" and row.extrasType ~= "trinket" and row._extrasAuraInstanceID == removedID then
+                    -- Extras buff removal (racials only; potions/trinkets use expiry timer, custom rows use buffMappings)
+                    if row.isExtras and row.extrasType ~= "potion" and row.extrasType ~= "trinket" and row.extrasType ~= "custom" and row._extrasAuraInstanceID == removedID then
                         row._extrasAuraInstanceID = nil
                         row._extrasBuffExpiry = nil
                         row.activeBuffDuration = nil
@@ -4679,7 +4673,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 local aSpellId = auraData.spellId
                 if aSpellId and not (issecretvalue and issecretvalue(aSpellId)) then
                     for _, row in ipairs(cooldownBars) do
-                        if row.isExtras then
+                        if row.isExtras and row.extrasType ~= "custom" then
                             local matchID = row._potionBuffSpellID or row.spellID
                             if matchID == aSpellId then
                                 row._extrasAuraInstanceID = auraData.auraInstanceID
@@ -5073,9 +5067,9 @@ SlashCmdList["INFALL"] = function(msg)
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
         
         if CONFIG.buffLayerAbove then
-            print("|cff00ff00[Infall]|r Buff bars: drawn |cff00ff00ABOVE|r cooldown bars")
+            print("|cff00ff00[Infall]|r Buff fill: drawn |cff00ff00ON TOP OF|r cooldown fill")
         else
-            print("|cff00ff00[Infall]|r Buff bars: drawn |cffff9900BELOW|r cooldown bars")
+            print("|cff00ff00[Infall]|r Buff fill: drawn |cffff9900BEHIND|r cooldown fill")
         end
         
         for _, row in ipairs(cooldownBars) do

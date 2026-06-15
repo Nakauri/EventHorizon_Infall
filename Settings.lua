@@ -1008,49 +1008,135 @@ local spellPickerCache
 local spellPickerCacheDirty = true
 local spellPickerCurrentOpts
 
+-- Common consumables / class buffs not always in the player's spellbook.
+-- Used so name search in the picker can find things like Healthstone, Phial of Tepid Versatility, etc.
+local PICKER_COMMON_SPELLS = {
+    6262,    -- Healthstone
+    433889,  -- Algari Healing Potion
+    432021,  -- Cavedweller's Delight (Algari mana)
+    432128,  -- Tempered Potion (primary stat)
+    431932,  -- Slumbering Soul Serum
+    432011,  -- Draught of Silent Footfalls
+    431893,  -- Phial of Tepid Versatility
+    431914,  -- Phial of Glacial Fury
+    431932,  -- Phial of Truesight
+    431945,  -- Phial of Charged Isolation
+    431971,  -- Phial of Tempered Aggression
+    432013,  -- Phial of Tepid Versatility
+    228600,  -- Bloodlust
+    32182,   -- Heroism
+    80353,   -- Time Warp
+    264667,  -- Primal Rage
+    390386,  -- Fury of the Aspects
+    23989,   -- Readiness (Hunter racial-like)
+    1044,    -- Blessing of Freedom (Paladin)
+    6940,    -- Blessing of Sacrifice
+    1022,    -- Blessing of Protection
+    633,     -- Lay on Hands
+    97462,   -- Rallying Cry (Warrior)
+    871,     -- Shield Wall
+    98008,   -- Spirit Link Totem (Shaman)
+    108271,  -- Astral Shift
+    207399,  -- Ancestral Protection Totem
+    47788,   -- Guardian Spirit
+    33206,   -- Pain Suppression
+    62618,   -- Power Word: Barrier
+    102342,  -- Ironbark (Druid)
+    740,     -- Tranquility
+    115310,  -- Revival (Monk)
+    115203,  -- Fortifying Brew (Monk)
+    122470,  -- Touch of Karma
+    642,     -- Divine Shield
+    498,     -- Divine Protection
+    31224,   -- Cloak of Shadows
+    1856,    -- Vanish
+    5277,    -- Evasion
+    104773,  -- Unending Resolve (Warlock)
+    108416,  -- Dark Pact
+    186265,  -- Aspect of the Turtle (Hunter)
+    19263,   -- Deterrence/Disengage related
+    198589,  -- Blur (Demon Hunter)
+    196555,  -- Netherwalk
+    187827,  -- Metamorphosis (DH tank)
+    55233,   -- Vampiric Blood (Death Knight)
+    48707,   -- Anti-Magic Shell
+    48792,   -- Icebound Fortitude
+    49028,   -- Dancing Rune Weapon
+    363916,  -- Obsidian Scales (Evoker)
+    374348,  -- Renewing Blaze
+    370960,  -- Emerald Communion
+    45438,   -- Ice Block (Mage)
+    113862,  -- Greater Invisibility
+    342245,  -- Alter Time (newer)
+    342246,  -- Alter Time return
+    198111,  -- Temporal Shield
+}
+
 local function BuildSpellPickerCache()
     local list = {}
     local seen = {}
 
+    local function addEntry(spellID, name, icon, tab)
+        if not spellID or seen[spellID] then return end
+        name = name or C_Spell.GetSpellName(spellID)
+        if not name or name == "" then return end
+        icon = icon or C_Spell.GetSpellTexture(spellID) or 134400
+        seen[spellID] = true
+        list[#list + 1] = {
+            spellID = spellID,
+            name = name,
+            nameLower = name:lower(),
+            icon = icon,
+            tab = tab,
+        }
+    end
+
     local getTabs = C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines
     local getLine = C_SpellBook and C_SpellBook.GetSpellBookSkillLineInfo
     local getItem = C_SpellBook and C_SpellBook.GetSpellBookItemInfo
-    if not (getTabs and getLine and getItem) then
-        spellPickerCache = list
-        spellPickerCacheDirty = false
-        return list
-    end
-
-    local playerBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
-    local spellType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Spell
-    local numTabs = getTabs() or 0
-    for t = 1, numTabs do
-        local info = getLine(t)
-        if info and not info.shouldHide then
-            local offset = info.itemIndexOffset or 0
-            local count = info.numSpellBookItems or 0
-            for i = 1, count do
-                local idx = offset + i
-                local ok, data = pcall(getItem, idx, playerBank)
-                if ok and data and data.spellID and not seen[data.spellID] then
-                    local typeOk = (spellType == nil) or (data.itemType == spellType)
-                    if typeOk then
-                        seen[data.spellID] = true
-                        local name = data.name or C_Spell.GetSpellName(data.spellID)
-                        if name and name ~= "" then
-                            local icon = data.iconID or C_Spell.GetSpellTexture(data.spellID) or 134400
-                            list[#list + 1] = {
-                                spellID = data.spellID,
-                                name = name,
-                                nameLower = name:lower(),
-                                icon = icon,
-                                tab = info.name,
-                            }
+    if getTabs and getLine and getItem then
+        local playerBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
+        local spellType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Spell
+        local numTabs = getTabs() or 0
+        for t = 1, numTabs do
+            local info = getLine(t)
+            if info and not info.shouldHide then
+                local offset = info.itemIndexOffset or 0
+                local count = info.numSpellBookItems or 0
+                for i = 1, count do
+                    local idx = offset + i
+                    local ok, data = pcall(getItem, idx, playerBank)
+                    if ok and data and data.spellID then
+                        local typeOk = (spellType == nil) or (data.itemType == spellType)
+                        if typeOk then
+                            addEntry(data.spellID, data.name, data.iconID, info.name)
                         end
                     end
                 end
             end
         end
+    end
+
+    -- CDM cooldownIDs across all categories: surfaces class abilities the player does not have learned
+    -- (so the user can pick icons for cross class buffs they want to track).
+    if C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCategorySet then
+        for category = 0, 3 do
+            local catOk, catIDs = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category, true)
+            if catOk and catIDs then
+                for _, cdID in ipairs(catIDs) do
+                    local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
+                    if infoOk and info then
+                        local sID = info.overrideTooltipSpellID or info.overrideSpellID or info.spellID
+                        if sID then addEntry(sID, nil, nil, "CDM") end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Common consumables and cross class buffs by spellID
+    for _, sID in ipairs(PICKER_COMMON_SPELLS) do
+        addEntry(sID, nil, nil, "Common")
     end
 
     table.sort(list, function(a, b) return a.nameLower < b.nameLower end)
@@ -1170,6 +1256,24 @@ local function BuildSpellPickerFrame()
         local seenIDs = {}
         for _, e in ipairs(results) do
             if e.spellID then seenIDs[e.spellID] = true end
+        end
+
+        -- If the search box is a number, surface "Use spell ID N" as the top result
+        -- so the user can pick icons for spells outside their spellbook.
+        local typedID = tonumber(query)
+        if typedID and typedID > 0 and not seenIDs[typedID] then
+            local nameOk, nameVal = pcall(C_Spell.GetSpellName, typedID)
+            local texOk, texVal = pcall(C_Spell.GetSpellTexture, typedID)
+            local resolvedName = (nameOk and nameVal) or ("Spell " .. typedID)
+            local resolvedIcon = (texOk and texVal) or 134400
+            table.insert(results, 1, {
+                spellID = typedID,
+                name = resolvedName,
+                nameLower = resolvedName:lower(),
+                icon = resolvedIcon,
+                tag = "Use spell ID " .. typedID,
+            })
+            seenIDs[typedID] = true
         end
 
         for _, e in ipairs(spellPickerCache) do
@@ -2820,7 +2924,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.3")
+    versionText:SetText("v1.3.5")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -2918,6 +3022,8 @@ local function BuildSettings()
     local castPoolCacheCount = 0
     local extrasRowCache = {}
     local extrasRowCacheCount = 0
+    local customRowCache = {}
+    local customRowCacheCount = 0
     local extrasHeaderFrame
     local profileBtnCache = {}
     local profileBtnCacheCount = 0
@@ -3214,6 +3320,387 @@ local function BuildSettings()
 
     -- Cached empty-state text (one per pool).
     local emptyRowsText, emptyBuffsText, emptyCastsText
+
+    -- Wires up the Buff 1/2/3, Cast 1/2, and Stack slot widgets on a row.
+    -- Used by Custom Rows in the Extras section. Reads + writes CONFIG.buffMappings[cooldownID],
+    -- CONFIG.extraCasts[cooldownID], and CONFIG.stackMappings[cooldownID].
+    local function WireSlots(row, cooldownID)
+        local buff1Slot, buff1ColorBtn = row.buff1Slot, row.buff1ColorBtn
+        local buff2Slot, buff2ColorBtn = row.buff2Slot, row.buff2ColorBtn
+        local buff3Slot, buff3ColorBtn = row.buff3Slot, row.buff3ColorBtn
+        local cast1Slot, cast1ColorBtn = row.cast1Slot, row.cast1ColorBtn
+        local cast2Slot, cast2ColorBtn = row.cast2Slot, row.cast2ColorBtn
+        local stackSlot, stackColorBtn = row.stackSlot, row.stackColorBtn
+
+        buff1Slot.icon:Hide(); buff1Slot.pairedCooldownID = nil; buff1Slot.pairedColor = nil; buff1ColorBtn:Hide()
+        buff2Slot.icon:Hide(); buff2Slot.pairedCooldownID = nil; buff2Slot.pairedColor = nil; buff2ColorBtn:Hide()
+        buff3Slot.icon:Hide(); buff3Slot.pairedCooldownID = nil; buff3Slot.pairedColor = nil; buff3ColorBtn:Hide()
+        cast1Slot.icon:Hide(); cast1Slot.pairedSpellID = nil; cast1Slot.pairedColor = nil; cast1ColorBtn:Hide()
+        cast2Slot.icon:Hide(); cast2Slot.pairedSpellID = nil; cast2Slot.pairedColor = nil; cast2ColorBtn:Hide()
+        stackSlot.icon:Hide(); stackSlot.pairedCooldownID = nil; stackSlot.pairedColor = nil; stackColorBtn:Hide()
+
+        buff1Slot.slotType = "buff"; buff2Slot.slotType = "buff"; buff3Slot.slotType = "buff"
+        cast1Slot.slotType = "cast"; cast2Slot.slotType = "cast"
+        stackSlot.slotType = "stack"
+        allSlotFrames[#allSlotFrames + 1] = buff1Slot
+        allSlotFrames[#allSlotFrames + 1] = buff2Slot
+        allSlotFrames[#allSlotFrames + 1] = buff3Slot
+        allSlotFrames[#allSlotFrames + 1] = cast1Slot
+        allSlotFrames[#allSlotFrames + 1] = cast2Slot
+        allSlotFrames[#allSlotFrames + 1] = stackSlot
+
+        -- Populate buff slots from mappings
+        local mappings = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+        local function applyBuffSlot(slot, colorBtn, m)
+            if not (m and m.buffCooldownIDs and m.buffCooldownIDs[1]) then return end
+            local bID = m.buffCooldownIDs[1]
+            local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, bID)
+            local sID = infoOk and info and (info.overrideTooltipSpellID or info.overrideSpellID or info.spellID)
+            local icon = sID and C_Spell.GetSpellTexture(sID) or 134400
+            slot.icon:SetTexture(icon)
+            slot.icon:Show()
+            slot.pairedCooldownID = bID
+            slot.pairedColor = m.color
+            local c = m.color or (m.unit == "target" and CONFIG.debuffColor) or (m.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+            colorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+            colorBtn:Show()
+            colorBtn.procDot:SetShown(m.requireGlow == true)
+        end
+        if mappings then
+            applyBuffSlot(buff1Slot, buff1ColorBtn, mappings[1])
+            applyBuffSlot(buff2Slot, buff2ColorBtn, mappings[2])
+            applyBuffSlot(buff3Slot, buff3ColorBtn, mappings[3])
+        end
+
+        -- Populate cast slots from extraCasts
+        local extraCasts = CONFIG.extraCasts and CONFIG.extraCasts[cooldownID]
+        if extraCasts then
+            for slotIdx, slotPair in ipairs({{cast1Slot, cast1ColorBtn}, {cast2Slot, cast2ColorBtn}}) do
+                local sID = extraCasts[slotIdx]
+                if sID then
+                    local icon = C_Spell.GetSpellTexture(sID) or 134400
+                    slotPair[1].icon:SetTexture(icon)
+                    slotPair[1].icon:Show()
+                    slotPair[1].pairedSpellID = sID
+                    local cc = CONFIG.castColors and CONFIG.castColors[sID]
+                    slotPair[1].pairedColor = cc and DeepCopy(cc) or DeepCopy(CONFIG.castColor)
+                    slotPair[2].tex:SetColorTexture(slotPair[1].pairedColor[1], slotPair[1].pairedColor[2], slotPair[1].pairedColor[3], slotPair[1].pairedColor[4] or 1)
+                    slotPair[2]:Show()
+                end
+            end
+        end
+
+        -- Populate stack slot
+        local stackMapping = CONFIG.stackMappings and CONFIG.stackMappings[cooldownID]
+        if stackMapping and stackMapping.buffCooldownID then
+            local sInfoOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, stackMapping.buffCooldownID)
+            local sSID = sInfoOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
+            local sIcon = sSID and C_Spell.GetSpellTexture(sSID) or 134400
+            stackSlot.icon:SetTexture(sIcon)
+            stackSlot.icon:Show()
+            stackSlot.pairedCooldownID = stackMapping.buffCooldownID
+            stackSlot.pairedColor = stackMapping.color and DeepCopy(stackMapping.color) or DeepCopy(CONFIG.stackTextColor)
+            stackColorBtn.tex:SetColorTexture(stackSlot.pairedColor[1], stackSlot.pairedColor[2], stackSlot.pairedColor[3], stackSlot.pairedColor[4] or 1)
+            stackColorBtn:Show()
+        end
+
+        -- Slot tooltips
+        local function buffSlotTooltip(self, slotName)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if self.pairedCooldownID then
+                local bOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, self.pairedCooldownID)
+                local bSpellID = bOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
+                local bName = bSpellID and C_Spell.GetSpellName(bSpellID) or ("ID:" .. tostring(self.pairedCooldownID))
+                GameTooltip:SetText(slotName .. ": " .. bName, 1, 1, 1)
+                GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
+                GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
+            else
+                GameTooltip:SetText(slotName .. " Slot (empty)", 0.6, 0.6, 0.6)
+                if selectedBuff then
+                    GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
+                else
+                    GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                end
+            end
+            GameTooltip:Show()
+        end
+        buff1Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 1") end)
+        buff1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buff2Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 2") end)
+        buff2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buff3Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 3") end)
+        buff3Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+        local function PairBuff(slot, colorBtn, slotIndex)
+            return function(self, button)
+                if button == "RightButton" and self.pairedCooldownID then
+                    self.pairedCooldownID = nil; self.pairedColor = nil
+                    slot.icon:Hide(); colorBtn:Hide(); colorBtn.procDot:Hide()
+                    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    if m then
+                        if slotIndex == 1 then table.remove(m, 1)
+                        elseif slotIndex == 2 and #m >= 2 then table.remove(m, 2)
+                        elseif slotIndex == 3 and #m >= 3 then table.remove(m, 3) end
+                    end
+                    ns.SaveCurrentProfile(); LoadEssentialCooldowns(); RefreshCooldownRows()
+                    return
+                end
+                if selectedType == "cast" then
+                    statusText:SetText("|cffff6666Select a buff from the Buffs pool, not the Casts pool.|r"); return
+                end
+                if not selectedBuff or selectedType ~= "buff" then
+                    SelectPoolTab(1)
+                    statusText:SetText("|cff88bbffSelect a buff from the Buffs pool.|r"); return
+                end
+                -- Enforce slot ordering
+                if slotIndex == 2 then
+                    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    local s1 = m and m[1] and m[1].buffCooldownIDs and #m[1].buffCooldownIDs > 0
+                    if not s1 then statusText:SetText("|cffff6666Pair Buff 1 first before using Buff 2.|r"); return end
+                elseif slotIndex == 3 then
+                    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                    local s2 = m and m[2] and m[2].buffCooldownIDs and #m[2].buffCooldownIDs > 0
+                    if not s2 then statusText:SetText("|cffff6666Pair Buff 1 and 2 first before using Buff 3.|r"); return end
+                end
+                local buffCdID = selectedBuff
+                local bOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+                local bSID = bOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
+                local bIcon = bSID and C_Spell.GetSpellTexture(bSID) or 134400
+                slot.icon:SetTexture(bIcon); slot.icon:Show()
+                self.pairedCooldownID = buffCdID
+                local isDebuff = bSID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSID)
+                local defaultColor = isDebuff and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
+                if slotIndex >= 2 then defaultColor[4] = 0.3 end
+                self.pairedColor = defaultColor
+                colorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
+                colorBtn:Show()
+                CONFIG.buffMappings = CONFIG.buffMappings or {}
+                CONFIG.buffMappings[cooldownID] = CONFIG.buffMappings[cooldownID] or {}
+                local mapping = { buffCooldownIDs = {buffCdID}, color = defaultColor }
+                if isDebuff then mapping.unit = "target" end
+                CONFIG.buffMappings[cooldownID][slotIndex] = mapping
+                ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
+                statusText:SetText("")
+            end
+        end
+        buff1Slot:SetScript("OnClick", PairBuff(buff1Slot, buff1ColorBtn, 1))
+        buff2Slot:SetScript("OnClick", PairBuff(buff2Slot, buff2ColorBtn, 2))
+        buff3Slot:SetScript("OnClick", PairBuff(buff3Slot, buff3ColorBtn, 3))
+
+        local function buffColorBtnFor(slot, colorBtn, slotIndex)
+            colorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            colorBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                GameTooltip:SetText("Buff " .. slotIndex .. " Colour")
+                GameTooltip:AddLine("Click to change this buff's bar colour.", 0.7, 0.7, 0.7, true)
+                if m and m[slotIndex] and m[slotIndex].requireGlow then
+                    GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
+                end
+                GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                GameTooltip:Show()
+            end)
+            colorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            colorBtn:SetScript("OnClick", function(self, button)
+                local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+                if button == "RightButton" then
+                    if m and m[slotIndex] then
+                        m[slotIndex].requireGlow = not m[slotIndex].requireGlow
+                        self.procDot:SetShown(m[slotIndex].requireGlow == true)
+                        ns.SaveCurrentProfile()
+                    end
+                    return
+                end
+                local mapData = m and m[slotIndex]
+                local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                local currentColor = (mapData and mapData.color) or slot.pairedColor or DeepCopy(defaultColor)
+                if slotIndex >= 2 then currentColor[4] = currentColor[4] or 0.3 end
+                OpenInlineColorPicker(currentColor, function(c)
+                    colorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                    slot.pairedColor = c
+                    if mapData then mapData.color = c end
+                    ns.SaveCurrentProfile()
+                end)
+            end)
+        end
+        buffColorBtnFor(buff1Slot, buff1ColorBtn, 1)
+        buffColorBtnFor(buff2Slot, buff2ColorBtn, 2)
+        buffColorBtnFor(buff3Slot, buff3ColorBtn, 3)
+
+        -- Cast slot tooltips
+        local function castSlotTooltip(self, slotName)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if self.pairedSpellID then
+                local cName = C_Spell.GetSpellName(self.pairedSpellID) or ("ID:" .. self.pairedSpellID)
+                GameTooltip:SetText(slotName .. ": " .. cName, 1, 1, 1)
+                GameTooltip:AddLine("Left click: replace with selected cast", 0.5, 0.8, 0.5)
+                GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
+            else
+                GameTooltip:SetText(slotName .. " Slot (empty)", 0.6, 0.6, 0.6)
+                if selectedType == "cast" then
+                    GameTooltip:AddLine("Click to pair selected cast here", 0.5, 1, 0.5)
+                else
+                    GameTooltip:AddLine("Select a cast from the Casts pool", 0.7, 0.7, 0.7)
+                end
+            end
+            GameTooltip:Show()
+        end
+        cast1Slot:SetScript("OnEnter", function(self) castSlotTooltip(self, "Cast 1") end)
+        cast1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        cast2Slot:SetScript("OnEnter", function(self) castSlotTooltip(self, "Cast 2") end)
+        cast2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+        local function PairCast(slot, colorBtn, castSlotIndex)
+            return function(self, button)
+                if button == "RightButton" and self.pairedSpellID then
+                    local oldSID = self.pairedSpellID
+                    self.pairedSpellID = nil; self.pairedColor = nil
+                    slot.icon:Hide(); colorBtn:Hide()
+                    local ec = CONFIG.extraCasts and CONFIG.extraCasts[cooldownID]
+                    if ec then
+                        if castSlotIndex == 1 then
+                            table.remove(ec, 1)
+                            if #ec == 0 then CONFIG.extraCasts[cooldownID] = nil end
+                        elseif castSlotIndex == 2 and #ec >= 2 then
+                            table.remove(ec, 2)
+                        end
+                    end
+                    if oldSID and CONFIG.castColors then CONFIG.castColors[oldSID] = nil end
+                    ns.SaveCurrentProfile(); LoadEssentialCooldowns(); RefreshCooldownRows()
+                    return
+                end
+                if selectedType ~= "cast" or not selectedCast then
+                    if selectedType == "buff" then
+                        statusText:SetText("|cffff6666Select a cast from the Casts pool, not the Buffs pool.|r")
+                    else
+                        SelectPoolTab(2)
+                        statusText:SetText("|cff88bbffSelect a cast from the Casts pool.|r")
+                    end
+                    return
+                end
+                if castSlotIndex == 2 then
+                    local ec = CONFIG.extraCasts and CONFIG.extraCasts[cooldownID]
+                    if not ec or not ec[1] then
+                        statusText:SetText("|cffff6666Pair Cast 1 first before using Cast 2.|r"); return
+                    end
+                end
+                local castSID = selectedCast
+                local cIcon = C_Spell.GetSpellTexture(castSID) or 134400
+                slot.icon:SetTexture(cIcon); slot.icon:Show()
+                self.pairedSpellID = castSID
+                local defaultColor = DeepCopy(CONFIG.castColor)
+                self.pairedColor = defaultColor
+                colorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
+                colorBtn:Show()
+                CONFIG.extraCasts = CONFIG.extraCasts or {}
+                CONFIG.extraCasts[cooldownID] = CONFIG.extraCasts[cooldownID] or {}
+                CONFIG.extraCasts[cooldownID][castSlotIndex] = castSID
+                CONFIG.castColors = CONFIG.castColors or {}
+                CONFIG.castColors[castSID] = defaultColor
+                ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
+                statusText:SetText("")
+            end
+        end
+        cast1Slot:SetScript("OnClick", PairCast(cast1Slot, cast1ColorBtn, 1))
+        cast2Slot:SetScript("OnClick", PairCast(cast2Slot, cast2ColorBtn, 2))
+
+        local function castColorBtnFor(slot, colorBtn, label)
+            colorBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText(label .. " Colour")
+                GameTooltip:AddLine("Click to change this cast's bar colour.", 0.7, 0.7, 0.7, true)
+                GameTooltip:Show()
+            end)
+            colorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            colorBtn:SetScript("OnClick", function()
+                local currentColor = slot.pairedColor or DeepCopy(CONFIG.castColor)
+                OpenInlineColorPicker(currentColor, function(c)
+                    colorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                    slot.pairedColor = c
+                    if slot.pairedSpellID then
+                        CONFIG.castColors = CONFIG.castColors or {}
+                        CONFIG.castColors[slot.pairedSpellID] = c
+                    end
+                    ns.SaveCurrentProfile()
+                end)
+            end)
+        end
+        castColorBtnFor(cast1Slot, cast1ColorBtn, "Cast 1")
+        castColorBtnFor(cast2Slot, cast2ColorBtn, "Cast 2")
+
+        -- Stack slot
+        stackSlot:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if self.pairedCooldownID then
+                local sOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, self.pairedCooldownID)
+                local sSID = sOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
+                local sName = sSID and C_Spell.GetSpellName(sSID) or ("ID:" .. tostring(self.pairedCooldownID))
+                GameTooltip:SetText("Stack: " .. sName, 1, 1, 1)
+                GameTooltip:AddLine("Shows this buff's stack count on the icon", 0.7, 0.7, 0.7)
+                GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
+                GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
+            else
+                GameTooltip:SetText("Stack Slot (empty)", 0.6, 0.6, 0.6)
+                if selectedType == "buff" then
+                    GameTooltip:AddLine("Click to track selected buff's stacks here", 0.5, 1, 0.5)
+                else
+                    GameTooltip:AddLine("Select a buff from the Buffs pool", 0.7, 0.7, 0.7)
+                end
+            end
+            GameTooltip:Show()
+        end)
+        stackSlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        stackSlot:SetScript("OnClick", function(self, button)
+            if button == "RightButton" and self.pairedCooldownID then
+                self.pairedCooldownID = nil; self.pairedColor = nil
+                stackSlot.icon:Hide(); stackColorBtn:Hide()
+                if CONFIG.stackMappings then CONFIG.stackMappings[cooldownID] = nil end
+                ns.SaveCurrentProfile(); LoadEssentialCooldowns()
+                return
+            end
+            if selectedType ~= "buff" or not selectedBuff then
+                if selectedType == "cast" then
+                    statusText:SetText("|cffff6666Select a buff from the Buffs pool, not the Casts pool.|r")
+                else
+                    SelectPoolTab(1)
+                    statusText:SetText("|cff88bbffSelect a buff from the Buffs pool to track stacks.|r")
+                end
+                return
+            end
+            local buffCdID = selectedBuff
+            local sOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+            local sSID = sOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
+            local sIcon = sSID and C_Spell.GetSpellTexture(sSID) or 134400
+            stackSlot.icon:SetTexture(sIcon); stackSlot.icon:Show()
+            self.pairedCooldownID = buffCdID
+            local defaultColor = DeepCopy(CONFIG.stackTextColor)
+            self.pairedColor = defaultColor
+            stackColorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
+            stackColorBtn:Show()
+            CONFIG.stackMappings = CONFIG.stackMappings or {}
+            CONFIG.stackMappings[cooldownID] = { buffCooldownID = buffCdID, color = defaultColor }
+            ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
+            statusText:SetText("")
+        end)
+
+        stackColorBtn:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Stack Text Colour")
+            GameTooltip:AddLine("Click to change the stack count text colour for this row.", 0.7, 0.7, 0.7, true)
+            GameTooltip:Show()
+        end)
+        stackColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        stackColorBtn:SetScript("OnClick", function()
+            local currentColor = stackSlot.pairedColor or DeepCopy(CONFIG.stackTextColor)
+            OpenInlineColorPicker(currentColor, function(c)
+                stackColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
+                stackSlot.pairedColor = c
+                local sm = CONFIG.stackMappings and CONFIG.stackMappings[cooldownID]
+                if sm then sm.color = c end
+                ns.SaveCurrentProfile()
+            end)
+        end)
+    end
 
     -- Refresh Cooldown Rows
     RefreshCooldownRows = function()
@@ -4123,9 +4610,12 @@ local function BuildSettings()
             if cooldownRowCache[i] then cooldownRowCache[i]:Hide() end
         end
 
-        -- Extras section (Racials, Potions, Trinkets)
+        -- Extras section (Racials, Potions, Trinkets, and user added Custom Rows)
         for i = 1, extrasRowCacheCount do
             if extrasRowCache[i] then extrasRowCache[i]:Hide() end
+        end
+        for i = 1, customRowCacheCount do
+            if customRowCache[i] then customRowCache[i]:Hide() end
         end
         if extrasHeaderFrame then extrasHeaderFrame:Hide() end
 
@@ -4134,7 +4624,7 @@ local function BuildSettings()
 
             if not extrasHeaderFrame then
                 extrasHeaderFrame = CreateFrame("Frame", nil, topContent)
-                extrasHeaderFrame:SetSize(topContent:GetWidth() or 700, 56)
+                extrasHeaderFrame:SetSize(topContent:GetWidth() or 700, 86)
                 extrasHeaderFrame.text = extrasHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
                 extrasHeaderFrame.text:SetPoint("TOPLEFT", 6, 0)
                 extrasHeaderFrame.text:SetText("Extras")
@@ -4154,6 +4644,43 @@ local function BuildSettings()
                 extrasHeaderFrame.posBot:SetSize(60, 22)
                 extrasHeaderFrame.posBot:SetPoint("LEFT", extrasHeaderFrame.posTop, "RIGHT", 4, 0)
                 extrasHeaderFrame.posBot:SetText("Bottom")
+                -- + Add Custom Row button (below position buttons, aligned right with Bottom)
+                extrasHeaderFrame.addCustom = CreateFrame("Button", nil, extrasHeaderFrame, "UIPanelButtonTemplate")
+                extrasHeaderFrame.addCustom:SetHeight(22)
+                extrasHeaderFrame.addCustom:SetPoint("TOPLEFT", extrasHeaderFrame.posLabel, "BOTTOMLEFT", 0, -14)
+                extrasHeaderFrame.addCustom:SetPoint("RIGHT", extrasHeaderFrame.posBot, "RIGHT", 0, 0)
+                extrasHeaderFrame.addCustom:SetText("+ Add Custom Row")
+                extrasHeaderFrame.addCustom:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Add Custom Row")
+                    GameTooltip:AddLine("Creates an extra row with no cooldown. Pick an icon, then assign Buff 1, Buff 2, Buff 3, Cast 1, Cast 2, and Stack like any other row. Type a spell ID in the search box to use icons not in your spellbook.", 0.7, 0.7, 0.7, true)
+                    GameTooltip:Show()
+                end)
+                extrasHeaderFrame.addCustom:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                extrasHeaderFrame.addCustom:SetScript("OnClick", function(self)
+                    OpenSpellPicker({
+                        title = "Pick Icon for Custom Row",
+                        anchor = self,
+                        onSelect = function(pickedID, pickedName, pickedIcon)
+                            CONFIG.extras = CONFIG.extras or {}
+                            local n = 1
+                            local keyTaken = {}
+                            for _, e in ipairs(CONFIG.extras) do keyTaken[e.key] = true end
+                            while keyTaken["custom_" .. n] do n = n + 1 end
+                            table.insert(CONFIG.extras, {
+                                key = "custom_" .. n,
+                                type = "custom",
+                                iconSpellID = pickedID,
+                                iconTexture = pickedIcon,
+                                label = pickedName,
+                                enabled = true,
+                            })
+                            ns.SaveCurrentProfile()
+                            LoadEssentialCooldowns()
+                            RefreshCooldownRows()
+                        end,
+                    })
+                end)
             end
             local function UpdateExtrasPosHighlight()
                 local pos = CONFIG.extrasPosition or "BOTTOM"
@@ -4176,10 +4703,174 @@ local function BuildSettings()
             extrasHeaderFrame:Show()
             extrasHeaderFrame:ClearAllPoints()
             extrasHeaderFrame:SetPoint("TOPLEFT", 0, -yOffset)
-            yOffset = yOffset + 58
+            yOffset = yOffset + 88
 
             for extIdx, extra in ipairs(CONFIG.extras) do
-                if not extra._unavailable then
+                if extra._unavailable then
+                    -- unavailable, skip
+                elseif extra.type == "custom" then
+                    -- Custom row: wider layout with slot widgets (buff 1/2/3, cast 1/2, stack)
+                    local cRow = customRowCache[extIdx]
+                    if not cRow then
+                        cRow = CreateFrame("Frame", nil, topContent)
+                        cRow:SetSize(topContent:GetWidth() or 700, 28)
+                        cRow.cb = CreateFrame("CheckButton", nil, cRow, "UICheckButtonTemplate")
+                        cRow.cb:SetPoint("LEFT", 2, 0)
+                        cRow.cb:SetSize(22, 22)
+                        cRow.abilIcon = cRow:CreateTexture(nil, "ARTWORK")
+                        cRow.abilIcon:SetSize(24, 24)
+                        cRow.abilIcon:SetPoint("LEFT", cRow.cb, "RIGHT", 4, 0)
+                        cRow.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                        cRow.iconBtn = CreateFrame("Button", nil, cRow)
+                        cRow.iconBtn:SetAllPoints(cRow.abilIcon)
+                        local iconHl = cRow.iconBtn:CreateTexture(nil, "HIGHLIGHT")
+                        iconHl:SetAllPoints()
+                        iconHl:SetColorTexture(1, 0.82, 0, 0.18)
+                        cRow.nameText = cRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                        cRow.nameText:SetPoint("LEFT", cRow.abilIcon, "RIGHT", 4, 0)
+                        cRow.nameText:SetWidth(106)
+                        cRow.nameText:SetJustifyH("LEFT")
+                        cRow.nameText:SetWordWrap(false)
+                        cRow.buff1Slot = CreateSlotFrame(cRow, cRow.nameText, "RIGHT", 4)
+                        cRow.buff1ColorBtn = CreateSlotColorBtn(cRow, cRow.buff1Slot)
+                        cRow.buff2Slot = CreateSlotFrame(cRow, cRow.buff1ColorBtn, "RIGHT", 6)
+                        cRow.buff2ColorBtn = CreateSlotColorBtn(cRow, cRow.buff2Slot)
+                        cRow.buff3Slot = CreateSlotFrame(cRow, cRow.buff2ColorBtn, "RIGHT", 6)
+                        cRow.buff3ColorBtn = CreateSlotColorBtn(cRow, cRow.buff3Slot)
+                        cRow.cast1Slot = CreateSlotFrame(cRow, cRow.buff3ColorBtn, "RIGHT", 12)
+                        cRow.cast1ColorBtn = CreateSlotColorBtn(cRow, cRow.cast1Slot)
+                        cRow.cast2Slot = CreateSlotFrame(cRow, cRow.cast1ColorBtn, "RIGHT", 6)
+                        cRow.cast2ColorBtn = CreateSlotColorBtn(cRow, cRow.cast2Slot)
+                        cRow.stackSlot = CreateSlotFrame(cRow, cRow.cast2ColorBtn, "RIGHT", 12)
+                        cRow.stackColorBtn = CreateSlotColorBtn(cRow, cRow.stackSlot)
+                        cRow.upBtn = CreateFrame("Button", nil, cRow)
+                        cRow.upBtn:SetSize(16, 16)
+                        cRow.upBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollUp-Up")
+                        cRow.upBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollUp-Highlight")
+                        cRow.upBtn:SetPoint("LEFT", cRow.stackColorBtn, "RIGHT", 18, 0)
+                        cRow.downBtn = CreateFrame("Button", nil, cRow)
+                        cRow.downBtn:SetSize(16, 16)
+                        cRow.downBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Up")
+                        cRow.downBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Highlight")
+                        cRow.downBtn:SetPoint("LEFT", cRow.upBtn, "RIGHT", 2, 0)
+                        cRow.deleteBtn = CreateFrame("Button", nil, cRow, "UIPanelButtonTemplate")
+                        cRow.deleteBtn:SetSize(56, 18)
+                        cRow.deleteBtn:SetPoint("LEFT", cRow.downBtn, "RIGHT", 8, 0)
+                        cRow.deleteBtn:SetText("Delete")
+                        customRowCache[extIdx] = cRow
+                        customRowCacheCount = math.max(customRowCacheCount, extIdx)
+                    end
+
+                    cRow:Show()
+                    cRow:ClearAllPoints()
+                    cRow:SetPoint("TOPLEFT", 0, -yOffset)
+
+                    local rowIcon = extra.iconTexture or (extra.iconSpellID and C_Spell.GetSpellTexture(extra.iconSpellID)) or 134400
+                    cRow.abilIcon:SetTexture(rowIcon)
+                    cRow.abilIcon:SetDesaturated(not extra.enabled)
+                    cRow.nameText:SetText(extra.label or "Custom Row")
+                    cRow.nameText:SetTextColor(extra.enabled and 0.6 or 0.5, extra.enabled and 0.85 or 0.5, extra.enabled and 1 or 0.5)
+                    cRow.cb:SetChecked(extra.enabled)
+
+                    local cIdx = extIdx
+                    local cKey = extra.key
+
+                    cRow.cb:SetScript("OnClick", function(self)
+                        if not CONFIG.extras[cIdx] then return end
+                        CONFIG.extras[cIdx].enabled = self:GetChecked() and true or false
+                        local on = CONFIG.extras[cIdx].enabled
+                        cRow.abilIcon:SetDesaturated(not on)
+                        cRow.nameText:SetTextColor(on and 0.6 or 0.5, on and 0.85 or 0.5, on and 1 or 0.5)
+                        ns.SaveCurrentProfile()
+                        LoadEssentialCooldowns()
+                    end)
+
+                    cRow.iconBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                    cRow.iconBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Custom Row Icon", 1, 1, 1)
+                        GameTooltip:AddLine("Left click to change the icon. Type a spell ID in the picker's search box to use icons outside your spellbook.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    cRow.iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    cRow.iconBtn:SetScript("OnClick", function(self, button)
+                        if button == "RightButton" then return end
+                        OpenSpellPicker({
+                            title = "Choose Custom Row Icon",
+                            anchor = self,
+                            onSelect = function(pickedID, pickedName, pickedIcon)
+                                local e = CONFIG.extras[cIdx]
+                                if not e then return end
+                                e.iconSpellID = pickedID
+                                e.iconTexture = pickedIcon
+                                e.label = pickedName or e.label
+                                ns.SaveCurrentProfile()
+                                LoadEssentialCooldowns()
+                                RefreshCooldownRows()
+                            end,
+                        })
+                    end)
+
+                    WireSlots(cRow, cKey)
+
+                    cRow.upBtn:SetEnabled(cIdx > 1)
+                    cRow.downBtn:SetEnabled(cIdx < #CONFIG.extras)
+                    cRow.upBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Move Up")
+                        GameTooltip:AddLine("Swap this row with the one above it.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    cRow.upBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    cRow.downBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Move Down")
+                        GameTooltip:AddLine("Swap this row with the one below it.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    cRow.downBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    cRow.upBtn:SetScript("OnClick", function()
+                        if cIdx <= 1 then return end
+                        local t = CONFIG.extras
+                        t[cIdx], t[cIdx - 1] = t[cIdx - 1], t[cIdx]
+                        ns.SaveCurrentProfile()
+                        LoadEssentialCooldowns()
+                        RefreshCooldownRows()
+                    end)
+                    cRow.downBtn:SetScript("OnClick", function()
+                        if cIdx >= #CONFIG.extras then return end
+                        local t = CONFIG.extras
+                        t[cIdx], t[cIdx + 1] = t[cIdx + 1], t[cIdx]
+                        ns.SaveCurrentProfile()
+                        LoadEssentialCooldowns()
+                        RefreshCooldownRows()
+                    end)
+                    cRow.deleteBtn:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Delete Custom Row")
+                        GameTooltip:AddLine("Remove this row and its buff, cast, and stack assignments.", 0.7, 0.7, 0.7, true)
+                        GameTooltip:Show()
+                    end)
+                    cRow.deleteBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                    cRow.deleteBtn:SetScript("OnClick", function()
+                        if not CONFIG.extras[cIdx] then return end
+                        local key = CONFIG.extras[cIdx].key
+                        table.remove(CONFIG.extras, cIdx)
+                        if key then
+                            if CONFIG.buffMappings then CONFIG.buffMappings[key] = nil end
+                            if CONFIG.extraCasts then CONFIG.extraCasts[key] = nil end
+                            if CONFIG.stackMappings then CONFIG.stackMappings[key] = nil end
+                            if CONFIG.cooldownColors then CONFIG.cooldownColors[key] = nil end
+                            if CONFIG.customIcons then CONFIG.customIcons[key] = nil end
+                            if ns._activeExtrasTimers then ns._activeExtrasTimers[key] = nil end
+                        end
+                        ns.SaveCurrentProfile()
+                        LoadEssentialCooldowns()
+                        RefreshCooldownRows()
+                    end)
+
+                    yOffset = yOffset + 30
+                elseif not extra._unavailable and extra.type ~= "custom" then
                 local eRow = extrasRowCache[extIdx]
                 if not eRow then
                     eRow = CreateFrame("Frame", nil, topContent)
@@ -5128,7 +5819,7 @@ local function BuildSettings()
     end)
     AddTogWidget(lockedCheck)
 
-    local buffLayerCheck = CreateCheckbox(togContent, "Buff Layer Above", "Show buff bars above cooldown bars", CONFIG.buffLayerAbove, function(v)
+    local buffLayerCheck = CreateCheckbox(togContent, "Buff Bar On Top", "Draw the buff fill on top of the cooldown fill (same bar).", CONFIG.buffLayerAbove, function(v)
         CONFIG.buffLayerAbove = v
         if ns.ApplyBuffLayer and ns.cooldownBars then
             for _, row in ipairs(ns.cooldownBars) do
