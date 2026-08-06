@@ -72,11 +72,14 @@ CONFIG.spellGeneration = {
 -- ============================================================================
 -- CHARGE OVERFLOW
 -- For spells where a proc temporarily bumps maxCharges beyond the base value
--- (granting a bonus charge). Locks the addon's lane count to trueMax so the
--- bar never builds a 3rd lane in past or future regions.
+-- (granting a bonus charge).
+--   base    = lane count to build, ignoring any proc-granted extra charge.
+--             Set this only when a PROC moves the count. Never set it for a
+--             charge granted by a talent, that is a real charge.
+--   trueMax = hard cap on lanes, so no past or future region can overflow.
 -- ============================================================================
 CONFIG.chargeOverflow = {
-    [8092] = { trueMax = 2 },  -- Mind Blast / Shadowy Insight
+    [8092] = { base = 1, trueMax = 2 },  -- Mind Blast / Shadowy Insight
 }
 
 -- ============================================================================

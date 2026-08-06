@@ -57,6 +57,33 @@ CONFIG.stackMappings = {
 }
 
 -- ============================================================================
+-- RUNE ABILITY BASE COOLDOWNS
+-- The client reports "when can I next cast this", which for a rune ability is
+-- the later of its real cooldown and the wait for runes. No API separates them,
+-- so a spell with no cooldown of its own draws a bar made entirely of rune wait.
+--
+-- These are real cooldowns in seconds, used only while the player has estimated
+-- rune cooldowns enabled. Static: DK ability cooldowns do not scale with haste.
+-- A cooldown reduction proc makes the estimate run long.
+-- 0 means the spell has no cooldown of its own.
+-- ============================================================================
+
+-- ONLY spells that cost runes belong here. A spell with no rune cost cannot
+-- carry a rune wait, so declaring one replaces exact API data with an estimate.
+
+CONFIG.runeBaseCooldowns = {
+    [43265]  = 30,   -- Death and Decay
+    [196770] = 20,   -- Remorseless Winter
+
+    [49020]  = 0,    -- Obliterate
+    [49184]  = 0,    -- Howling Blast
+    [207230] = 0,    -- Frostscythe
+    [85948]  = 0,    -- Festering Strike
+    [55090]  = 0,    -- Scourge Strike
+    [206930] = 0,    -- Heart Strike
+}
+
+-- ============================================================================
 -- HIDDEN COOLDOWNS
 -- Bars you want in the Blizzard Cooldown Manager but not shown in Infall
 -- ============================================================================

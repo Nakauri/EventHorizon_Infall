@@ -126,11 +126,25 @@ CONFIG.stackMappings = {}
 -- base = focus generated on cast, talents = conditional bonuses
 -- ============================================================================
 
+-- Values measured from SPELL_ENERGIZE in a combat log, not from tooltips.
 CONFIG.spellGeneration = {
-    [56641] = {  -- Steady Shot
-        base = 10,
+    [56641] = {  -- Steady Shot, one energize of 25
+        base = 20,
         talents = {
             {spellID = 450379, bonus = 5},  -- Invigorating Pulse
+        },
+    },
+
+    -- Channeled: base is the total focus over the full channel, not per tick.
+    -- 10 shots at 3 focus each.
+    -- Bonuses are in FOCUS, not shots, so a shot-count talent contributes
+    -- shots * 3. Effects that scale shot count multiplicatively, or that add
+    -- targets rather than shots, are not representable here.
+    [257044] = {  -- Rapid Fire, 10 shots of 3
+        base = 30,
+        talents = {
+            {spellID = 459794, bonus = 9},   -- Quick Draw, 3 extra shots
+            {spellID = 470945, bonus = 30},  -- Aspect of the Hydra, second target energizes too
         },
     },
 }

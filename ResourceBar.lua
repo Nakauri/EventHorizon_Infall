@@ -32,11 +32,55 @@ local function DeepCopy(v)
     return copy
 end
 
+-- Observed regen rate, in resource per second.
+-- GetPowerRegenForPowerType returns a secret value in combat, so the rate is
+-- measured from the player's own power ticks instead. Only a rise from below
+-- the cap measures regen: a fall is a spend, and an interval that starts at the
+-- cap is inflated. UnitPower can itself be secret, so that frame is skipped.
+local observedRegen = 0
+local regenPrev, regenPrevAt
+
+local function ResetRegenObservation()
+    observedRegen = 0
+    regenPrev, regenPrevAt = nil, nil
+end
+ns.ResetRegenObservation = ResetRegenObservation
+
+local function ObservePowerTick()
+    if not currentPowerType then return end
+    local ok, value = pcall(UnitPower, "player", currentPowerType)
+    if not ok or type(value) ~= "number" or issecretvalue(value) then return end
+
+    local now = GetTime()
+    local prev, prevAt = regenPrev, regenPrevAt
+    regenPrev, regenPrevAt = value, now
+
+    if prev == nil or prevAt == nil then return end
+    -- Only a rise measures regen, and only from below the cap.
+    if value <= prev then return end
+    if currentPowerMax > 0 and prev >= currentPowerMax then return end
+
+    local elapsed = now - prevAt
+    if elapsed <= 0 or elapsed > 5 then return end
+
+    local rate = (value - prev) / elapsed
+    if rate <= 0 or rate > 1000 then return end
+    -- Smoothed so one ragged interval cannot swing the prediction.
+    observedRegen = (observedRegen > 0) and (observedRegen * 0.7 + rate * 0.3) or rate
+end
+ns.ObservePowerTick = ObservePowerTick
+
 local function GetRegenRate()
-    if not GetPowerRegenForPowerType or not currentPowerType then return 0 end
-    local ok, _, casting = pcall(GetPowerRegenForPowerType, currentPowerType)
-    if not ok or not casting or issecretvalue(casting) then return 0 end
-    return casting
+    -- Prefer the API whenever it is readable: exact, no warm-up, and a genuine
+    -- zero (classes that do not regen while casting) must not be overridden by
+    -- an observed out-of-cast rate. Fall back only when it is actually secret.
+    if GetPowerRegenForPowerType and currentPowerType then
+        local ok, _, casting = pcall(GetPowerRegenForPowerType, currentPowerType)
+        if ok and type(casting) == "number" and not issecretvalue(casting) then
+            return casting
+        end
+    end
+    return observedRegen
 end
 
 local function IsTalentKnown(talentSpellID)
@@ -466,17 +510,22 @@ local function OnEvent(self, event, ...)
     if not GetRB().enabled then return end
 
     if event == "UNIT_POWER_FREQUENT" then
-        if (...) == "player" then UpdateResourceBar() end
+        if (...) == "player" then
+            ObservePowerTick()
+            UpdateResourceBar()
+        end
 
     elseif event == "UNIT_MAXPOWER" then
         if (...) == "player" then UpdateMaxPower() end
 
     elseif event == "UNIT_DISPLAYPOWER" then
         DetectPowerType()
+        ResetRegenObservation()
         ClearPrediction()
         UpdateMaxPower()
 
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" or event == "UPDATE_SHAPESHIFT_FORM" then
+        ResetRegenObservation()
         ClearPrediction()
         C_Timer.After(0.1, function()
             DetectPowerType()

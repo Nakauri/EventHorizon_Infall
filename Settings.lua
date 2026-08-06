@@ -19,7 +19,7 @@ local TOGGLE_KEYS = {
     "buffLayerAbove", "hideIcons", "clickthrough",
     "showVariantNames", "smoothBars", "showPastBars",
     "forceViewersAlways", "stackIndicators",
-    "showCooldownDuration",
+    "showCooldownDuration", "estimateRuneCooldowns",
 }
 
 local DISPLAY_KEYS = {
@@ -2598,7 +2598,7 @@ local function BuildStacksTab(contentArea, tabFrames)
         end
 
         -- Show every CDM buff aura. The tooltip word "stack" is an unreliable
-        -- filter — some stacking auras (IE Shadow Techniques) never say it.
+        -- filter , some stacking auras (IE Shadow Techniques) never say it.
         -- Picking a non-stacking buff still works; it just shows 0 or 1 pip.
         local filteredIDs = buffIDs
 
@@ -2611,8 +2611,9 @@ local function BuildStacksTab(contentArea, tabFrames)
         for i, buffCdID in ipairs(filteredIDs) do
             local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
             local spellID = infoOk and cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
-            local tex = spellID and C_Spell.GetSpellTexture(spellID) or 134400
-            local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. buffCdID)
+            local rName, rIcon = ns.ResolveCooldownDisplay(buffCdID, cdInfo)
+            local tex = rIcon or 134400
+            local spellName = rName or ("ID:" .. buffCdID)
 
             gridIdx = gridIdx + 1
             local col = (gridIdx - 1) % cols
@@ -2924,7 +2925,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.5")
+    versionText:SetText("v1.3.6")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -3103,6 +3104,22 @@ local function BuildSettings()
         GameTooltip:Show()
     end)
     refreshBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    -- 12.1 Note, right aligned on the Refresh List row.
+    local noteBtn = CreateFrame("Button", nil, instrBlock, "UIPanelButtonTemplate")
+    noteBtn:SetSize(100, 22)
+    noteBtn:SetPoint("BOTTOMRIGHT", -12, 10)
+    noteBtn:SetText("12.1 Note")
+    noteBtn:SetScript("OnClick", function()
+        if ns.Migrate121 then ns.Migrate121.ShowNote() end
+    end)
+    noteBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:SetText("12.1 Note")
+        GameTooltip:AddLine("Why buffs in Tracked Buffs are estimated, and which of yours are.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    noteBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local cdmBtn = CreateFrame("Button", nil, instrBlock, "UIPanelButtonTemplate")
     cdmBtn:SetSize(180, 22)
@@ -3737,8 +3754,9 @@ local function BuildSettings()
             if infoOk and cdInfo then
                 rowIndex = rowIndex + 1
                 local spellID = cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID
-                local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. cooldownID)
-                local spellIcon = spellID and C_Spell.GetSpellTexture(spellID) or 134400
+                local rName, rIcon = ns.ResolveCooldownDisplay(cooldownID, cdInfo)
+                local spellName = rName or ("ID:" .. cooldownID)
+                local spellIcon = rIcon or 134400
                 local isHidden = CONFIG.hiddenCooldownIDs and (CONFIG.hiddenCooldownIDs[cooldownID] or (spellID and spellID ~= cooldownID and CONFIG.hiddenCooldownIDs[spellID]))
 
                 local row = cooldownRowCache[rowIndex]
@@ -4630,7 +4648,11 @@ local function BuildSettings()
                 extrasHeaderFrame.text:SetText("Extras")
                 extrasHeaderFrame.note = extrasHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
                 extrasHeaderFrame.note:SetPoint("TOPLEFT", extrasHeaderFrame.text, "BOTTOMLEFT", 0, -2)
-                extrasHeaderFrame.note:SetText("These can only be shown either above or below the cooldown manager bars.")
+                if ns.AuraCompat and ns.AuraCompat.IS_121 then
+                    extrasHeaderFrame.note:SetText("Racials now come from the Cooldown Manager. Add them there for exact timing.")
+                else
+                    extrasHeaderFrame.note:SetText("These can only be shown either above or below the cooldown manager bars.")
+                end
                 extrasHeaderFrame.note:SetTextColor(0.6, 0.6, 0.6)
                 -- Position buttons
                 extrasHeaderFrame.posLabel = extrasHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -4705,9 +4727,14 @@ local function BuildSettings()
             extrasHeaderFrame:SetPoint("TOPLEFT", 0, -yOffset)
             yOffset = yOffset + 88
 
+            -- 12.1 hides racials only; they come from the CDM there.
+            -- REMOVE WITH 12.0.7 SUPPORT.
+            local extrasNativeIn121 = ns.AuraCompat and ns.AuraCompat.IS_121
             for extIdx, extra in ipairs(CONFIG.extras) do
                 if extra._unavailable then
                     -- unavailable, skip
+                elseif extrasNativeIn121 and extra.type == "racial" then
+                    -- superseded by the Cooldown Manager, skip
                 elseif extra.type == "custom" then
                     -- Custom row: wider layout with slot widgets (buff 1/2/3, cast 1/2, stack)
                     local cRow = customRowCache[extIdx]
@@ -5072,9 +5099,11 @@ local function BuildSettings()
             if buffSectionHeaders[i] then buffSectionHeaders[i]:Hide() end
         end
 
+        -- Labels only annotated on 12.1; both are exact on earlier builds.
+        local is121 = ns.AuraCompat and ns.AuraCompat.IS_121
         local sections = {
-            { cat = 2, label = "Tracked Buffs" },
-            { cat = 3, label = "Tracked Bars" },
+            { cat = 2, label = is121 and "Tracked Buffs (estimated timing)" or "Tracked Buffs" },
+            { cat = 3, label = is121 and "Tracked Bars (exact timing)" or "Tracked Bars" },
         }
         local catLabel = {}
         local seen = {}
@@ -5142,9 +5171,11 @@ local function BuildSettings()
                     btnIdx = btnIdx + 1
                     local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                     local spellID = infoOk and cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
-                    local tex = spellID and C_Spell.GetSpellTexture(spellID) or 134400
-                    local spellName = spellID and C_Spell.GetSpellName(spellID) or ("ID:" .. buffCdID)
+                    local rName, rIcon = ns.ResolveCooldownDisplay(buffCdID, cdInfo)
+                    local tex = rIcon or 134400
+                    local spellName = rName or ("ID:" .. buffCdID)
                     local secLabel = sec.label
+                    local secCat = sec.cat
 
                     local col = (i - 1) % cols
                     local rowIdx = math.floor((i - 1) / cols)
@@ -5177,6 +5208,17 @@ local function BuildSettings()
                         GameTooltip:AddLine("CooldownID: " .. buffCdID, 0.7, 0.7, 0.7)
                         if spellID then
                             GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
+                        end
+                        -- Estimated section only: show what has been learned.
+                        if is121 and secCat == 2 and ns.AuraCompat then
+                            local state, dur = ns.AuraCompat.GetLearnState(spellID)
+                            if state == "permanent" then
+                                GameTooltip:AddLine("Permanent buff, drawn as a full bar.", 0.5, 0.9, 0.5, true)
+                            elseif state == "learned" then
+                                GameTooltip:AddLine(string.format("Estimated at %.1fs. Will not follow refreshes or haste.", dur), 1, 0.82, 0, true)
+                            else
+                                GameTooltip:AddLine("Not learned yet. Gain this buff out of combat once, or move it to Tracked Bars for exact timing.", 1, 0.5, 0.5, true)
+                            end
                         end
                         GameTooltip:AddLine("Click to select, then click a Buff or Stack slot above.", 0.5, 0.8, 0.5, true)
                         GameTooltip:Show()
@@ -5968,6 +6010,21 @@ local function BuildSettings()
         ns.SaveCurrentProfile()
     end)
     AddTogWidget(cdMinDurSlider)
+
+    -- Rune abilities. Only built when the class declares base cooldowns, so no
+    -- other class sees a control that would do nothing.
+    if CONFIG.runeBaseCooldowns then
+        AddTogHeader("Rune Abilities")
+
+        local runeCdCheck = CreateCheckbox(togContent, "Estimate Rune Cooldowns",
+            "The game reports the later of an ability's own cooldown and the wait for runes, and gives addons no way to tell them apart. With this on, bars are rebuilt from the ability's real cooldown instead, so abilities with no cooldown of their own stop drawing a bar. Estimated: a cooldown reduction effect will make a bar run long.",
+            CONFIG.estimateRuneCooldowns, function(v)
+                CONFIG.estimateRuneCooldowns = v
+                ns.SaveCurrentProfile()
+                if ns.LoadEssentialCooldowns then ns.LoadEssentialCooldowns() end
+            end)
+        AddTogWidget(runeCdCheck)
+    end
 
     -- Utility Buttons
     AddTogHeader("Utility")

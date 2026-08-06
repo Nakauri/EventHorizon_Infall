@@ -143,3 +143,78 @@ end
 
 ns.cooldownBars = {}
 ns.barPool = {}
+
+-- Generic display for item categories that have no recent source yet. Mirrors
+-- the Cooldown Manager's own spellCategoryMetadataLookup, so the names and
+-- icons match what the player sees there.
+ns.SPELL_CATEGORY_DISPLAY = {
+    [4]    = { icon = "Interface/ICONS/INV_POTION_114",      name = COOLDOWN_VIEWER_TOOLTIP_POTION_COMBAT_TITLE },
+    [30]   = { icon = "Interface/ICONS/INV_POTION_54",       name = COOLDOWN_VIEWER_TOOLTIP_POTION_HEALTH_TITLE },
+    [1711] = { icon = "Interface/ICONS/Warlock_ Healthstone", name = COOLDOWN_VIEWER_TOOLTIP_POTION_HEALTHSTONE_TITLE },
+    [2566] = { icon = "Interface/ICONS/Warlock_ Bloodstone",  name = COOLDOWN_VIEWER_TOOLTIP_POTION_DEMONIC_HEALTHSTONE_TITLE },
+}
+
+-- Display name and icon for a Cooldown Manager entry.
+--
+-- Not every entry is a spell. Potions and consumables carry a spellCategoryID
+-- with no spellID, and trinkets carry an equipSlot, so a spell lookup returns
+-- nothing and the entry renders as a bare cooldown id. Resolution order
+-- follows the Cooldown Manager's own: equipped item, then the most recent
+-- source in the spell category, then the spell.
+function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
+    if not cooldownID then return nil, nil end
+    if not cdInfo then
+        local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+        cdInfo = ok and info or nil
+    end
+    if not cdInfo then return nil, nil end
+
+    -- Equipped item, ie a trinket.
+    if cdInfo.equipSlot then
+        local iiOk, itemID = pcall(GetInventoryItemID, "player", cdInfo.equipSlot)
+        if iiOk and itemID and not (issecretvalue and issecretvalue(itemID)) then
+            local nOk, name = pcall(C_Item.GetItemNameByID, itemID)
+            local iOk, icon = pcall(C_Item.GetItemIconByID, itemID)
+            name = nOk and name or nil
+            icon = iOk and icon or nil
+            if name or icon then return name, icon end
+        end
+        local slotTex = ItemUtil and ItemUtil.GetEquipSlotTexture
+            and ItemUtil.GetEquipSlotTexture(cdInfo.equipSlot)
+        if slotTex then return nil, slotTex end
+    end
+
+    -- Bag item, ie a potion or healthstone. The category reports whatever most
+    -- recently started a cooldown in it, so it is unresolved until the player
+    -- uses one; the category metadata below covers that case.
+    if cdInfo.spellCategoryID then
+        -- GetLastCategoryCooldownSource carries SecretWhenCooldownsRestricted,
+        -- so both returns are secret in combat. C_Item's lookups reject secret
+        -- arguments outright, and a secret name cannot be sorted or compared,
+        -- so anything secret falls through to the static metadata below.
+        local issecret = issecretvalue or function() return false end
+        if C_Spell.GetLastCategoryCooldownSource then
+            local ok, spellID, itemID = pcall(C_Spell.GetLastCategoryCooldownSource, cdInfo.spellCategoryID)
+            if ok then
+                if itemID and not issecret(itemID) then
+                    local nOk, name = pcall(C_Item.GetItemNameByID, itemID)
+                    local iOk, icon = pcall(C_Item.GetItemIconByID, itemID)
+                    name = nOk and name or nil
+                    icon = iOk and icon or nil
+                    if name or icon then return name, icon end
+                end
+                if spellID and not issecret(spellID) then
+                    return C_Spell.GetSpellName(spellID), C_Spell.GetSpellTexture(spellID)
+                end
+            end
+        end
+        local meta = ns.SPELL_CATEGORY_DISPLAY[cdInfo.spellCategoryID]
+        if meta then return meta.name, meta.icon end
+    end
+
+    local sid = cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID
+    if sid then
+        return C_Spell.GetSpellName(sid), C_Spell.GetSpellTexture(sid)
+    end
+    return nil, nil
+end
