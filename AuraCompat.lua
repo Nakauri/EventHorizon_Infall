@@ -8,22 +8,17 @@ ns.AuraCompat = AC
 
 local issecret = issecretvalue or function() return false end
 
-AC.IS_121 = (select(4, GetBuildInfo()) or 0) >= 120100
-
-------------------------------------------------------------------------------
 -- Restriction state
-------------------------------------------------------------------------------
 
 local probeStamp = -1
 local probeAnswer = false
 
 -- True while aura queries raise an error for addons. Probes the call itself
--- rather than C_Secrets.ShouldAurasBeSecret, which reports secrecy and is true
--- on 12.0.7 in instances where the queries still work.
+-- rather than C_Secrets.ShouldAurasBeSecret, which reports secrecy rather than
+-- whether the query works.
 -- Memoized per frame: callers run per row per update cycle, and an uncached
 -- probe costs a pcall plus an API call every time.
 function AC.AurasRestricted()
-    if not AC.IS_121 then return false end
     local now = GetTime()
     if now == probeStamp then return probeAnswer end
     probeStamp = now
@@ -31,9 +26,7 @@ function AC.AurasRestricted()
     return probeAnswer
 end
 
-------------------------------------------------------------------------------
 -- Learned aura data, keyed by spell id
-------------------------------------------------------------------------------
 
 local learnedDuration = {}
 local learnedPermanent = {}
@@ -141,9 +134,7 @@ function AC.LearnVisible()
     end
 end
 
-------------------------------------------------------------------------------
 -- Aura start times
-------------------------------------------------------------------------------
 
 local auraStart = setmetatable({}, { __mode = "k" })
 
@@ -161,15 +152,14 @@ function AC.GetAuraStart(frame)
     return frame and auraStart[frame] or nil
 end
 
-------------------------------------------------------------------------------
 -- Fill resolution
-------------------------------------------------------------------------------
 
 -- Returns kind, payload, resolvedUnit:
 --   "mirror",    StatusBar   read this widget's value each frame
 --   "durobj",    DurObj      feed the DurationObject path
 --   "permanent", nil         draw a full bar
 --   nil                      no usable timing
+
 function AC.ResolveFill(frame, unit)
     if not frame then return nil end
 
@@ -197,8 +187,12 @@ function AC.ResolveFill(frame, unit)
         return "mirror", bar
     end
 
-    local dur = AC.GetLearnedDuration(spellID)
+    -- Last resort when there is no .Bar to mirror: rebuild from a learned duration
+    -- and the recorded start. Works under restriction; GetAuraDuration does not,
+    -- it is refused to tainted callers. Only fires for auras seen unrestricted at
+    -- least once. Item buffs never learn, and use a cast-armed window in Bars.lua.
     local start = AC.GetAuraStart(frame)
+    local dur = AC.GetLearnedDuration(spellID)
     if dur and start then
         local durObj = C_DurationUtil.CreateDuration()
         durObj:SetTimeFromStart(start, dur)
@@ -208,9 +202,7 @@ function AC.ResolveFill(frame, unit)
     return nil
 end
 
-------------------------------------------------------------------------------
 -- Frame field reads
-------------------------------------------------------------------------------
 
 -- Application count. May be secret; only pass it to a widget setter.
 function AC.ReadApplications(frame)
@@ -241,9 +233,7 @@ function AC.ReadAuraSpellID(frame)
     return nil
 end
 
-------------------------------------------------------------------------------
 -- Learning ticker
-------------------------------------------------------------------------------
 
 local learnTicker = CreateFrame("Frame")
 learnTicker:RegisterEvent("PLAYER_LOGIN")

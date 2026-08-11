@@ -136,15 +136,21 @@ CONFIG.spellGeneration = {
     },
 
     -- Channeled: base is the total focus over the full channel, not per tick.
-    -- 10 shots at 3 focus each.
     -- Bonuses are in FOCUS, not shots, so a shot-count talent contributes
-    -- shots * 3. Effects that scale shot count multiplicatively, or that add
-    -- targets rather than shots, are not representable here.
-    [257044] = {  -- Rapid Fire, 10 shots of 3
-        base = 30,
+    -- shots * 3.
+    --
+    -- The in-game tooltip shows the TALENTED shot count, so reading "10 shots"
+    -- off it and then adding Quick Draw counts that talent twice. Untalented
+    -- base is 7. Measured from a combat log 2026-08-11: 7 + 3 = 10 primary hits,
+    -- 5 cleave hits, 15 energizes of 3 = 45 focus.
+    [257044] = {  -- Rapid Fire, 7 shots of 3 before talents
+        base = 21,
         talents = {
             {spellID = 459794, bonus = 9},   -- Quick Draw, 3 extra shots
-            {spellID = 470945, bonus = 30},  -- Aspect of the Hydra, second target energizes too
+            -- Hydra's extra target is hit on every OTHER shot, not every shot,
+            -- so it is worth half the shot count. It also needs a second target
+            -- in range; solo this overstates by the whole 15.
+            {spellID = 470945, bonus = 15},  -- Aspect of the Hydra
         },
     },
 }

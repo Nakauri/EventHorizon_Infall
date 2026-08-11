@@ -36,11 +36,14 @@ local function Line(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[Infall]|r " .. msg)
 end
 
+-- Recent avg is a 60 tick window, ie one second. Encounter avg spans the whole
+-- boss fight and is the number that describes raid cost.
 local METRICS = {
-    { "Recent avg", 1 },
-    { "Peak", 4 },
-    { "Over 1ms", 5 },
-    { "Over 5ms", 6 },
+    { "Recent avg", 1, "ms" },
+    { "Encounter avg", 2, "ms" },
+    { "Peak", 4, "ms" },
+    { "Over 1ms", 5, "ticks" },
+    { "Over 5ms", 6, "ticks" },
 }
 
 function P.Report()
@@ -49,22 +52,24 @@ function P.Report()
     if not (C_AddOnProfiler and C_AddOnProfiler.GetAddOnMetric) then
         Line("  addon profiler unavailable on this client")
     elseif C_AddOnProfiler.IsEnabled and not C_AddOnProfiler.IsEnabled() then
-        Line("  addon profiler is off. Enable with /console scriptProfile 1 then reload")
+        -- Gated on the addonProfilerEnabled CVar, not scriptProfile, and on for
+        -- everyone by default.
+        Line("  addon profiler is off. Enable with /console addonProfilerEnabled 1")
     else
         for _, m in ipairs(METRICS) do
             local ok, v = pcall(C_AddOnProfiler.GetAddOnMetric, ADDON, m[2])
             if ok and v then
-                if m[2] == 1 or m[2] == 4 then
-                    Line(string.format("  %-10s %.3f ms", m[1], v))
+                if m[3] == "ms" then
+                    Line(string.format("  %-14s %.3f ms", m[1], v))
                 else
-                    Line(string.format("  %-10s %d ticks", m[1], v))
+                    Line(string.format("  %-14s %d ticks", m[1], v))
                 end
             end
         end
         local okAll, all = pcall(C_AddOnProfiler.GetOverallMetric, 1)
         local okMine, mine = pcall(C_AddOnProfiler.GetAddOnMetric, ADDON, 1)
         if okAll and okMine and all and mine and all > 0 then
-            Line(string.format("  Share      %.1f%% of all addon time", (mine / all) * 100))
+            Line(string.format("  %-14s %.1f%% of all addon time", "Share", (mine / all) * 100))
         end
     end
 

@@ -310,7 +310,6 @@ CONFIG.cooldownColor = {171/255, 191/255, 181/255, 0.5}  -- the cooldown bar (sh
 CONFIG.castColor = {0.2, 0.8, 0.2, 0.7}                  -- the cast bar (shows while you're casting)
 CONFIG.buffColor = {0.4, 0.4, 0.9, 0.6}                  -- player buff overlay (default if no custom colour)
 CONFIG.debuffColor = {0.9, 0.3, 0.3, 0.6}                -- target debuff overlay (default if no custom colour)
-CONFIG.petBuffColor = {0.3, 0.6, 0.9, 0.7}               -- pet buff overlay
 CONFIG.gcdColor = {1, 1, 1, 0.1}                         -- GCD bar (shows global cooldown remaining)
 CONFIG.gcdSparkColor = {1, 1, 1, 0.6}                    -- the thin vertical line at the edge of the GCD
 ```
@@ -502,7 +501,6 @@ Inside the curly braces, `buffCooldownIDs` is a list of cooldownIDs for the buff
 
 The `color` field is optional. If you leave it out, the bar uses a default colour based on the unit:
 - `"target"` uses `CONFIG.debuffColor` (red by default)
-- `"pet"` uses `CONFIG.petBuffColor` (blue by default)
 - `"player"` or anything else uses `CONFIG.buffColor` (purple by default)
 
 ### Example: Track a DoT on Your Target
@@ -891,7 +889,6 @@ CONFIG.cooldownColor = {171/255, 191/255, 181/255, 0.5}
 CONFIG.castColor = {0.2, 0.8, 0.2, 0.7}
 CONFIG.buffColor = {0.4, 0.4, 0.9, 0.6}
 CONFIG.debuffColor = {0.9, 0.3, 0.3, 0.6}
-CONFIG.petBuffColor = {0.3, 0.6, 0.9, 0.7}
 CONFIG.gcdColor = {1, 1, 1, 0.1}
 CONFIG.gcdSparkColor = {1, 1, 1, 0.6}
 CONFIG.gcdSparkWidth = 3

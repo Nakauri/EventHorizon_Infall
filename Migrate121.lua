@@ -17,9 +17,7 @@ local function Say(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[Infall]|r " .. msg)
 end
 
-------------------------------------------------------------------------------
 -- Detection
-------------------------------------------------------------------------------
 
 -- Reads the live viewer, not GetCooldownViewerCategorySet, which returns
 -- static categories and includes entries the player has since hidden.
@@ -64,9 +62,7 @@ function M.AffectedNames(list)
         n, list[1].name, list[2].name, list[3].name)
 end
 
-------------------------------------------------------------------------------
 -- Window
-------------------------------------------------------------------------------
 
 local function OpenCooldownManager()
     if InCombatLockdown() then
@@ -182,13 +178,11 @@ function M.ShowNote()
     win:Show()
 end
 
-------------------------------------------------------------------------------
 -- Combat. The window stays up; only opening Blizzard's panel is restricted.
-------------------------------------------------------------------------------
 
 local queuedPrompt = false
 
-function SetActionsEnabled(enabled)
+SetActionsEnabled = function(enabled)
     if not win then return end
     if win.btnPrimary.combatLocked then
         if enabled then win.btnPrimary:Enable() else win.btnPrimary:Disable() end
@@ -211,12 +205,9 @@ combatWatcher:SetScript("OnEvent", function(_, event)
     end
 end)
 
-------------------------------------------------------------------------------
 -- Login
-------------------------------------------------------------------------------
 
 function M.CheckOnLogin()
-    if not ns.AuraCompat or not ns.AuraCompat.IS_121 then return end
     if InfallDB and InfallDB.seen121Note then return end
     -- Deferred until combat ends.
     if InCombatLockdown() then

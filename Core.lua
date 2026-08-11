@@ -25,15 +25,26 @@ ns.CONFIG = {
     nowLineColor = {1, 1, 1, 0.7},
     nowLineWidth = 2,
     
+    -- Space left of the bars when icons are hidden. 0 puts them flush.
+    hiddenIconWidth = 0,
+
     gcdColor = {1, 1, 1, 0.1},
     gcdSparkColor = {1, 1, 1, 0.6},
     gcdSparkWidth = 3,
-    
+
+    -- Off by default: it draws over every lane, so it is not something to inflict
+    -- on a player who did not ask for it.
+    castSpark = false,
+    castSparkWidth = 1,
+    castSparkColor = {0.2, 0.8, 0.2, 0.9},
+    castSparkMatchCast = true,
+
+
     cooldownColor = {171/255, 191/255, 181/255, 0.5},
     castColor = {0.2, 0.8, 0.2, 0.7},
     buffColor = {0.4, 0.4, 0.9, 0.6},
+    potionBuffColor = {0.4, 0.4, 0.9, 0.6},
     debuffColor = {0.9, 0.3, 0.3, 0.6},
-    petBuffColor = {0.3, 0.6, 0.9, 0.7},
     bgcolor = {0, 0, 0, 0.5},
     bordercolor = {0, 0, 0, 1},
     
@@ -111,8 +122,21 @@ ns.CONFIG = {
     showPastBars = true,
     forceViewersAlways = true,
     stackIndicators = false,
+    -- ApplyProfile skips nil keys, so a toggle with no default sticks at its last
+    -- value for any profile seeded before it existed.
+    estimateRuneCooldowns = false,
 
     customIcons = {},
+
+    -- Icon strip. Defaults live HERE, not in Icons.lua: ns.classConfigDefaults is
+    -- built at Settings.lua file scope, which loads first, so a default declared
+    -- later snapshots as empty and Reset to Default would wipe the user's setup.
+    -- Two levels each, mirroring stackIndicatorSettings / stackIndicatorList.
+    iconsEnabled = false,
+    iconContainers = {},   -- { key, anchor, grow, mode, size, spacing, perLine, zoom, text = {} }
+    iconList = {},         -- { cooldownID, container, enabled, states = {} }
+    iconIgnoreGCD = true,
+    iconStates = {},       -- ready|buff|cooldown|unusable = { show, desaturate, sweep, timer }
 }
 
 InfallDB = InfallDB or {}
@@ -172,7 +196,7 @@ function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
     -- Equipped item, ie a trinket.
     if cdInfo.equipSlot then
         local iiOk, itemID = pcall(GetInventoryItemID, "player", cdInfo.equipSlot)
-        if iiOk and itemID and not (issecretvalue and issecretvalue(itemID)) then
+        if iiOk and itemID and not issecretvalue(itemID) then
             local nOk, name = pcall(C_Item.GetItemNameByID, itemID)
             local iOk, icon = pcall(C_Item.GetItemIconByID, itemID)
             name = nOk and name or nil
@@ -217,4 +241,131 @@ function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
         return C_Spell.GetSpellName(sid), C_Spell.GetSpellTexture(sid)
     end
     return nil, nil
+end
+
+-- Cooldown Manager order, read without building it.
+-- Its accessors build lazily; a build on our stack is created tainted and
+-- Blizzard's own frames then throw on it. IsDirty and GetDisplayData build
+-- nothing, so read only when it is already built. Never call an accessor.
+
+local orderCache = {}
+
+local function CleanProvider()
+    local settings = CooldownViewerSettings
+    if not settings or not settings.GetDataProvider then return nil end
+    local ok, dp = pcall(settings.GetDataProvider, settings)
+    if not ok or not dp then return nil end
+    if not dp.IsDirty or not dp.GetOrderedCooldownIDsForCategory then return nil end
+    local okDirty, dirty = pcall(dp.IsDirty, dp)
+    if not okDirty or dirty then return nil end
+    return dp
+end
+
+function ns.CooldownOrderReady()
+    return CleanProvider() ~= nil
+end
+
+-- The player's real order, or nil if it cannot be had without building it.
+-- Callers fall back to GetCooldownViewerCategorySet, which is static defaults.
+function ns.OrderedCooldownIDs(category)
+    local dp = CleanProvider()
+    if dp then
+        local ok, ids = pcall(dp.GetOrderedCooldownIDsForCategory, dp, category)
+        if ok and ids and #ids > 0 then
+            orderCache[category] = ids
+            return ids
+        end
+    end
+    return orderCache[category]
+end
+
+-- Custom row and custom icon keys share one keyspace: the key indexes
+-- buffMappings, extraCasts, stackMappings, cooldownColors and customIcons, and
+-- none of those know which list an entry came from. Generate across both.
+
+-- Mutated field by field, never replaced, so this reference stays valid.
+local CONFIG = ns.CONFIG
+
+local KEY_TABLES = { "buffMappings", "extraCasts", "stackMappings",
+                     "cooldownColors", "customIcons" }
+
+-- Settings.lua's DeepCopy is a file local, and a shared reference would leave
+-- the two entries linked.
+local function CopyDeep(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, sub in pairs(v) do out[k] = CopyDeep(sub) end
+    return out
+end
+
+local function CollectKeys(into)
+    for _, e in ipairs(CONFIG.extras or {}) do
+        if e.key then into[e.key] = true end
+    end
+    for _, e in ipairs(CONFIG.iconList or {}) do
+        if e.key then into[e.key] = true end
+    end
+    return into
+end
+
+function ns.NextCustomKey()
+    local taken = CollectKeys({})
+    local n = 1
+    while taken["custom_" .. n] do n = n + 1 end
+    return "custom_" .. n
+end
+
+-- Settings are copied, not moved: a collided pair is indistinguishable here.
+function ns.MigrateCustomKeyCollisions()
+    if not CONFIG.extras or not CONFIG.iconList then return 0 end
+
+    local barKeys = {}
+    for _, e in ipairs(CONFIG.extras) do
+        if e.key then barKeys[e.key] = true end
+    end
+
+    local taken = CollectKeys({})
+    local fixed = 0
+
+    for _, e in ipairs(CONFIG.iconList) do
+        if e.key and barKeys[e.key] then
+            local n = 1
+            while taken["custom_" .. n] do n = n + 1 end
+            local newKey = "custom_" .. n
+            taken[newKey] = true
+
+            for _, tName in ipairs(KEY_TABLES) do
+                local t = CONFIG[tName]
+                if t and t[e.key] ~= nil then
+                    t[newKey] = CopyDeep(t[e.key])
+                end
+            end
+
+            e.key = newKey
+            fixed = fixed + 1
+        end
+    end
+
+    return fixed
+end
+
+-- Pixel grid. One physical pixel in a frame's own units, and snapping onto it.
+-- GetPhysicalScreenSize can report 0 mid display-mode change, and 768/0 would
+-- NaN every size derived from it, so the last good height stands in.
+local lastPhysH = 1080
+
+function ns.OnePx(scale)
+    local _, physH = GetPhysicalScreenSize()
+    if physH and physH > 0 then lastPhysH = physH end
+    if not scale or scale <= 0 then scale = 1 end
+    return 768 / lastPhysH / scale
+end
+
+function ns.OnePxForFrame(frame)
+    return ns.OnePx(frame and frame:GetEffectiveScale() or 1)
+end
+
+function ns.SnapPx(value, onePx)
+    if value == 0 or not onePx or onePx <= 0 then return value end
+    return math.floor(value / onePx + 0.5) * onePx
 end

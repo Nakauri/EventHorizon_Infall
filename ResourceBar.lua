@@ -9,6 +9,7 @@ local valueText, predText
 
 local currentPowerType, currentPowerToken
 local currentPowerMax = 0
+local maxPowerByType = {}
 local eventFrame
 
 local RebuildResourceBar, UpdateTickPositions, UpdateResourceBar, UpdatePrediction
@@ -141,9 +142,7 @@ local function GetCastSpellCost(spellID)
     return 0
 end
 
--- ============================================================================
 -- FRAME CREATION
--- ============================================================================
 
 local function CreateResourceBarFrames()
     if resourceRowFrame then return end
@@ -223,9 +222,7 @@ local function CreateResourceBarFrames()
     end)
 end
 
--- ============================================================================
 -- POWER DETECTION
--- ============================================================================
 
 local function DetectPowerType()
     local pType, pToken = UnitPowerType("player")
@@ -249,9 +246,7 @@ local function GetAutoColor()
     return {0.8, 0.8, 0.2, 1}
 end
 
--- ============================================================================
 -- TICK MARKS
--- ============================================================================
 
 UpdateTickPositions = function()
     for _, t in ipairs(tickTextures) do t:Hide() end
@@ -267,7 +262,7 @@ UpdateTickPositions = function()
     local tickPx = rb.tickWidth or 1
     local es = resourceBar:GetEffectiveScale()
     if not es or es == 0 then return end
-    local onePx = 768 / select(2, GetPhysicalScreenSize()) / es
+    local onePx = ns.OnePx(es)
 
     for i, tickData in ipairs(rb.tickMarks) do
         local val, tc
@@ -300,9 +295,7 @@ UpdateTickPositions = function()
     end
 end
 
--- ============================================================================
 -- POWER UPDATES
--- ============================================================================
 
 local channelPredActive = false
 
@@ -326,31 +319,47 @@ end
 local function UpdateMaxPower()
     if currentPowerType == nil then return end
     local maxP = UnitPowerMax("player", currentPowerType)
-    if issecretvalue(maxP) then return end
+    if issecretvalue(maxP) then
+        -- Keyed by type, so a form swap cannot leave the new power reading
+        -- against the old one's max.
+        maxP = maxPowerByType[currentPowerType]
+        if maxP == nil then return end
+    else
+        maxPowerByType[currentPowerType] = maxP
+    end
     currentPowerMax = maxP
     if currentPowerMax == 0 then
         if resourceRowFrame then resourceRowFrame:Hide() end
         return
+    end
+    -- A zero max earlier in the session hid this, and only a full rebuild
+    -- brought it back.
+    if resourceRowFrame and GetRB().enabled and not resourceRowFrame:IsShown() then
+        resourceRowFrame:Show()
     end
     resourceBar:SetMinMaxValues(0, currentPowerMax)
     UpdateTickPositions()
     UpdateResourceBar()
 end
 
--- ============================================================================
 -- PREDICTIVE POWER
--- ============================================================================
 
 local smoothDeltaPx = 0
 local lastPredSign = 0
 
-local function ClearPrediction()
+local function HidePredictionVisuals()
     if gainOverlay then gainOverlay:Hide() end
     if costOverlay then costOverlay:Hide() end
+    if predText then predText:Hide() end
+end
+
+-- Full stop: visuals off AND smoothing forgotten. The per-tick path must use
+-- HidePredictionVisuals instead, or the lerp below can never run.
+local function ClearPrediction()
+    HidePredictionVisuals()
     channelPredActive = false
     smoothDeltaPx = 0
     lastPredSign = 0
-    if predText then predText:Hide() end
 end
 
 UpdatePrediction = function()
@@ -435,7 +444,8 @@ UpdatePrediction = function()
         return
     end
 
-    ClearPrediction()
+    HidePredictionVisuals()
+    channelPredActive = false
 
     -- Hardcasts and costs: per-frame smoothed width
     local netDelta
@@ -494,9 +504,7 @@ UpdatePrediction = function()
     end
 end
 
--- ============================================================================
 -- EVENT HANDLING
--- ============================================================================
 
 local predElapsed = 0
 local function OnPredictionUpdate(self, dt)
@@ -517,6 +525,12 @@ local function OnEvent(self, event, ...)
 
     elseif event == "UNIT_MAXPOWER" then
         if (...) == "player" then UpdateMaxPower() end
+
+    elseif event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
+        -- Deferred: the new scale is not readable from inside the event.
+        C_Timer.After(0, function()
+            if UpdateTickPositions then UpdateTickPositions() end
+        end)
 
     elseif event == "UNIT_DISPLAYPOWER" then
         DetectPowerType()
@@ -562,9 +576,7 @@ local function OnEvent(self, event, ...)
     end
 end
 
--- ============================================================================
 -- PUBLIC API
--- ============================================================================
 
 RebuildResourceBar = function()
     CreateResourceBarFrames()
@@ -592,13 +604,17 @@ RebuildResourceBar = function()
     eventFrame:UnregisterAllEvents()
     eventFrame:RegisterUnitEvent("UNIT_POWER_FREQUENT", "player")
     eventFrame:RegisterUnitEvent("UNIT_MAXPOWER", "player")
-    eventFrame:RegisterEvent("UNIT_DISPLAYPOWER")
+    eventFrame:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", "player")
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_STOP", "player")
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_STOP", "player")
     eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
     eventFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
     eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    -- The tick marks are snapped to physical pixels, so they go stale when the
+    -- scale or the resolution changes. Bars and the icon strip take these too.
+    eventFrame:RegisterEvent("UI_SCALE_CHANGED")
+    eventFrame:RegisterEvent("DISPLAY_SIZE_CHANGED")
 
     DetectPowerType()
 
@@ -705,34 +721,8 @@ function ns.GetResourceBarRow()
     }
 end
 
--- ============================================================================
--- SLASH COMMAND
--- ============================================================================
 
-SLASH_EHIRB1 = "/rb"
-SlashCmdList["EHIRB"] = function(msg)
-    msg = (msg or ""):lower():trim()
-    if msg == "status" then
-        local rb = GetRB()
-        print("|cffff8800[RB]|r enabled=" .. tostring(rb.enabled)
-            .. " pred=" .. tostring(rb.ghostEnabled)
-            .. " pType=" .. tostring(currentPowerType)
-            .. " pMax=" .. tostring(currentPowerMax))
-        if resourceBar then
-            print("|cffff8800[RB]|r barWidth=" .. tostring(resourceBar:GetWidth())
-                .. " shown=" .. tostring(resourceBar:IsShown()))
-        end
-        local n1 = UnitCastingInfo("player")
-        local n2 = UnitChannelInfo("player")
-        print("|cffff8800[RB]|r casting=" .. tostring(n1) .. " channel=" .. tostring(n2))
-    else
-        print("|cffff8800[RB]|r /rb status")
-    end
-end
-
--- ============================================================================
 -- SETTINGS TAB BUILDER
--- ============================================================================
 
 function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
     local CreateCheckbox = helpers.CreateCheckbox
@@ -837,78 +827,19 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
     end)
     AddWidget(gapSlider)
 
-    AddDescription("When stack indicators are on the same side (top or bottom), row order controls where the resource bar sits relative to them. Has no effect without stack indicators.")
+    AddDescription("Everything sharing this edge, drawn nearest the frame first. Stack pips and the icon strip show the same list from their own tabs.")
 
-    local orderFrame = CreateFrame("Frame", nil, content)
-    orderFrame:SetSize(300, 26)
-    local orderLabel = orderFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    orderLabel:SetPoint("LEFT", 0, 0)
-    orderLabel:SetText("Row Order")
-
-    local orderVal = orderFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    orderVal:SetPoint("LEFT", orderLabel, "RIGHT", 8, 0)
-
-    local orderUp = CreateFrame("Button", nil, orderFrame, "UIPanelButtonTemplate")
-    orderUp:SetSize(50, 22)
-    orderUp:SetPoint("LEFT", orderVal, "RIGHT", 8, 0)
-    orderUp:SetText("Up")
-
-    local orderDown = CreateFrame("Button", nil, orderFrame, "UIPanelButtonTemplate")
-    orderDown:SetSize(50, 22)
-    orderDown:SetPoint("LEFT", orderUp, "RIGHT", 2, 0)
-    orderDown:SetText("Down")
-
-    local function GetPipCount()
-        local counts = ns.siRowCounts or {top = 0, bottom = 0}
-        local pos = rb.position or "BOTTOM"
-        return pos == "BOTTOM" and counts.bottom or counts.top
+    local orderCtl
+    if ns.CreateEdgeOrderControl then
+        orderCtl = ns.CreateEdgeOrderControl(content,
+            function() return rb.position or "BOTTOM" end,
+            function() return rb.enabled and { kind = "resource" } or nil end,
+            SaveAndRebuild)
+        AddWidget(orderCtl)
     end
-
     local function UpdateOrderText()
-        local pipCount = GetPipCount()
-        if pipCount == 0 then
-            orderVal:SetText("No other rows")
-            orderUp:SetEnabled(false)
-            orderDown:SetEnabled(false)
-            return
-        end
-        orderUp:SetEnabled(true)
-        orderDown:SetEnabled(true)
-        local o = rb.order
-        if not o or o > pipCount then
-            orderVal:SetText("Last")
-        elseif o <= 1 then
-            orderVal:SetText("First")
-        else
-            orderVal:SetText(tostring(o) .. " of " .. tostring(pipCount + 1))
-        end
+        if orderCtl then orderCtl.Refresh() end
     end
-    UpdateOrderText()
-
-    orderUp:SetScript("OnClick", function()
-        local pipCount = GetPipCount()
-        local cur = rb.order
-        if not cur or cur > pipCount then
-            rb.order = math.max(1, pipCount)
-        else
-            rb.order = math.max(1, cur - 1)
-        end
-        UpdateOrderText()
-        SaveAndRebuild()
-    end)
-    orderDown:SetScript("OnClick", function()
-        local pipCount = GetPipCount()
-        local cur = rb.order or (pipCount + 1)
-        if cur >= pipCount + 1 then
-            rb.order = nil
-        else
-            rb.order = cur + 1
-            if rb.order > pipCount then rb.order = nil end
-        end
-        UpdateOrderText()
-        SaveAndRebuild()
-    end)
-    AddWidget(orderFrame)
 
     DetectPowerType()
     local autoClr = GetAutoColor()
@@ -1334,16 +1265,13 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
                 })
             end)
 
-            local removeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-            removeBtn:SetSize(22, 18)
-            removeBtn:SetPoint("LEFT", 74, 0)
-            removeBtn:SetText("x")
             local capturedIdx = idx
-            removeBtn:SetScript("OnClick", function()
+            local removeBtn = ns.CreateRemoveButton(row, "Remove Tick", function()
                 table.remove(rb.tickMarks, capturedIdx)
                 RebuildTickList()
                 SaveAndRebuild()
-            end)
+            end, 18)
+            removeBtn:SetPoint("LEFT", 74, 0)
 
             row:Show()
             tickWidgets[#tickWidgets + 1] = row
@@ -1376,8 +1304,11 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
         origSaveAndRebuild()
     end
 
-    local function RefreshResourceTab()
-        refreshing = true
+    -- Restored through a pcall. Every setter in this tab is gated on this flag,
+    -- so a throw anywhere in the repopulate used to leave it stuck true and the
+    -- whole tab silently read only until a reload, with no error to connect it
+    -- to. Same defect the Icons and Display tabs carried.
+    local function RefreshResourceTabInner()
         rb = CONFIG.resourceBar or {}
         enableCB:SetChecked(rb.enabled or false)
         UpdatePosHighlight()
@@ -1414,7 +1345,16 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
         tickWidthSlider:SetValue(rb.tickWidth or 1)
         defaultTickSwatch:SetColor(rb.tickColor and DeepCopy(rb.tickColor) or {1, 1, 1, 0.8})
         RebuildTickList()
-        refreshing = false
+    end
+
+    local function RefreshResourceTab()
+        local was = refreshing
+        refreshing = true
+        local ok, err = pcall(RefreshResourceTabInner)
+        refreshing = was
+        if not ok then
+            print("|cff00ff00[Infall]|r The resource settings could not be refreshed. Reload if it looks wrong: " .. tostring(err))
+        end
     end
 
     tab:SetScript("OnShow", RefreshResourceTab)

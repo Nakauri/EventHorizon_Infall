@@ -19,6 +19,9 @@ CONFIG.hiddenCooldownIDs = CONFIG.hiddenCooldownIDs or {}
 CONFIG.chargesDisabled = CONFIG.chargesDisabled or {}
 
 local activeCast
+-- Own record, not activeCast: that only exists for casts matching a row.
+local sparkCast
+local HideCastSpark
 local cachedGcdDurObj
 local lastFedGcdDurObj
 local shownSetupHint = false
@@ -30,77 +33,32 @@ local SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "a
 local PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay", "lastPtr_third"}
 local HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay", "hidden_third"}
 
--- ============================================================================
--- EXTRAS: Racial + Potion lookup tables
--- ============================================================================
+-- Combat potion aura. No readable timing exists for it under aura restrictions,
+-- so the window is self-timed from the cast and outranks lane resolution.
+local POTION_BUFF_DURATION = 30
+local ArmPotionWindow
 
-local RACE_RACIALS = {
-    Scourge            = { 7744 },
-    Tauren             = { 20549 },
-    Orc                = { 20572, 33697, 33702 },
-    BloodElf           = { 202719, 50613, 25046, 69179, 80483, 155145, 129597, 232633, 28730 },
-    Dwarf              = { 20594 },
-    Troll              = { 26297 },
-    Draenei            = { 28880 },
-    NightElf           = { 58984 },
-    Human              = { 59752 },
-    DarkIronDwarf      = { 265221 },
-    Gnome              = { 20589 },
-    HighmountainTauren = { 69041 },
-    Worgen             = { 68992 },
-    Goblin             = { 69070 },
-    Pandaren           = { 107079 },
-    MagharOrc          = { 274738 },
-    LightforgedDraenei = { 255647 },
-    VoidElf            = { 256948 },
-    KulTiran           = { 287712 },
-    ZandalariTroll     = { 291944 },
-    Vulpera            = { 312411 },
-    Mechagnome         = { 312924 },
-    Dracthyr           = { 357214, 368970 },
-    EarthenDwarf       = { 436344 },
-    Haranir            = { 1287685 },
+-- Match on config shape: GetLastCategoryCooldownSource is secret in combat,
+-- CooldownViewerCooldown is not. Category 4 only; 30, 1711 and 2566 are health
+-- potions and healthstones.
+-- Cast spellID to window seconds, and the membership test: linkedSpellIDs is
+-- empty on consumable entries. An id missing here draws no aura bar.
+local POTION_BUFF_DURATIONS = {
+    [1236616] = 30,   -- Light's Potential
+    [1236998] = 30,   -- Draught of Rampant Abandon
+    [1236994] = 30,   -- Potion of Recklessness
+    [1238443] = 30,   -- Potion of Zealotry
 }
 
--- Racial buff durations (seconds) for racials that grant a trackable buff
-local RACIAL_BUFF_DURATIONS = {
-    [26297]  = 12,   -- Berserking (Troll)
-    [20572]  = 15,   -- Blood Fury (Orc, melee AP)
-    [33697]  = 15,   -- Blood Fury (Orc, spell power)
-    [33702]  = 15,   -- Blood Fury (Orc, AP+SP)
-    [20594]  = 8,    -- Stoneform (Dwarf)
-    [265221] = 8,    -- Fireblood (Dark Iron Dwarf)
-    [274738] = 15,   -- Ancestral Call (Mag'har Orc)
-    [68992]  = 10,   -- Darkflight (Worgen)
-    [28880]  = 5,    -- Gift of the Naaru (Draenei)
-}
+local SPELL_CATEGORY_COMBAT_POTION = 4
 
--- Persistent extras timer cache (survives bar rebuilds within a session)
-ns._activeExtrasTimers = ns._activeExtrasTimers or {}
-
-local POTION_BUFFS = {
-    { buffSpellID = 1236616, itemID = 241309, name = "Light's Potential",          buffDuration = 30, cdDuration = 300 },
-    { buffSpellID = 1236998, itemID = 241293, name = "Draught of Rampant Abandon", buffDuration = 30, cdDuration = 300 },
-    { buffSpellID = 1236994, itemID = 241289, name = "Potion of Recklessness",     buffDuration = 30, cdDuration = 300 },
-    { buffSpellID = 1238443, itemID = 241297, name = "Potion of Zealotry",         buffDuration = 30, cdDuration = 300 },
-}
-
-local POTION_BUFF_LOOKUP = {}
-for _, pot in ipairs(POTION_BUFFS) do
-    POTION_BUFF_LOOKUP[pot.buffSpellID] = pot
-end
-
-local TRINKET_ITEMS = {
-    { spellID = 383781,  itemID = 193701, buffDuration = 20, cdDuration = 120 },  -- Algeth'ar Puzzle Box
-    { spellID = 1259633, itemID = 249344, buffDuration = 15, cdDuration = 90 },   -- Light Company Guidon
-    { spellID = 1260459, itemID = 249346, buffDuration = 15, cdDuration = 90 },   -- Vaelgor's Final Stare
-    { spellID = 1250508, itemID = 250144, buffDuration = 15, cdDuration = 120 },  -- Emberwing Feather
-    { spellID = 71564,   itemID = 50259,  buffDuration = 20, cdDuration = 180 },  -- Nevermelting Ice Crystal
-}
-
-local TRINKET_SPELL_LOOKUP = {}
-for _, tri in ipairs(TRINKET_ITEMS) do
-    TRINKET_SPELL_LOOKUP[tri.spellID] = tri
+local function CombatPotionRowInfo(cooldownID)
+    if not cooldownID or issecretvalue(cooldownID) then return nil end
+    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+    if not ok or not info then return nil end
+    if info.spellID or info.equipSlot then return nil end
+    if info.spellCategoryID ~= SPELL_CATEGORY_COMBAT_POTION then return nil end
+    return info
 end
 
 local function GetCooldownColor(row)
@@ -206,6 +164,8 @@ end
 
 local UpdateChargeState
 local InstallBuffFrameHooks
+
+local chargeDurWarned = {}
 
 -- Apply CONFIG font (or fallback) to a FontString at a given size.
 local function ApplyFont(fontString, size)
@@ -325,7 +285,7 @@ local function SpellIdentitySet(id)
     end
     add(C_Spell and C_Spell.GetOverrideSpell, id)
     add(C_Spell and C_Spell.GetBaseSpell, id)
-    add(FindBaseSpellByID, id)
+    add(C_SpellBook and C_SpellBook.FindBaseSpellByID, id)
     add(C_SpellBook and C_SpellBook.FindSpellOverrideByID, id)
     return t
 end
@@ -342,7 +302,9 @@ local function RowMatchesCastSpell(row, castSpellID)
     return (rowSet and rowSet[castSpellID]) and true or false
 end
 
-local function UpdateCastBar(event)
+local channelRetryPending = false
+
+local function UpdateCastBar(event, isRetry)
     local name, text, texture, startTimeMS, endTimeMS, isTradeSkill, castID, notInterruptible, spellID
     local isChannel
     local numStages
@@ -355,6 +317,16 @@ local function UpdateCastBar(event)
         if not name then
             name, text, texture, startTimeMS, endTimeMS, isTradeSkill, castID, notInterruptible, spellID = UnitCastingInfo("player")
             isChannel = false
+        end
+        -- UnitChannelInfo can be empty on the frame the start event fires.
+        -- One retry, then the nil path below cleans up as normal.
+        if not name and not isRetry and not channelRetryPending then
+            channelRetryPending = true
+            C_Timer.After(0, function()
+                channelRetryPending = false
+                UpdateCastBar(event, true)
+            end)
+            return
         end
     else
         name, text, texture, startTimeMS, endTimeMS, isTradeSkill, castID, notInterruptible, spellID = UnitCastingInfo("player")
@@ -373,6 +345,13 @@ local function UpdateCastBar(event)
         end
     end
     
+    -- Recorded before the row lookup, so an untracked spell still gets a spark.
+    if name and spellID and startTimeMS and endTimeMS then
+        sparkCast = { endTime = endTimeMS / 1000, spellID = spellID }
+    else
+        sparkCast = nil
+    end
+
     if name and spellID then
         local targetRow
         for _, row in ipairs(cooldownBars) do
@@ -421,7 +400,8 @@ local function UpdateCastBar(event)
             activeCast = {
                 spellID = spellID,
                 row = targetRow,
-                isChannel = isChannel
+                isChannel = isChannel,
+                castID = castID
             }
             -- DurObj for countdown; fallback to raw endTime
             if C_DurationUtil and durSec > 0 then
@@ -525,6 +505,60 @@ local function UpdateCastBar(event)
     end
 end
 
+-- One line at the cast's end, crossing every lane, moving toward the now line.
+local castSparkFrame, castSparkTex
+
+HideCastSpark = function()
+    if castSparkFrame then castSparkFrame:Hide() end
+end
+
+local function UpdateCastSpark()
+    if not CONFIG.castSpark or not sparkCast then
+        HideCastSpark()
+        return
+    end
+
+    local remaining = sparkCast.endTime - GetTime()
+    if remaining <= 0 then
+        sparkCast = nil
+        HideCastSpark()
+        return
+    end
+    -- Past the edge of the timeline there is nowhere honest to draw it.
+    if remaining > CONFIG.future then
+        HideCastSpark()
+        return
+    end
+
+    if not castSparkFrame then
+        castSparkFrame = CreateFrame("Frame", nil, EH_Parent)
+        castSparkFrame:SetFrameLevel(EH_Parent:GetFrameLevel() + 20)
+        castSparkTex = castSparkFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+    end
+
+    -- Padded like a row: GetBarOffset is the icon column only.
+    castSparkFrame:ClearAllPoints()
+    castSparkFrame:SetPoint("TOPLEFT", EH_Parent, "TOPLEFT",
+        CONFIG.paddingLeft, -CONFIG.paddingTop)
+    castSparkFrame:SetPoint("BOTTOMRIGHT", EH_Parent, "BOTTOMRIGHT",
+        -CONFIG.paddingRight, CONFIG.paddingBottom)
+
+    local colour = CONFIG.castSparkColor
+    if CONFIG.castSparkMatchCast then
+        colour = (CONFIG.castColors and CONFIG.castColors[sparkCast.spellID])
+            or CONFIG.castColor or colour
+    end
+    castSparkTex:SetColorTexture(unpack(colour))
+
+    -- Left edge on the cast's end, matching the GCD spark's anchor.
+    local x = GetBarOffset() + TimeToPixel(remaining)
+    castSparkTex:ClearAllPoints()
+    castSparkTex:SetPoint("TOPLEFT", castSparkFrame, "TOPLEFT", x, 0)
+    castSparkTex:SetPoint("BOTTOMLEFT", castSparkFrame, "BOTTOMLEFT", x, 0)
+    castSparkTex:SetWidth(CONFIG.castSparkWidth or 1)
+    castSparkFrame:Show()
+end
+
 local function UpdateActiveCastBar()
     if not activeCast then return end
 
@@ -534,6 +568,7 @@ local function UpdateActiveCastBar()
     else
         remaining = (activeCast.endTime or 0) - GetTime()
     end
+
 
     if remaining > 0 then
         local row = activeCast.row
@@ -830,12 +865,83 @@ end
 local CreateTimeLines
 local ResizeContainer
 
-local ICON_HIDDEN_WIDTH = 20
-local ICON_HIDDEN_GAP = 4
+-- Space left of the bars when icons are off. Zero puts them flush.
+local function HiddenIconWidth()
+    return math.max(0, CONFIG.hiddenIconWidth or 0)
+end
+
+-- Icon while there is one, bar lane when there is not. The icon box is a few
+-- pixels wide with icons off, so anchor points inside it are indistinguishable.
+local function TextAnchorHome(row)
+    if CONFIG.hideIcons then return row.barTextOverlay or row.textOverlay end
+    return row.textOverlay
+end
+
+local function ApplyTextAnchors(row)
+    local home = TextAnchorHome(row)
+    if not home then return end
+    if row.chargeText then
+        row.chargeText:ClearAllPoints()
+        row.chargeText:SetPoint(CONFIG.chargeTextAnchor, home,
+            CONFIG.chargeTextRelPoint, CONFIG.chargeTextOffsetX, CONFIG.chargeTextOffsetY)
+    end
+    if row.stackText then
+        row.stackText:ClearAllPoints()
+        row.stackText:SetPoint(CONFIG.stackTextAnchor, home,
+            CONFIG.stackTextRelPoint, CONFIG.stackTextOffsetX, CONFIG.stackTextOffsetY)
+    end
+end
+ns.ApplyTextAnchors = ApplyTextAnchors
+
+-- Settings call this rather than a full reload: a text offset does not need one,
+-- and it re-anchors every live row instead of relying on the rebuild path.
+function ns.RefreshTextAnchors()
+    for _, row in ipairs(cooldownBars) do
+        ApplyTextAnchors(row)
+    end
+end
+
+-- Lane height and pitch in whole physical pixels, so every lane and every
+-- separator comes out identical. Snapping the height alone is not enough: the
+-- separator rides on the pitch, and a pitch off the grid drifts by lane index.
+-- Same rounding the stack pips had, on the other axis.
+local lanePitchCache = setmetatable({}, { __mode = "k" })
+
+local function ChargeLaneMetrics(frame, barHeight, maxC)
+    maxC = math.max(2, maxC or 2)
+    local _, physH = GetPhysicalScreenSize()
+    local es = (frame and frame:GetEffectiveScale()) or 1
+    if es <= 0 then es = 1 end
+    if not physH or physH <= 0 then
+        local raw = (barHeight - (maxC - 1)) / maxC
+        return math.max(1, raw), math.max(1, raw) + 1
+    end
+    local onePx = ns.OnePx(es)
+    local totalPx = math.max(1, math.floor(barHeight / onePx + 0.5))
+    local sepPx = math.max(1, math.floor(1 / onePx + 0.5))
+    local laneP = math.max(1, math.floor((totalPx - (maxC - 1) * sepPx) / maxC))
+    return laneP * onePx, (laneP + sepPx) * onePx
+end
+
+-- Set alongside laneHeight, read wherever a lane's y offset is derived.
+local function SetChargeLaneMetrics(row, barHeight, maxC)
+    local h, pitch = ChargeLaneMetrics(row, barHeight, maxC)
+    row.cdBar.laneHeight = h
+    lanePitchCache[row] = pitch
+    return h, pitch
+end
+
+local function ChargeLanePitch(row, laneH)
+    return lanePitchCache[row] or ((laneH or 0) + 1)
+end
+
+local function ChargeBottomY(row, laneH, maxC)
+    return -((math.max(2, maxC or 2) - 1) * ChargeLanePitch(row, laneH))
+end
 
 GetBarOffset = function()
     if CONFIG.hideIcons then
-        return ICON_HIDDEN_WIDTH + ICON_HIDDEN_GAP
+        return HiddenIconWidth()
     else
         return CONFIG.iconSize + (CONFIG.iconGap or 10)
     end
@@ -859,14 +965,19 @@ local function ApplyIconMode(row)
         if row.iconGlow then row.iconGlow:Hide() end
         if row.innerGlowAnim and row.innerGlowAnim:IsPlaying() then row.innerGlowAnim:Stop() end
         if row.glowAnim and row.glowAnim:IsPlaying() then row.glowAnim:Stop() end
-        
-        row.iconContainer:SetSize(ICON_HIDDEN_WIDTH, CONFIG.height)
+
+        -- A frame cannot be zero wide; 1px and empty.
+        row.iconContainer:SetSize(math.max(1, HiddenIconWidth()), CONFIG.height)
+        if row.textOverlay then row.textOverlay:SetAllPoints(row.iconContainer) end
+        ApplyTextAnchors(row)
     else
         row.icon:Show()
         row.iconBorder:Show()
         row.innerGlow:SetAlpha(0)  -- default hidden state, procs will show it
 
         row.iconContainer:SetSize(CONFIG.iconSize, CONFIG.iconSize)
+        if row.textOverlay then row.textOverlay:SetAllPoints(row.iconContainer) end
+        ApplyTextAnchors(row)
         row.iconBorder:SetSize(CONFIG.iconSize + 2, CONFIG.iconSize + 2)
         row.innerGlow:ClearAllPoints()
         row.innerGlow:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
@@ -915,7 +1026,7 @@ local function ApplyIconMode(row)
     
     -- Past clip frames
     local pastWidth = GetNowPixelOffset()
-    local pastClips = {row.pastCdClip, row.pastBuffClip, row.pastOverlayClip, row.pastCastClip}
+    local pastClips = {row.pastCdClip, row.pastBuffClip, row.pastOverlayClip, row.pastThirdClip, row.pastCastClip}
     for _, clip in ipairs(pastClips) do
         if clip then
             clip:ClearAllPoints()
@@ -949,6 +1060,9 @@ local function ApplyIconMode(row)
         row.barTextOverlay:SetPoint("TOPLEFT", row, "TOPLEFT", barOffset, 0)
         row.barTextOverlay:SetSize(CONFIG.width, row:GetHeight())
     end
+
+    -- Which frame the text hangs off flips with the icon toggle.
+    ApplyTextAnchors(row)
 end
 
 local function ApplyBuffLayer(row)
@@ -1167,6 +1281,60 @@ local function FeedHiddenCooldown(rowRef, timerType, durObj, clearIfZero)
     if timerType == "cd" then FeedCdText(rowRef, durObj) end
 end
 
+-- Raw write that also updates the pointer cache. FeedHiddenCooldown early-returns
+-- on a matching pointer, so a stale cache makes the next clear a no-op.
+local function FeedHiddenCooldownRaw(rowRef, timerType, durObj)
+    local keys = hiddenKeys[timerType]
+    if not keys then return end
+    local cd = rowRef[keys.frame]
+    if not cd then return end
+    if durObj then
+        pcall(cd.SetCooldownFromDurationObject, cd, durObj)
+    else
+        cd:SetCooldown(0, 0)
+    end
+    rowRef[keys.ptr] = durObj
+end
+
+ArmPotionWindow = function(row, windowSeconds)
+    if not row or not row.buffBar then return end
+    local window = windowSeconds or POTION_BUFF_DURATION
+    local now = GetTime()
+    local durObj = C_DurationUtil.CreateDuration()
+    durObj:SetTimeFromStart(now, window)
+    local buffColor = CONFIG.potionBuffColor or CONFIG.buffColor
+    row.activeBuffDuration = durObj
+    row._potionWindowExpiry = now + window
+    row._auraMirrorCdID = nil
+    row.resolvedBuffColor = buffColor
+    row.trackedBuffAuraInstanceID = nil
+    row.buffBar:SetStatusBarColor(buffColor[1], buffColor[2], buffColor[3], buffColor[4] or 1)
+    FeedHiddenCooldown(row, "buff", durObj)
+    if not row.buffBar:IsShown() then
+        row.buffBar:SetValue(0)
+        row.buffBar:Show()
+    end
+end
+
+local function FeedChargeIndicators(row, chargeInfo)
+    if not chargeInfo then return end
+    local cc = chargeInfo.currentCharges
+    row.depletedIndicator:SetValue(cc)
+    if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
+    if row.middleClipIndicators then
+        for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
+    end
+    if row.middleLanes then
+        for _, ml2 in ipairs(row.middleLanes) do
+            if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
+        end
+    end
+    -- Never concatenated: currentCharges has no NeverSecret flag.
+    if row.chargeText and row.hasCharges then
+        row.chargeText:SetText(cc)
+    end
+end
+
 -- Event-driven charge bar fill via SetTimerDuration.
 local IMM_INTERP = Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate
 local REMAIN_DIR = Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.RemainingTime
@@ -1187,21 +1355,8 @@ FeedChargeBarTimers = function(row)
     local isOnGCD = cdInfoOk and cdInfo and cdInfo.isOnGCD
     if isOnGCD then cdDurObj = nil end
 
-    -- Feed all charge-driven indicators with currentCharges
     local chargesOk, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
-    if chargesOk and chargeInfo then
-        local cc = chargeInfo.currentCharges
-        row.depletedIndicator:SetValue(cc)
-        if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
-        if row.middleClipIndicators then
-            for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
-        end
-        if row.middleLanes then
-            for _, ml2 in ipairs(row.middleLanes) do
-                if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
-            end
-        end
-    end
+    if chargesOk then FeedChargeIndicators(row, chargeInfo) end
 
     row._chargeDurObj = chargeDurObj
     row._cdDurObj = cdDurObj
@@ -1213,7 +1368,9 @@ FeedChargeBarTimers = function(row)
     end
     FeedHiddenCooldown(row, "cd", cdDurObj)
 
-    if chargeDurObj and IMM_INTERP and REMAIN_DIR then
+    local timed = chargeDurObj and IMM_INTERP and REMAIN_DIR
+        and not row._chargeDurUnknown
+    if timed then
         row.depletedChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
         row.normalChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
     else
@@ -1225,7 +1382,7 @@ FeedChargeBarTimers = function(row)
         for j = 1, row.maxCharges - 2 do
             local ml = row.middleLanes[j]
             if ml then
-                if chargeDurObj and IMM_INTERP and REMAIN_DIR then
+                if timed then
                     ml.depletedChargeBar:SetTimerDuration(chargeDurObj, IMM_INTERP, REMAIN_DIR)
                 else
                     ml.depletedChargeBar:SetValue(0)
@@ -1245,7 +1402,7 @@ local function CreateCooldownBar(spellID, index)
     
     row.iconContainer = CreateFrame("Frame", nil, row)
     if CONFIG.hideIcons then
-        row.iconContainer:SetSize(ICON_HIDDEN_WIDTH, CONFIG.height)
+        row.iconContainer:SetSize(math.max(1, HiddenIconWidth()), CONFIG.height)
     else
         row.iconContainer:SetSize(CONFIG.iconSize, CONFIG.iconSize)
     end
@@ -1354,6 +1511,9 @@ local function CreateCooldownBar(spellID, index)
         pcall(cdTextFrame.SetMinimumCountdownDuration, cdTextFrame, (CONFIG.cdTextMinDuration or 30) * 1000)
     end
 
+    -- After barTextOverlay exists, which is what it anchors to with icons off.
+    ApplyTextAnchors(row)
+
     -- Cooldown bar (top half for charge spells, full height otherwise).
     local nowPx = GetNowPixelOffset()
     local futureWidth = GetFutureWidth()
@@ -1367,7 +1527,7 @@ local function CreateCooldownBar(spellID, index)
     
     row.cdBar:Hide()
     row.cdBar.fullHeight = CONFIG.height
-    row.cdBar.laneHeight = (CONFIG.height - 1) / 2
+    SetChargeLaneMetrics(row, CONFIG.height, 2)
     
     -- Past clip frames, one per lane, matching future counterpart frame levels.
     local baseLevel = row:GetFrameLevel()
@@ -1531,16 +1691,27 @@ ResizeContainer = function()
         row:SetHeight(rowHeight)
         row.cdBar.fullHeight = rowHeight
         local maxC = row.maxCharges or 2
-        row.cdBar.laneHeight = (rowHeight - (maxC - 1)) / maxC
+        SetChargeLaneMetrics(row, rowHeight, maxC)
 
         if row.isChargeSpell then
             local lH = row.cdBar.laneHeight
-            local bottomY = -(rowHeight - lH)
+            local bottomY = ChargeBottomY(row, lH, maxC)
             row.cdBar:SetHeight(lH)
             if row.depletedWrapper then
                 local futW = GetFutureWidth()
                 local nowOff = GetBarOffset() + GetNowPixelOffset()
+
+                -- Re-anchor, not just resize: these were positioned once at
+                -- configure time and stayed put when the bar offset moved.
+                row.depletedIndicator:ClearAllPoints()
+                row.depletedIndicator:SetPoint("TOPLEFT", row, "TOPLEFT", nowOff, 0)
                 row.depletedIndicator:SetSize(futW, rowHeight)
+
+                row.depletedWrapper:ClearAllPoints()
+                row.depletedWrapper:SetPoint("TOPLEFT", row, "TOPLEFT", nowOff, 0)
+                row.depletedWrapper:SetPoint("BOTTOMRIGHT",
+                    row.depletedIndicator:GetStatusBarTexture(), "TOPRIGHT")
+
                 row.notDepletedWrapper:ClearAllPoints()
                 row.notDepletedWrapper:SetPoint("TOPLEFT", row.depletedIndicator:GetStatusBarTexture(), "TOPLEFT")
                 row.notDepletedWrapper:SetPoint("BOTTOMRIGHT", row, "TOPLEFT", nowOff + futW, -rowHeight)
@@ -1580,7 +1751,7 @@ ResizeContainer = function()
                     end
                     local ml = row.middleLanes[j]
                     if ml then
-                        local laneY = -(j * (lH + 1))
+                        local laneY = -(j * ChargeLanePitch(row, lH))
                         ml.depletedHelperBar:SetSize(math.max(1, j * slotPx), lH)
                         ml.depletedHelperBar:ClearAllPoints()
                         ml.depletedHelperBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", 0, laneY)
@@ -1648,15 +1819,17 @@ CreateTimeLines = function()
     local colorDef = CONFIG.linesColor or {1, 1, 1, 0.3}
     local multiColor = type(colorDef[1]) == "table"
     local barOffset = GetBarOffset()
-    
+    local onePx = ns.OnePxForFrame(linesOverlay)
+
     for i, seconds in ipairs(lineDef) do
         if seconds > 0 and seconds <= CONFIG.future then
             local line = frameTimeLines[i]
             if not line then
                 line = linesOverlay:CreateTexture(nil, "OVERLAY")
-                line:SetWidth(1)
                 frameTimeLines[i] = line
             end
+            -- Every pass: the scale can change under an existing line.
+            line:SetWidth(onePx)
             
             local color
             if multiColor then
@@ -1668,6 +1841,7 @@ CreateTimeLines = function()
             
             -- Use timeline coordinate system: seconds is a future offset
             local xOffset = CONFIG.paddingLeft + barOffset + TimeToPixel(seconds)
+            xOffset = math.floor(xOffset / onePx + 0.5) * onePx
             line:ClearAllPoints()
             line:SetPoint("TOP", linesOverlay, "TOPLEFT", xOffset, 0)
             line:SetPoint("BOTTOM", linesOverlay, "BOTTOMLEFT", xOffset, 0)
@@ -1687,14 +1861,17 @@ local LoadEssentialCooldowns
 local function SmartReorder()
     local newOrderCooldownIDs = {}
     
-    if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
-        local dataProvider = CooldownViewerSettings:GetDataProvider()
-        if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
-            local displayedCooldownIDs = dataProvider:GetOrderedCooldownIDsForCategory(0)
+    -- Never the raw provider: its accessors build lazily and a build on our
+    -- stack is created tainted. See ns.OrderedCooldownIDs in Core.lua.
+    do
+        local displayedCooldownIDs = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
+        do
             if displayedCooldownIDs then
                 for _, cdID in ipairs(displayedCooldownIDs) do
                     local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
-                    if infoOk and info and info.spellID then
+                    -- Item entries have no spellID. The count still disagrees when extras
+                    -- or hidden rows exist, so a full reload is not fully avoided.
+                    if infoOk and info and (info.spellID or info.spellCategoryID or info.equipSlot) then
                         table.insert(newOrderCooldownIDs, cdID)
                     end
                 end
@@ -1779,6 +1956,10 @@ local function extractAuraInstanceID(frame)
     return frame.auraInstanceID
 end
 
+local function extractIconTexture(frame)
+    return frame.Icon and frame.Icon:GetTexture()
+end
+
 -- Cached tables reused by ScanViewerFrames to avoid per-call allocation
 local cachedCooldownViewerFrames = {}
 local cachedBuffViewerFrames = {}
@@ -1788,7 +1969,69 @@ local buffViewerNames = {"BuffIconCooldownViewer", "BuffBarCooldownViewer"}
 -- Hook-maintained persistent maps: survive combat without frame pool iteration
 local persistentCooldownMap = {}
 local persistentBuffMap = {}
-ns.GetPersistentBuffFrame = function(cdID) return persistentBuffMap[cdID] end
+
+-- A cooldown-viewer frame may stand in for a buff frame but has no Bar. Item
+-- entries share one cooldownID across both, so the stand-in can hold the slot.
+-- Tracked here so it can be upgraded on read.
+local persistentBuffFallback = {}
+local buffPromoteNext = {}
+
+local function ResolveBuffFrame(cdID)
+    if not cdID then return nil end
+    local frame = persistentBuffMap[cdID]
+    if frame and not persistentBuffFallback[cdID] then return frame end
+    -- Stand-ins only; walking every id returns pool iteration to the combat path.
+    if not persistentBuffFallback[cdID] then return frame end
+
+    local now = GetTime()
+    local nextTry = buffPromoteNext[cdID]
+    if nextTry and now < nextTry then return frame end
+    buffPromoteNext[cdID] = now + 1
+
+    for _, viewerName in ipairs(buffViewerNames) do
+        local iter, pool, first = ScanViewer(viewerName)
+        if iter then
+            for f in iter, pool, first do
+                local ok, id = pcall(extractCooldownID, f)
+                if ok and id == cdID then
+                    persistentBuffMap[cdID] = f
+                    persistentBuffFallback[cdID] = nil
+                    buffPromoteNext[cdID] = nil
+                    InstallBuffFrameHooks(f)
+                    return f
+                end
+            end
+        end
+    end
+
+    -- No buff-viewer frame exists for this id. Stop retrying: most cooldown rows
+    -- have no buff twin, and re-walking both pools every second for each of them
+    -- puts frame-pool iteration back on the combat path. If one appears later the
+    -- SetCooldownID and SetAuraInstanceInfo hooks install it directly.
+    persistentBuffFallback[cdID] = nil
+    buffPromoteNext[cdID] = nil
+    return frame
+end
+
+local function IsBuffViewerFrame(frame)
+    local ok, viewer = pcall(function() return frame.viewerFrame end)
+    if not ok or not viewer then return false end
+    return viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"]
+end
+
+-- Consumers only index this map, so a proxy upgrades stand-ins on read.
+local buffMapProxy = setmetatable({}, {
+    __index = function(_, cdID) return ResolveBuffFrame(cdID) end,
+})
+
+ns.GetPersistentBuffFrame = function(cdID) return ResolveBuffFrame(cdID) end
+
+-- The engine writes auraInstanceID onto this frame for whichever aura it
+-- associates with the entry, including a phase with no entry of its own.
+ns.GetPersistentCooldownFrame = function(cdID)
+    if not cdID then return nil end
+    return persistentCooldownMap[cdID]
+end
 local viewerScanDirty = true
 local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
 local hookedAuraFrames = setmetatable({}, { __mode = "k" })
@@ -1817,7 +2060,14 @@ InstallBuffFrameHooks = function(frame)
             local cdID = cdmFrameToCdID[self]
             if not cdID then cdID = self.cooldownID end
             if cdID then
-                persistentBuffMap[cdID] = self
+                if IsBuffViewerFrame(self) then
+                    persistentBuffMap[cdID] = self
+                    persistentBuffFallback[cdID] = nil
+                    buffPromoteNext[cdID] = nil
+                elseif not persistentBuffMap[cdID] or persistentBuffFallback[cdID] then
+                    persistentBuffMap[cdID] = self
+                    persistentBuffFallback[cdID] = true
+                end
                 MarkBuffDirtyForCdID(cdID)
             end
         end)
@@ -1845,6 +2095,9 @@ ScanViewerFrames = function()
 
     wipe(cachedCooldownViewerFrames)
     wipe(cachedBuffViewerFrames)
+    -- Cleared before the scan, not after: the loops below set the stand-in flags.
+    wipe(persistentBuffFallback)
+    wipe(buffPromoteNext)
 
     if C_CVar and not C_CVar.GetCVarBool("cooldownViewerEnabled") then
         return cachedCooldownViewerFrames, cachedBuffViewerFrames
@@ -1859,8 +2112,9 @@ ScanViewerFrames = function()
                     cachedCooldownViewerFrames[cdID] = frame
                     -- Category 0 hasAura: make active auras available for buff tracking
                     local aOk, aID = pcall(extractAuraInstanceID, frame)
-                    if aOk and aID then
+                    if aOk and aID and not cachedBuffViewerFrames[cdID] then
                         cachedBuffViewerFrames[cdID] = frame
+                        persistentBuffFallback[cdID] = true
                     end
                 end
             end
@@ -1875,6 +2129,8 @@ ScanViewerFrames = function()
                 local ok, cdID = pcall(extractCooldownID, frame)
                 if ok and cdID then
                     cachedBuffViewerFrames[cdID] = frame
+                    persistentBuffFallback[cdID] = nil
+                    buffPromoteNext[cdID] = nil
                 end
             end
         end
@@ -1929,7 +2185,7 @@ local function MirrorECMState(row, cooldownViewerFrames)
                 row.icon:SetTexture(customTex)
             end
         else
-            local texOk, tex = pcall(getIconTexture, ecmFrame)
+            local texOk, tex = pcall(extractIconTexture, ecmFrame)
             if texOk and tex then
                 row.icon:SetTexture(tex)
             end
@@ -1940,7 +2196,11 @@ local function MirrorECMState(row, cooldownViewerFrames)
     if row.hasCharges then
         local ok, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
         if ok and chargeInfo then
-            row.chargeText:SetText(chargeInfo.currentCharges .. "")
+            -- Straight through, never concatenated. currentCharges is secret
+            -- under restriction (maxCharges and isActive beside it are flagged
+            -- NeverSecret, it is not), and the pcall above covers only the API
+            -- call, so a concat here threw out of the whole display pass.
+            row.chargeText:SetText(chargeInfo.currentCharges)
             row.chargeText:Show()
         else
             row.chargeText:Hide()
@@ -1973,6 +2233,8 @@ local runeCastAt = {}
 local function RuneBaseFor(row, spellID)
     local t = CONFIG.runeBaseCooldowns
     if not t then return nil end
+    -- spellID is secret for item-category rows; a secret table key throws.
+    if issecretvalue(spellID) then return nil end
     local base = t[spellID]
     if base ~= nil then return base, spellID end
     local b = row and row.baseSpellID
@@ -2005,7 +2267,6 @@ end
 
 local function UpdateRowCooldown(row)
     if row.isChargeSpell then return end
-    if row.extrasType == "potion" or row.extrasType == "trinket" then return end
     if row.extrasType == "custom" then return end
 
     local cdSpellID = ResolveCooldownSpellID(row)
@@ -2088,8 +2349,6 @@ local function ResolveBuffColor(buffEntry)
         return buffEntry.color
     elseif buffEntry.unit == "target" then
         return CONFIG.debuffColor
-    elseif buffEntry.unit == "pet" then
-        return CONFIG.petBuffColor
     else
         return buffEntry.color or CONFIG.buffColor
     end
@@ -2101,10 +2360,52 @@ local _primaryBuffEntry = {}
 local _overlayBuffEntry = {}
 local _thirdBuffEntry = {}
 
+-- One row per buff lane. Values are literal field names; never a secret key.
+local BUFF_LANES = {
+    { entry = _primaryBuffEntry, bar = "buffBar",        timer = "buff",
+      dur = "activeBuffDuration",        mirror = "_auraMirrorCdID",
+      color = "resolvedBuffColor",       tracked = "trackedBuffAuraInstanceID",
+      totemSlot = "_totemSlot",          totemFed = "_totemCooldownFed" },
+    { entry = _overlayBuffEntry, bar = "buffBarOverlay", timer = "overlay",
+      dur = "activeBuffOverlayDuration", mirror = "_auraMirrorCdIDOverlay",
+      color = "resolvedOverlayColor",    tracked = "trackedOverlayAuraInstanceID",
+      totemSlot = "_overlayTotemSlot",   totemFed = "_overlayTotemFed" },
+    { entry = _thirdBuffEntry,   bar = "buffBarThird",   timer = "third",
+      dur = "activeBuffThirdDuration",   mirror = "_auraMirrorCdIDThird",
+      color = "resolvedThirdColor",      tracked = "trackedThirdAuraInstanceID",
+      totemSlot = "_thirdTotemSlot",     totemFed = "_thirdTotemFed" },
+}
+
+local _buffLanes = {}
+
+-- Callers must test the lane is unclaimed first; these wipe the shared entry table.
+local function FillAuraLane(laneIdx, frame, mapData, unitHint, secretAuraSpellId)
+    local e = BUFF_LANES[laneIdx].entry
+    wipe(e)
+    e.frame = frame
+    e.color = mapData.color or CONFIG.buffColor
+    e.hasCustomColor = mapData.color ~= nil
+    e.unit = unitHint
+    e.secretAuraSpellId = secretAuraSpellId
+    e.requireGlow = mapData.requireGlow
+    return e
+end
+
+local function FillTotemLane(laneIdx, frame, mapData, totemSlot)
+    local e = BUFF_LANES[laneIdx].entry
+    wipe(e)
+    e.frame = frame
+    e.color = (mapData and mapData.color) or CONFIG.buffColor
+    e.hasCustomColor = (mapData and mapData.color) ~= nil
+    e.unit = "player"
+    e.totemSlot = totemSlot
+    return e
+end
+
 UpdateBuffState = function(row, buffViewerFrames)
     if row.isExtras and row.extrasType ~= "custom" then return end
     -- Each mapping entry owns a fixed lane: [1] = primary, [2] = overlay, [3] = third.
-    local primaryBuff, overlayBuff, thirdBuff
+    wipe(_buffLanes)
     local mappings = row.cooldownID and CONFIG.buffMappings and (CONFIG.buffMappings[row.cooldownID] or CONFIG.buffMappings[row.baseSpellID] or CONFIG.buffMappings[row.spellID])
 
     if row.cooldownID then
@@ -2116,39 +2417,12 @@ UpdateBuffState = function(row, buffViewerFrames)
                         local buffFrame = buffViewerFrames[mappedID]
                         if buffFrame and buffFrame.auraInstanceID then
                             local unitHint = mapData.unit or buffFrame.auraDataUnit or "player"
-                            local matchedColor = mapData.color or CONFIG.buffColor
-                            local hasCustomColor = mapData.color ~= nil
                             local secretAuraSpellId
                             if CONFIG.showVariantNames and buffFrame.auraInstanceID then
                                 secretAuraSpellId = AC.ReadAuraSpellID(buffFrame)
                             end
-                            if mapIdx == 1 then
-                                wipe(_primaryBuffEntry)
-                                _primaryBuffEntry.frame = buffFrame
-                                _primaryBuffEntry.color = matchedColor
-                                _primaryBuffEntry.hasCustomColor = hasCustomColor
-                                _primaryBuffEntry.unit = unitHint
-                                _primaryBuffEntry.secretAuraSpellId = secretAuraSpellId
-                                _primaryBuffEntry.requireGlow = mapData.requireGlow
-                                primaryBuff = _primaryBuffEntry
-                            elseif mapIdx == 2 and not overlayBuff then
-                                wipe(_overlayBuffEntry)
-                                _overlayBuffEntry.frame = buffFrame
-                                _overlayBuffEntry.color = matchedColor
-                                _overlayBuffEntry.hasCustomColor = hasCustomColor
-                                _overlayBuffEntry.unit = unitHint
-                                _overlayBuffEntry.secretAuraSpellId = secretAuraSpellId
-                                _overlayBuffEntry.requireGlow = mapData.requireGlow
-                                overlayBuff = _overlayBuffEntry
-                            elseif mapIdx == 3 and not thirdBuff then
-                                wipe(_thirdBuffEntry)
-                                _thirdBuffEntry.frame = buffFrame
-                                _thirdBuffEntry.color = matchedColor
-                                _thirdBuffEntry.hasCustomColor = hasCustomColor
-                                _thirdBuffEntry.unit = unitHint
-                                _thirdBuffEntry.secretAuraSpellId = secretAuraSpellId
-                                _thirdBuffEntry.requireGlow = mapData.requireGlow
-                                thirdBuff = _thirdBuffEntry
+                            if mapIdx <= 3 and not _buffLanes[mapIdx] then
+                                _buffLanes[mapIdx] = FillAuraLane(mapIdx, buffFrame, mapData, unitHint, secretAuraSpellId)
                             end
                             break
                         end
@@ -2161,44 +2435,17 @@ UpdateBuffState = function(row, buffViewerFrames)
         -- (same cooldownID in buff viewer) rather than a separate buffCooldownID.
         if mappings then
             for mapIdx, mapData in ipairs(mappings) do
-                local alreadyMatched = (mapIdx == 1 and primaryBuff) or (mapIdx == 2 and overlayBuff) or (mapIdx == 3 and thirdBuff)
+                local alreadyMatched = _buffLanes[mapIdx]
                 if not alreadyMatched and mapData.buffCooldownIDs then
                     local selfFrame = buffViewerFrames[row.cooldownID]
                     if selfFrame and selfFrame.auraInstanceID then
                         local unitHint = mapData.unit or selfFrame.auraDataUnit or "player"
-                        local matchedColor = mapData.color or CONFIG.buffColor
-                        local hasCustomColor = mapData.color ~= nil
                         local secretAuraSpellId
                         if CONFIG.showVariantNames and selfFrame.auraInstanceID then
                             secretAuraSpellId = AC.ReadAuraSpellID(selfFrame)
                         end
-                        if mapIdx == 1 then
-                            wipe(_primaryBuffEntry)
-                            _primaryBuffEntry.frame = selfFrame
-                            _primaryBuffEntry.color = matchedColor
-                            _primaryBuffEntry.hasCustomColor = hasCustomColor
-                            _primaryBuffEntry.unit = unitHint
-                            _primaryBuffEntry.secretAuraSpellId = secretAuraSpellId
-                            _primaryBuffEntry.requireGlow = mapData.requireGlow
-                            primaryBuff = _primaryBuffEntry
-                        elseif mapIdx == 2 and not overlayBuff then
-                            wipe(_overlayBuffEntry)
-                            _overlayBuffEntry.frame = selfFrame
-                            _overlayBuffEntry.color = matchedColor
-                            _overlayBuffEntry.hasCustomColor = hasCustomColor
-                            _overlayBuffEntry.unit = unitHint
-                            _overlayBuffEntry.secretAuraSpellId = secretAuraSpellId
-                            _overlayBuffEntry.requireGlow = mapData.requireGlow
-                            overlayBuff = _overlayBuffEntry
-                        elseif mapIdx == 3 and not thirdBuff then
-                            wipe(_thirdBuffEntry)
-                            _thirdBuffEntry.frame = selfFrame
-                            _thirdBuffEntry.color = matchedColor
-                            _thirdBuffEntry.hasCustomColor = hasCustomColor
-                            _thirdBuffEntry.unit = unitHint
-                            _thirdBuffEntry.secretAuraSpellId = secretAuraSpellId
-                            _thirdBuffEntry.requireGlow = mapData.requireGlow
-                            thirdBuff = _thirdBuffEntry
+                        if mapIdx <= 3 and not _buffLanes[mapIdx] then
+                            _buffLanes[mapIdx] = FillAuraLane(mapIdx, selfFrame, mapData, unitHint, secretAuraSpellId)
                         end
                     end
                 end
@@ -2207,55 +2454,25 @@ UpdateBuffState = function(row, buffViewerFrames)
     end
 
     -- Totem pass (CDM tracks summon abilities via preferredTotemUpdateSlot)
-    if not primaryBuff and row.cooldownID then
+    if not _buffLanes[1] and row.cooldownID then
         local selfFrame = buffViewerFrames[row.cooldownID]
         if selfFrame and not selfFrame.auraInstanceID then
             local totemSlot = GetTotemSlotForRow(selfFrame)
             if totemSlot then
-                wipe(_primaryBuffEntry)
-                _primaryBuffEntry.frame = selfFrame
-                _primaryBuffEntry.color = CONFIG.buffColor
-                _primaryBuffEntry.hasCustomColor = false
-                _primaryBuffEntry.unit = "player"
-                _primaryBuffEntry.totemSlot = totemSlot
-                primaryBuff = _primaryBuffEntry
+                _buffLanes[1] = FillTotemLane(1, selfFrame, nil, totemSlot)
             end
         end
-        if not primaryBuff and mappings then
+        if not _buffLanes[1] and mappings then
             for mapIdx, mapData in ipairs(mappings) do
-                if primaryBuff then break end
+                if _buffLanes[1] then break end
                 if mapData.buffCooldownIDs then
                     for _, mappedID in ipairs(mapData.buffCooldownIDs) do
                         local buffFrame = buffViewerFrames[mappedID]
                         if buffFrame and not buffFrame.auraInstanceID then
                             local totemSlot = GetTotemSlotForRow(buffFrame)
                             if totemSlot then
-                                local matchedColor = mapData.color or CONFIG.buffColor
-                                local hasCustomColor = mapData.color ~= nil
-                                if mapIdx == 1 then
-                                    wipe(_primaryBuffEntry)
-                                    _primaryBuffEntry.frame = buffFrame
-                                    _primaryBuffEntry.color = matchedColor
-                                    _primaryBuffEntry.hasCustomColor = hasCustomColor
-                                    _primaryBuffEntry.unit = "player"
-                                    _primaryBuffEntry.totemSlot = totemSlot
-                                    primaryBuff = _primaryBuffEntry
-                                elseif mapIdx == 2 and not overlayBuff then
-                                    wipe(_overlayBuffEntry)
-                                    _overlayBuffEntry.frame = buffFrame
-                                    _overlayBuffEntry.color = matchedColor
-                                    _overlayBuffEntry.hasCustomColor = hasCustomColor
-                                    _overlayBuffEntry.unit = "player"
-                                    _overlayBuffEntry.totemSlot = totemSlot
-                                    overlayBuff = _overlayBuffEntry
-                                elseif mapIdx == 3 and not thirdBuff then
-                                    wipe(_thirdBuffEntry)
-                                    _thirdBuffEntry.frame = buffFrame
-                                    _thirdBuffEntry.color = matchedColor
-                                    _thirdBuffEntry.hasCustomColor = hasCustomColor
-                                    _thirdBuffEntry.unit = "player"
-                                    _thirdBuffEntry.totemSlot = totemSlot
-                                    thirdBuff = _thirdBuffEntry
+                                if mapIdx <= 3 and not _buffLanes[mapIdx] then
+                                    _buffLanes[mapIdx] = FillTotemLane(mapIdx, buffFrame, mapData, totemSlot)
                                 end
                                 break
                             end
@@ -2267,6 +2484,8 @@ UpdateBuffState = function(row, buffViewerFrames)
     end
 
     -- Glow-gated: suppress buff bar but preserve secretAuraSpellId for variant text.
+    local primaryBuff, overlayBuff, thirdBuff = _buffLanes[1], _buffLanes[2], _buffLanes[3]
+
     row._glowGatedVariant = false
     if primaryBuff and primaryBuff.requireGlow and not row.isGlowing then
         row.secretAuraSpellId = primaryBuff.secretAuraSpellId
@@ -2280,8 +2499,13 @@ UpdateBuffState = function(row, buffViewerFrames)
         thirdBuff = nil
     end
 
-    -- Primary lane → buffBar
-    if primaryBuff then
+    -- Primary lane → buffBar.
+    -- A live potion window is checked first: a resolved lane on a potion row gives
+    -- an empty mirror or nothing, and both would hide the window's bar.
+    local potionWindowLive = row._potionWindowExpiry and GetTime() < row._potionWindowExpiry
+    if potionWindowLive then
+        -- Owned by the window. Reapplying it each tick makes the bar strobe.
+    elseif primaryBuff then
         local resolvedColor = ResolveBuffColor(primaryBuff)
         row.resolvedBuffColor = resolvedColor
         row.buffBar:SetStatusBarColor(unpack(resolvedColor))
@@ -2290,9 +2514,9 @@ UpdateBuffState = function(row, buffViewerFrames)
             if not row._totemCooldownFed then
                 local totemDurObj = GetTotemDuration(primaryBuff.totemSlot)
                 if totemDurObj then
-                    pcall(row.hidden_buff.SetCooldownFromDurationObject, row.hidden_buff, totemDurObj)
+                    FeedHiddenCooldownRaw(row, "buff", totemDurObj)
                 else
-                    row.hidden_buff:SetCooldown(0, 0)
+                    FeedHiddenCooldownRaw(row, "buff", nil)
                 end
                 row._totemCooldownFed = true
             end
@@ -2369,6 +2593,9 @@ UpdateBuffState = function(row, buffViewerFrames)
             end
         end
     else
+        if row._potionWindowExpiry then
+            row._potionWindowExpiry = nil
+        end
         row.buffBar:Hide()
         if row.buffPandemicAnim:IsPlaying() then
             row.buffPandemicAnim:Stop()
@@ -2396,9 +2623,9 @@ UpdateBuffState = function(row, buffViewerFrames)
             if not row._overlayTotemFed then
                 local totemDurObj = GetTotemDuration(overlayBuff.totemSlot)
                 if totemDurObj then
-                    pcall(row.hidden_overlay.SetCooldownFromDurationObject, row.hidden_overlay, totemDurObj)
+                    FeedHiddenCooldownRaw(row, "overlay", totemDurObj)
                 else
-                    row.hidden_overlay:SetCooldown(0, 0)
+                    FeedHiddenCooldownRaw(row, "overlay", nil)
                 end
                 row._overlayTotemFed = true
             end
@@ -2437,6 +2664,7 @@ UpdateBuffState = function(row, buffViewerFrames)
                 row.activeBuffOverlayDuration = nil
                 row.resolvedOverlayColor = nil
                 row.trackedOverlayAuraInstanceID = nil
+                row._auraMirrorCdIDOverlay = nil
                 FeedHiddenCooldown(row, "overlay", nil)
             end
         end
@@ -2445,6 +2673,7 @@ UpdateBuffState = function(row, buffViewerFrames)
         row.activeBuffOverlayDuration = nil
         row.resolvedOverlayColor = nil
         row.trackedOverlayAuraInstanceID = nil
+        row._auraMirrorCdIDOverlay = nil
         row._overlayTotemSlot = nil
         row._overlayTotemFed = false
         FeedHiddenCooldown(row, "overlay", nil)
@@ -2460,9 +2689,9 @@ UpdateBuffState = function(row, buffViewerFrames)
             if not row._thirdTotemFed then
                 local totemDurObj = GetTotemDuration(thirdBuff.totemSlot)
                 if totemDurObj then
-                    pcall(row.hidden_third.SetCooldownFromDurationObject, row.hidden_third, totemDurObj)
+                    FeedHiddenCooldownRaw(row, "third", totemDurObj)
                 else
-                    row.hidden_third:SetCooldown(0, 0)
+                    FeedHiddenCooldownRaw(row, "third", nil)
                 end
                 row._thirdTotemFed = true
             end
@@ -2501,6 +2730,7 @@ UpdateBuffState = function(row, buffViewerFrames)
                 row.activeBuffThirdDuration = nil
                 row.resolvedThirdColor = nil
                 row.trackedThirdAuraInstanceID = nil
+                row._auraMirrorCdIDThird = nil
                 FeedHiddenCooldown(row, "third", nil)
             end
         end
@@ -2509,10 +2739,13 @@ UpdateBuffState = function(row, buffViewerFrames)
         row.activeBuffThirdDuration = nil
         row.resolvedThirdColor = nil
         row.trackedThirdAuraInstanceID = nil
+        row._auraMirrorCdIDThird = nil
         row._thirdTotemSlot = nil
         row._thirdTotemFed = false
         FeedHiddenCooldown(row, "third", nil)
     end
+
+
 end
 
 UpdateStackText = function(row, buffViewerFrames)
@@ -2608,11 +2841,13 @@ local function UpdateBars()
     if now - lastUpdateBarsTime < 0.016 then return end
     lastUpdateBarsTime = now
 
-    local cooldownViewerFrames, buffViewerFrames = ScanViewerFrames()
+    local cooldownViewerFrames = ScanViewerFrames()
+    local buffViewerFrames = buffMapProxy
 
     -- One-time warning if buff viewers have no frames but mappings exist
     if not buffViewerWarningShown and CONFIG.buffMappings and next(CONFIG.buffMappings) then
-        local hasBuff = next(buffViewerFrames) ~= nil
+        -- next() ignores metamethods, so this must test the backing map.
+        local hasBuff = next(persistentBuffMap) ~= nil
         if not hasBuff and _G["BuffIconCooldownViewer"] then
             buffViewerWarningShown = true
             print("|cff00ff00[Infall]|r Buff tracking requires the Cooldown Manager buff viewer to be visible. Set it to Always in CDM settings, then use /infall ecm to hide it.")
@@ -2694,6 +2929,44 @@ end
 
 local updateTimer = 0
 local buffPollTimer = 0
+-- The mirror widget is re-resolved every call because the viewer pools frames.
+local function FillBuffLaneBar(row, lane, interp)
+    local bar = row[lane.bar]
+    if not bar then return end
+
+    local slot = row[lane.totemSlot]
+    if slot then
+        local timeLeft = GetTotemTimeLeft(slot)
+        if timeLeft ~= nil then
+            bar:SetValue(timeLeft, interp)
+        else
+            bar:Hide()
+            row[lane.totemSlot] = nil
+        end
+        return
+    end
+
+    if row[lane.mirror] and row[lane.tracked] then
+        local mf = ResolveBuffFrame(row[lane.mirror])
+        local mbar = mf and mf.Bar
+        local ok, val = false, nil
+        if mbar then ok, val = pcall(mbar.GetValue, mbar) end
+        if ok then bar:SetValue(val, interp) else bar:Hide() end
+        return
+    end
+
+    local dur = row[lane.dur]
+    if dur then
+        local ok, val
+        if BuffFillCurve then
+            ok, val = pcall(dur.EvaluateRemainingDuration, dur, BuffFillCurve)
+        else
+            ok, val = pcall(dur.GetRemainingDuration, dur)
+        end
+        if ok then bar:SetValue(val, interp) else bar:Hide() end
+    end
+end
+
 EH_Parent:SetScript("OnUpdate", function(self, elapsed)
     updateTimer = updateTimer + elapsed
 
@@ -2712,8 +2985,8 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 -- Hidden rows keep their dirty flag so the show edge reconciles.
                 if row._buffDirty and visible then
                     row._buffDirty = false
-                    UpdateBuffState(row, persistentBuffMap)
-                    UpdateStackText(row, persistentBuffMap)
+                    UpdateBuffState(row, buffMapProxy)
+                    UpdateStackText(row, buffMapProxy)
                 end
             end
         else
@@ -2740,7 +3013,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
             -- CD past slide
             if not row.isChargeSpell and row.hidden_cd then
-                local cdActive = row._extrasCdExpiry and true or row.hidden_cd:IsShown()
+                local cdActive = row.hidden_cd:IsShown()
                 if cdActive and not row.activeCdSlide then
                     row.activeCdSlide = SpawnPastSlide(row, row.pastCdClip, GetCooldownColor(row), row.cdBar.fullHeight or CONFIG.height, 0)
                 elseif not cdActive and row.activeCdSlide then
@@ -2749,130 +3022,15 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                 end
             end
 
-            -- Buff bar fill
-            if row._totemSlot then
-                local timeLeft = GetTotemTimeLeft(row._totemSlot)
-                if timeLeft ~= nil then
-                    row.buffBar:SetValue(timeLeft, interp)
-                else
-                    row.buffBar:Hide()
-                    row._totemSlot = nil
-                end
-            elseif row._auraMirrorCdID and row.trackedBuffAuraInstanceID then
-                -- CDM bar value is remaining seconds. Frames are pooled, so the
-                -- widget is re-resolved rather than cached.
-                local mf = persistentBuffMap[row._auraMirrorCdID]
-                local bar = mf and mf.Bar
-                local ok, val = false, nil
-                if bar then ok, val = pcall(bar.GetValue, bar) end
-                if ok then row.buffBar:SetValue(val, interp) else row.buffBar:Hide() end
-            elseif row.activeBuffDuration then
-                local ok, val
-                if BuffFillCurve then
-                    ok, val = pcall(row.activeBuffDuration.EvaluateRemainingDuration, row.activeBuffDuration, BuffFillCurve)
-                else
-                    ok, val = pcall(row.activeBuffDuration.GetRemainingDuration, row.activeBuffDuration)
-                end
-                if ok then row.buffBar:SetValue(val, interp) else row.buffBar:Hide() end
-            end
-
-            -- Buff overlay bar fill
-            if row._overlayTotemSlot and row.buffBarOverlay then
-                local timeLeft = GetTotemTimeLeft(row._overlayTotemSlot)
-                if timeLeft ~= nil then
-                    row.buffBarOverlay:SetValue(timeLeft, interp)
-                else
-                    row.buffBarOverlay:Hide()
-                    row._overlayTotemSlot = nil
-                end
-            elseif row._auraMirrorCdIDOverlay and row.trackedOverlayAuraInstanceID and row.buffBarOverlay then
-                local mf = persistentBuffMap[row._auraMirrorCdIDOverlay]
-                local bar = mf and mf.Bar
-                local ok, val = false, nil
-                if bar then ok, val = pcall(bar.GetValue, bar) end
-                if ok then row.buffBarOverlay:SetValue(val, interp) else row.buffBarOverlay:Hide() end
-            elseif row.activeBuffOverlayDuration and row.buffBarOverlay then
-                local ok, val
-                if BuffFillCurve then
-                    ok, val = pcall(row.activeBuffOverlayDuration.EvaluateRemainingDuration, row.activeBuffOverlayDuration, BuffFillCurve)
-                else
-                    ok, val = pcall(row.activeBuffOverlayDuration.GetRemainingDuration, row.activeBuffOverlayDuration)
-                end
-                if ok then row.buffBarOverlay:SetValue(val, interp) else row.buffBarOverlay:Hide() end
-            end
-
-            -- Buff third bar fill
-            if row._thirdTotemSlot and row.buffBarThird then
-                local timeLeft = GetTotemTimeLeft(row._thirdTotemSlot)
-                if timeLeft ~= nil then
-                    row.buffBarThird:SetValue(timeLeft, interp)
-                else
-                    row.buffBarThird:Hide()
-                    row._thirdTotemSlot = nil
-                end
-            elseif row._auraMirrorCdIDThird and row.trackedThirdAuraInstanceID and row.buffBarThird then
-                local mf = persistentBuffMap[row._auraMirrorCdIDThird]
-                local bar = mf and mf.Bar
-                local ok, val = false, nil
-                if bar then ok, val = pcall(bar.GetValue, bar) end
-                if ok then row.buffBarThird:SetValue(val, interp) else row.buffBarThird:Hide() end
-            elseif row.activeBuffThirdDuration and row.buffBarThird then
-                local ok, val
-                if BuffFillCurve then
-                    ok, val = pcall(row.activeBuffThirdDuration.EvaluateRemainingDuration, row.activeBuffThirdDuration, BuffFillCurve)
-                else
-                    ok, val = pcall(row.activeBuffThirdDuration.GetRemainingDuration, row.activeBuffThirdDuration)
-                end
-                if ok then row.buffBarThird:SetValue(val, interp) else row.buffBarThird:Hide() end
-            end
-
-            -- Extras expiry cleanup (replaces OCD which doesn't fire for addon timers)
-            if row._extrasBuffExpiry and GetTime() >= row._extrasBuffExpiry then
-                row._extrasBuffExpiry = nil
-                row.activeBuffDuration = nil
-                row.buffBar:Hide()
-                if row.activeBuffSlide then
-                    DetachPastSlide(row.activeBuffSlide)
-                    row.activeBuffSlide = nil
-                end
-                local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
-                if cache then cache.buffExpiry = nil end
-            end
-            if row._extrasCdExpiry and GetTime() >= row._extrasCdExpiry then
-                row._extrasCdExpiry = nil
-                row.activeCooldown = nil
-                row.cdBar:Hide()
-                if row.cooldownFrame then row.cooldownFrame:Hide() end
-                if row.activeCdSlide then
-                    DetachPastSlide(row.activeCdSlide)
-                    row.activeCdSlide = nil
-                end
-                if row.cdTextCooldown then row.cdTextCooldown:SetCooldown(0, 0) end
-                UpdateDesaturation(row)
-                local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
-                if cache then cache.cdExpiry = nil end
-            end
+            FillBuffLaneBar(row, BUFF_LANES[1], interp)
+            FillBuffLaneBar(row, BUFF_LANES[2], interp)
+            FillBuffLaneBar(row, BUFF_LANES[3], interp)
 
             -- Charge bars
             if row.isChargeSpell and row.depletedWrapper then
                 -- Per-frame charge count feed
                 local cOk, cInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
-                if cOk and cInfo then
-                    local cc = cInfo.currentCharges
-                    row.depletedIndicator:SetValue(cc)
-                    if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
-                    if row.middleClipIndicators then
-                        for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
-                    end
-                    if row.middleLanes then
-                        for _, ml2 in ipairs(row.middleLanes) do
-                            if ml2.helperSpacer then ml2.helperSpacer:SetValue(cc) end
-                        end
-                    end
-                    if row.chargeText and row.hasCharges then
-                        row.chargeText:SetText(cc .. "")
-                    end
-                end
+                if cOk then FeedChargeIndicators(row, cInfo) end
 
                 local chargeDurObj = row._chargeDurObj
 
@@ -2984,7 +3142,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                             if mlActive and not ml.activeSlide then
                                 ml.activeSlide = SpawnPastSlide(row,
                                     row.pastCdClip, GetCooldownColor(row),
-                                    laneH, j * (laneH + 1))
+                                    laneH, j * ChargeLanePitch(row, laneH))
                                 ml._slideSpawnTime = GetTime()
                             elseif ml.activeSlide and not ml.activeSlide.detachTime and not mlActive then
                                 ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
@@ -3065,6 +3223,7 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
         end
 
         UpdateActiveCastBar()
+        UpdateCastSpark()
         UpdatePastSlides()
 
         if not gcdActive then
@@ -3077,11 +3236,16 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 end)
 
 local function ResetBarState(bar)
+    HandleProcGlow(bar, false)
     bar.activeCooldown = nil
     bar.activeBuffDuration = nil
+    bar._spellCategoryID = nil
+    bar._potionWindowExpiry = nil
     bar.activeBuffOverlayDuration = nil
+    bar.activeBuffThirdDuration = nil
     bar.resolvedBuffColor = nil
     bar.resolvedOverlayColor = nil
+    bar.resolvedThirdColor = nil
     bar.cachedPandemicIcon = nil
     if bar.buffPandemicAnim and bar.buffPandemicAnim:IsPlaying() then
         bar.buffPandemicAnim:Stop()
@@ -3106,13 +3270,7 @@ local function ResetBarState(bar)
     bar.isExtras = nil
     bar.extrasType = nil
     bar.extrasKey = nil
-    bar._potionBuffDuration = nil
-    bar._potionCdDuration = nil
-    bar._potionBuffSpellID = nil
     bar._extrasAuraInstanceID = nil
-    bar._extrasItemID = nil
-    bar._extrasBuffExpiry = nil
-    bar._extrasCdExpiry = nil
     bar._totemSlot = nil
     bar._totemCooldownFed = false
     bar._overlayTotemSlot = nil
@@ -3122,6 +3280,9 @@ local function ResetBarState(bar)
     bar.trackedBuffAuraInstanceID = nil
     bar.trackedOverlayAuraInstanceID = nil
     bar.trackedThirdAuraInstanceID = nil
+    bar._auraMirrorCdID = nil
+    bar._auraMirrorCdIDOverlay = nil
+    bar._auraMirrorCdIDThird = nil
     bar.secretAuraSpellId = nil
     bar.icon:SetDesaturation(0)
     bar.cdBar:Hide()
@@ -3174,10 +3335,24 @@ local function ResetBarState(bar)
     end
     bar.chargeText:SetTextColor(unpack(CONFIG.chargeTextColor))
     bar.stackText:SetTextColor(unpack(CONFIG.stackTextColor))
-    bar.chargeText:ClearAllPoints()
-    bar.chargeText:SetPoint(CONFIG.chargeTextAnchor, bar.textOverlay, CONFIG.chargeTextRelPoint, CONFIG.chargeTextOffsetX, CONFIG.chargeTextOffsetY)
-    bar.stackText:ClearAllPoints()
-    bar.stackText:SetPoint(CONFIG.stackTextAnchor, bar.textOverlay, CONFIG.stackTextRelPoint, CONFIG.stackTextOffsetX, CONFIG.stackTextOffsetY)
+    ApplyTextAnchors(bar)
+end
+
+-- Name and icon follow bar.spellID, which is the OVERRIDE when one exists. Using
+-- the base spellID leaves a hero-talent form like Black Arrow showing its base
+-- spell's art. Item entries have no spellID and resolve from the category.
+local function ApplyRowDisplay(bar, cooldownID)
+    local customID = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
+    local customTex = customID and C_Spell.GetSpellTexture(customID)
+    local info = bar.spellID and C_Spell.GetSpellInfo(bar.spellID) or nil
+    if info then
+        bar.spellName = info.name
+        bar.icon:SetTexture(customTex or info.iconID)
+    else
+        local rName, rIcon = ns.ResolveCooldownDisplay(cooldownID)
+        bar.spellName = rName or ("ID:" .. tostring(cooldownID))
+        bar.icon:SetTexture(customTex or rIcon or 134400)
+    end
 end
 
 local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
@@ -3219,10 +3394,13 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.spellID = ovID
     end
 
-    -- Initialize glow state for requireGlow feature
+    -- Glow belongs to the spell, not the frame. Rows are pooled, so resync
+    -- through HandleProcGlow, which owns the art; a flag alone leaves it lit.
     if C_SpellActivationOverlay and C_SpellActivationOverlay.IsSpellOverlayed then
         local gOk, isOverlayed = pcall(C_SpellActivationOverlay.IsSpellOverlayed, bar.spellID)
-        bar.isGlowing = gOk and isOverlayed or false
+        HandleProcGlow(bar, (gOk and isOverlayed) and true or false)
+    else
+        HandleProcGlow(bar, false)
     end
 
     local isChargeSpell = false
@@ -3232,11 +3410,11 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     local maxCap = chargeOverride and chargeOverride.trueMax or nil
 
     if chargeInfo and chargeInfo.maxCharges then
-        -- maxCharges is NeverSecret on 12.0.7 and 12.1, so the guard should
+        -- maxCharges is NeverSecret, so the guard should
         -- never fire. Kept as cheap insurance, but it fails safe rather than
         -- falling back to a saved value: a stale max draws lanes for charges
         -- the spell does not have.
-        if issecretvalue and issecretvalue(chargeInfo.maxCharges) then
+        if issecretvalue(chargeInfo.maxCharges) then
             -- no usable count, leave it as a single bar
         else
             local effectiveMax = chargeInfo.maxCharges
@@ -3320,18 +3498,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.chargeDurationConstant = nil
     end
     
-    local spellInfo = spellID and C_Spell.GetSpellInfo(spellID) or nil
-    local customID = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
-    local customTex = customID and C_Spell.GetSpellTexture(customID)
-    if spellInfo then
-        bar.spellName = spellInfo.name
-        bar.icon:SetTexture(customTex or spellInfo.iconID)
-    else
-        -- Item category entry: name and icon come from the category.
-        local rName, rIcon = ns.ResolveCooldownDisplay(cooldownID)
-        bar.spellName = rName or ("ID:" .. tostring(cooldownID))
-        bar.icon:SetTexture(customTex or rIcon or 134400)
-    end
+    ApplyRowDisplay(bar, cooldownID)
 
     bar.cdBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
@@ -3347,17 +3514,30 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         local nowOffset = GetBarOffset() + nowPx
         local maxC = bar.maxCharges or 2
         local barHeight = bar.cdBar.fullHeight or CONFIG.height
-        local laneH = (barHeight - (maxC - 1)) / maxC
-        bar.cdBar.laneHeight = laneH
+        local laneH = SetChargeLaneMetrics(bar, barHeight, maxC)
 
         -- slotPx: charge duration in pixels
         local slotPx = 0
         if bar.chargeDurationConstant then
-            slotPx = (bar.chargeDurationConstant / CONFIG.future) * futureWidth
-            slotPx = math.max(1, math.min(slotPx, futureWidth))
+            -- NEVER clamp. This width IS the charge duration on the timeline,
+            -- which is what makes the fill read as seconds, and (maxC-1)*slotPx
+            -- is how the lower lane shows cd+cd without touching a secret.
+            -- Over-wide lanes are correct; the wrappers clip them.
+            slotPx = math.max(1, (bar.chargeDurationConstant / CONFIG.future) * futureWidth)
+        elseif not chargeDurWarned[cooldownID] then
+            -- Without it the lane falls back to full width and drains like a cooldown.
+            chargeDurWarned[cooldownID] = true
+            print("|cff00ff00[Infall]|r No charge duration for "
+                .. (bar.spellName or ("cooldown " .. tostring(cooldownID)))
+                .. ": charge lane will draw full width. Clear restrictions and /reload to fix.")
         end
         bar._chargeSlotPx = slotPx
+        -- No duration means no width that reads as seconds: draw nothing
+        -- rather than a percentage dressed up as time.
+        bar._chargeDurUnknown = slotPx <= 0
         local chargeDurPx = slotPx > 0 and slotPx or futureWidth
+
+        local fillW, fillMax = chargeDurPx, 1
 
         if not bar.depletedIndicator then
             bar.depletedIndicator = CreateFrame("StatusBar", nil, bar)
@@ -3409,7 +3589,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.notDepletedWrapper:SetAlpha(1)
         bar.notDepletedWrapper:Show()
 
-        local bottomY = -(barHeight - laneH)
+        local bottomY = ChargeBottomY(bar, laneH, maxC)
         bar.depletedCdBar:SetParent(bar.depletedWrapper)
         bar.depletedCdBar:SetFrameLevel(bar:GetFrameLevel() + 1)
         bar.depletedCdBar:ClearAllPoints()
@@ -3425,14 +3605,14 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
         bar.depletedHelperBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         bar.depletedChargeBar:ClearAllPoints()
-        bar.depletedChargeBar:SetSize(chargeDurPx, laneH)
-        bar.depletedChargeBar:SetMinMaxValues(0, 1)
+        bar.depletedChargeBar:SetSize(fillW, laneH)
+        bar.depletedChargeBar:SetMinMaxValues(0, fillMax)
         bar.depletedChargeBar:SetPoint("TOPLEFT", bar.depletedWrapper, "TOPLEFT", bottomSlotPx, bottomY)
         bar.depletedChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
         bar.normalChargeBar:ClearAllPoints()
-        bar.normalChargeBar:SetSize(chargeDurPx, laneH)
-        bar.normalChargeBar:SetMinMaxValues(0, 1)
+        bar.normalChargeBar:SetSize(fillW, laneH)
+        bar.normalChargeBar:SetMinMaxValues(0, fillMax)
         bar.normalChargeBar:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, bottomY)
         bar.normalChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
 
@@ -3535,7 +3715,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                     bar.middleLanes[j].depletedHelperBar:SetParent(bar.depletedWrapper)
                 end
                 local ml = bar.middleLanes[j]
-                local laneY = -(j * (laneH + 1))
+                local laneY = -(j * ChargeLanePitch(bar, laneH))
                 local mlSlotPx = j * slotPx
 
                 ml.depletedHelperBar:ClearAllPoints()
@@ -3559,8 +3739,8 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 ml.helperSpacer:Show()
 
                 ml.depletedChargeBar:ClearAllPoints()
-                ml.depletedChargeBar:SetSize(chargeDurPx, laneH)
-                ml.depletedChargeBar:SetMinMaxValues(0, 1)
+                ml.depletedChargeBar:SetSize(fillW, laneH)
+                ml.depletedChargeBar:SetMinMaxValues(0, fillMax)
                 ml.depletedChargeBar:SetPoint("TOPLEFT", ml.helperSpacer:GetStatusBarTexture(), "TOPLEFT")
                 ml.depletedChargeBar:SetStatusBarColor(unpack(GetCooldownColor(bar)))
                 ml.depletedChargeBar:Show()
@@ -3604,104 +3784,24 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     bar:SetPoint("TOPLEFT", EH_Parent, "TOPLEFT", CONFIG.paddingLeft, -CONFIG.paddingTop - ((index - 1) * (CONFIG.height + CONFIG.spacing)))
 end
 
--- ============================================================================
 -- EXTRAS: Auto-detect racials + potions
--- ============================================================================
 
 local function DetectExtras()
     local extras = CONFIG.extras or {}
-    local existingKeys = {}
-    for _, e in ipairs(extras) do existingKeys[e.key] = true end
 
-    -- Racials: detect from race
-    local _, raceKey = UnitRace("player")
-    local racials = raceKey and RACE_RACIALS[raceKey]
-    if racials then
-        for _, spellID in ipairs(racials) do
-            if IsPlayerSpell(spellID) then
-                local key = "racial_" .. spellID
-                if not existingKeys[key] then
-                    local cdID = spellID
-                    pcall(function()
-                        local utilIDs = C_CooldownViewer.GetCooldownViewerCategorySet(1, false)
-                        if utilIDs then
-                            for _, uid in ipairs(utilIDs) do
-                                local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, uid)
-                                if ok and info and info.spellID == spellID then
-                                    cdID = uid
-                                    return
-                                end
-                            end
-                        end
-                    end)
-                    extras[#extras + 1] = {
-                        key = key, type = "racial", spellID = spellID,
-                        cooldownID = cdID, enabled = false,
-                    }
-                    existingKeys[key] = true
-                end
-            end
-        end
-    end
-
-    -- Potions: always available
-    for _, pot in ipairs(POTION_BUFFS) do
-        local key = "potion_" .. pot.buffSpellID
-        if not existingKeys[key] then
-            extras[#extras + 1] = {
-                key = key, type = "potion", spellID = pot.buffSpellID,
-                buffDuration = pot.buffDuration, cdDuration = pot.cdDuration,
-                enabled = false,
-            }
-            existingKeys[key] = true
-        end
-    end
-
-    -- Trinkets: detect if in bags or equipped, remove if gone
-    local ownedTrinkets = {}
-    for _, tri in ipairs(TRINKET_ITEMS) do
-        local found = false
-        for _, slot in ipairs({13, 14}) do
-            local itemID = GetInventoryItemID("player", slot)
-            if itemID == tri.itemID then found = true break end
-        end
-        if not found then
-            for bag = 0, 4 do
-                local numSlots = C_Container.GetContainerNumSlots(bag)
-                for bagSlot = 1, numSlots do
-                    local info = C_Container.GetContainerItemInfo(bag, bagSlot)
-                    if info and info.itemID == tri.itemID then
-                        found = true
-                        break
-                    end
-                end
-                if found then break end
-            end
-        end
-        if found then
-            local key = "trinket_" .. tri.spellID
-            ownedTrinkets[key] = true
-            if not existingKeys[key] then
-                extras[#extras + 1] = {
-                    key = key, type = "trinket", spellID = tri.spellID,
-                    itemID = tri.itemID,
-                    buffDuration = tri.buffDuration, cdDuration = tri.cdDuration,
-                    enabled = false,
-                }
-                existingKeys[key] = true
-            end
-        end
-    end
-    -- Mark trinkets unavailable/available based on ownership (preserves settings)
+    -- On 12.1 the Cooldown Manager carries potions and trinkets natively, so drop
+    -- any a saved profile still holds. Custom and racial rows are untouched.
+    local kept = {}
     for _, e in ipairs(extras) do
-        if e.type == "trinket" then
-            e._unavailable = not ownedTrinkets[e.key] or nil
+        if e.type == "custom" then
+            kept[#kept + 1] = e
         end
     end
+    extras = kept
+
 
     CONFIG.extras = extras
 end
-ns.DetectExtras = DetectExtras
 
 LoadEssentialCooldowns = function()
     CleanupActiveCast()
@@ -3713,15 +3813,18 @@ LoadEssentialCooldowns = function()
 
     local sortedSpellIDs = {}
     local sortedCooldownIDs = {}
-    if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
-        local dataProvider = CooldownViewerSettings:GetDataProvider()
-        if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
-            local displayedCooldownIDs = dataProvider:GetOrderedCooldownIDsForCategory(0)
+    -- Never the raw provider: its accessors build lazily and a build on our
+    -- stack is created tainted. See ns.OrderedCooldownIDs in Core.lua.
+    do
+        local displayedCooldownIDs = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
+        do
             if displayedCooldownIDs and #displayedCooldownIDs > 0 then
                 for _, cdID in ipairs(displayedCooldownIDs) do
                     local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
-                    if infoOk and info and info.spellID then
-                        table.insert(sortedSpellIDs, info.spellID)
+                    if infoOk and info and (info.spellID or info.spellCategoryID or info.equipSlot) then
+                        -- false, not nil: the arrays are index-parallel and
+                        -- table.insert(t, nil) would not advance the index.
+                        table.insert(sortedSpellIDs, info.spellID or false)
                         table.insert(sortedCooldownIDs, cdID)
                     end
                 end
@@ -3736,8 +3839,8 @@ LoadEssentialCooldowns = function()
             if success and cooldownIDs then
                 for _, cooldownID in ipairs(cooldownIDs) do
                     local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-                    if infoOk and info and info.spellID then
-                        table.insert(sortedSpellIDs, info.spellID)
+                    if infoOk and info and (info.spellID or info.spellCategoryID or info.equipSlot) then
+                        table.insert(sortedSpellIDs, info.spellID or false)
                         table.insert(sortedCooldownIDs, cooldownID)
                     end
                 end
@@ -3797,16 +3900,11 @@ LoadEssentialCooldowns = function()
         table.insert(cooldownBars, bar)
     end
     
-    -- Extras bars (racials, potions, trinkets), always at bottom.
-    -- Racials are real spells, so on 12.1 the Cooldown Manager carries them and
-    -- EH picks them up as ordinary rows. Potions and trinkets are ITEM entries
-    -- with no spellID, which EH cannot track yet, so they stay on this path.
-    -- REMOVE WITH 12.0.7 SUPPORT, once item entries are supported.
-    local racialsNativeIn121 = ns.AuraCompat and ns.AuraCompat.IS_121
+    -- Extras bars, always at bottom. On 12.1 the Cooldown Manager carries racials,
+    -- potions and trinkets natively, so this path holds only custom rows there,
     if CONFIG.extras then
         for _, extra in ipairs(CONFIG.extras) do
-            local supersededByCDM = racialsNativeIn121 and extra.type == "racial"
-            if extra.enabled and not extra._unavailable and not supersededByCDM then
+            if extra.enabled then
                 local nextIdx = #cooldownBars + 1
                 local bar = barPool[nextIdx]
                 if bar then
@@ -3850,62 +3948,9 @@ LoadEssentialCooldowns = function()
                 bar.resolvedBuffColor = buffColor
                 bar.cdBar:SetHeight(bar.cdBar.fullHeight or CONFIG.height)
 
-                if extra.type == "potion" or extra.type == "trinket" then
-                    bar._potionBuffDuration = extra.buffDuration
-                    bar._potionCdDuration = extra.cdDuration
-                    bar._potionBuffSpellID = extra.spellID
-                    bar._extrasAuraInstanceID = nil
-                    bar._extrasItemID = extra.itemID or (POTION_BUFF_LOOKUP[extra.spellID] and POTION_BUFF_LOOKUP[extra.spellID].itemID)
-                end
-
                 if isCustom then
                     bar.cdBar:Hide()
                     bar.activeCooldown = nil
-                end
-
-                -- Restore active timers from persistent cache (survives bar rebuilds)
-                local cached = (not isCustom) and ns._activeExtrasTimers[extra.key] or nil
-                if cached then
-                    local now = GetTime()
-                    if cached.buffExpiry and cached.buffExpiry > now and cached.buffDuration then
-                        local buffDurObj = C_DurationUtil.CreateDuration()
-                        buffDurObj:SetTimeFromStart(cached.buffExpiry - cached.buffDuration, cached.buffDuration)
-                        bar.activeBuffDuration = buffDurObj
-                        bar._extrasBuffExpiry = cached.buffExpiry
-                        bar.buffBar:SetValue(0)
-                        bar.buffBar:Show()
-                    end
-                    if cached.cdExpiry and cached.cdExpiry > now and cached.cdDuration then
-                        local cdDurObj = C_DurationUtil.CreateDuration()
-                        cdDurObj:SetTimeFromStart(cached.cdExpiry - cached.cdDuration, cached.cdDuration)
-                        bar.activeCooldown = cdDurObj
-                        bar._extrasCdExpiry = cached.cdExpiry
-                        bar.cdBar:Show()
-                        FeedCdText(bar, cdDurObj)
-                    end
-                end
-
-                -- Item CD recovery via item API (survives /reload, non-secret)
-                if (extra.type == "potion" or extra.type == "trinket") and not bar._extrasCdExpiry then
-                    local itemID = extra.itemID or (POTION_BUFF_LOOKUP[extra.spellID] and POTION_BUFF_LOOKUP[extra.spellID].itemID)
-                    if itemID then
-                        local ok, startTime, duration = pcall(C_Item.GetItemCooldown, itemID)
-                        if ok and startTime and startTime > 0 and duration and duration > 2 then
-                            local expiry = startTime + duration
-                            local now = GetTime()
-                            if expiry > now then
-                                local cdDurObj = C_DurationUtil.CreateDuration()
-                                cdDurObj:SetTimeFromStart(startTime, duration)
-                                bar.activeCooldown = cdDurObj
-                                bar._extrasCdExpiry = expiry
-                                bar.cdBar:Show()
-                                FeedCdText(bar, cdDurObj)
-                                ns._activeExtrasTimers[extra.key] = ns._activeExtrasTimers[extra.key] or {}
-                                ns._activeExtrasTimers[extra.key].cdExpiry = expiry
-                                ns._activeExtrasTimers[extra.key].cdDuration = duration
-                            end
-                        end
-                    end
                 end
 
                 bar:Show()
@@ -3927,12 +3972,18 @@ LoadEssentialCooldowns = function()
         for _, bar in ipairs(cdm) do cooldownBars[#cooldownBars + 1] = bar end
     end
 
-    -- Hide text on unused pooled bars
+    -- Hide text on unused pooled bars. cdTextCooldown needs clearing, not
+    -- hiding: it hangs off barTextOverlay, which is parented to EH_Parent and
+    -- not to the row, so hiding the row leaves the engine drawing its countdown
+    -- over nothing when the bar set shrinks mid-cooldown.
     for i = #cooldownBars + 1, #barPool do
         local bar = barPool[i]
         bar.chargeText:Hide()
         bar.stackText:Hide()
         if bar.variantNameText then bar.variantNameText:Hide() end
+        HandleProcGlow(bar, false)
+        -- Cleared, not hidden: nothing ever re-shows barTextOverlay.
+        if bar.cdTextCooldown then bar.cdTextCooldown:SetCooldown(0, 0) end
     end
 
 
@@ -4018,19 +4069,15 @@ local function ProcessSpecChange()
 end
 
 local function UpdateVisibility()
-    if not CONFIG.redshift then
-        EH_Parent:Show()
-        return
-    end
-    
-    local inCombat = InCombatLockdown()
-    local hasTarget = UnitExists("target")
-    
-    if inCombat or hasTarget then
-        EH_Parent:Show()
+    if CONFIG.redshift then
+        EH_Parent:SetShown(InCombatLockdown() or UnitExists("target"))
     else
-        EH_Parent:Hide()
+        EH_Parent:Show()
     end
+
+    -- Called from here, not the same events: two frames taking one event have
+    -- no defined order and the strip would read a stale state.
+    if CONFIG.iconsEnabled and ns.Icons then ns.Icons.Layout() end
 end
 
 -- Events
@@ -4043,6 +4090,12 @@ EH_Parent:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 EH_Parent:RegisterEvent("TRAIT_CONFIG_UPDATED")
 EH_Parent:RegisterEvent("SPELLS_CHANGED")
 EH_Parent:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")
+EH_Parent:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")
+-- Every snapped measurement in this file divides by the effective scale, so all
+-- of it goes stale when the scale or the resolution changes. Only the icon
+-- strip was rebuilding on these.
+EH_Parent:RegisterEvent("UI_SCALE_CHANGED")
+EH_Parent:RegisterEvent("DISPLAY_SIZE_CHANGED")
 
 EH_Parent:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_SHOW")
 EH_Parent:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_HIDE")
@@ -4063,12 +4116,11 @@ EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_EMPOWER_STOP", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_EMPOWER_UPDATE", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 
-EH_Parent:RegisterUnitEvent("UNIT_AURA", "player", "target", "pet")
+EH_Parent:RegisterUnitEvent("UNIT_AURA", "player", "target")
 
 EH_Parent:RegisterEvent("PLAYER_REGEN_DISABLED")
 EH_Parent:RegisterEvent("PLAYER_REGEN_ENABLED")
 EH_Parent:RegisterEvent("PLAYER_TARGET_CHANGED")
-EH_Parent:RegisterEvent("BAG_UPDATE_COOLDOWN")
 
 -- ECM visibility (per-viewer)
 local ecmFrameNames = {
@@ -4141,6 +4193,11 @@ end
 ns.ApplyECMVisibility = ApplyECMVisibility
 
 local function ForceViewersAlways()
+    -- Claim the single allowed save on the login pass, even if it returns
+    -- early, so every later caller is a runtime caller by definition.
+    local isFirstCall = not ns._editModeSeen
+    ns._editModeSeen = true
+
     -- Fast path: check if VisibleSetting already correct via frame properties (read-only)
     local allCorrect = true
     for _, name in ipairs(ecmFrameNames) do
@@ -4217,7 +4274,7 @@ local function ForceViewersAlways()
     -- Blizzard frame properties including isActive, the field read on every
     -- viewer child. Runtime callers get the layout data corrected in memory
     -- and the write deferred to the next login.
-    if ns._editModeSaved then
+    if ns._editModeSaved or not isFirstCall then
         return true
     end
     ns._editModeSaved = true
@@ -4347,18 +4404,15 @@ loginInitFrame:SetScript("OnEvent", function()
         EH_Parent:SetPoint(pos.point, UIParent, pos.relPoint, pos.x, pos.y)
     end
 
-    local setAlphaGuard = {}
     for _, name in ipairs(ecmFrameNames) do
         local frame = _G[name]
         if frame then
             local key = ecmViewerKey[name]
+            -- Queue only. Writing to a CDM frame inside its own hook taints
+            -- the rest of that secure execution.
             hooksecurefunc(frame, "SetAlpha", function(self, alpha)
-                if setAlphaGuard[self] then return end
-                if issecretvalue and issecretvalue(alpha) then return end
+                if issecretvalue(alpha) then return end
                 if key and CONFIG[key] and alpha > 0 then
-                    setAlphaGuard[self] = true
-                    self:SetAlpha(0)
-                    setAlphaGuard[self] = nil
                     QueueECMVisibility()
                 end
             end)
@@ -4379,7 +4433,11 @@ loginInitFrame:SetScript("OnEvent", function()
                 local oldCdID = cdmFrameToCdID[frame]
                 if oldCdID then
                     if persistentCooldownMap[oldCdID] == frame then persistentCooldownMap[oldCdID] = nil end
-                    if persistentBuffMap[oldCdID] == frame then persistentBuffMap[oldCdID] = nil end
+                    if persistentBuffMap[oldCdID] == frame then
+                        persistentBuffMap[oldCdID] = nil
+                        persistentBuffFallback[oldCdID] = nil
+                        buffPromoteNext[oldCdID] = nil
+                    end
                 end
                 cdmFrameToCdID[frame] = cdID
 
@@ -4392,10 +4450,13 @@ loginInitFrame:SetScript("OnEvent", function()
                     persistentCooldownMap[cdID] = frame
                     if not persistentBuffMap[cdID] then
                         persistentBuffMap[cdID] = frame
+                        persistentBuffFallback[cdID] = true
                     end
                 end
                 if isBuff then
                     persistentBuffMap[cdID] = frame
+                    persistentBuffFallback[cdID] = nil
+                    buffPromoteNext[cdID] = nil
                 end
                 InstallBuffFrameHooks(frame)
                 MarkBuffDirtyForCdID(cdID)
@@ -4414,7 +4475,11 @@ loginInitFrame:SetScript("OnEvent", function()
                 local cdID = cdmFrameToCdID[frame]
                 if cdID then
                     if persistentCooldownMap[cdID] == frame then persistentCooldownMap[cdID] = nil end
-                    if persistentBuffMap[cdID] == frame then persistentBuffMap[cdID] = nil end
+                    if persistentBuffMap[cdID] == frame then
+                        persistentBuffMap[cdID] = nil
+                        persistentBuffFallback[cdID] = nil
+                        buffPromoteNext[cdID] = nil
+                    end
                     cdmFrameToCdID[frame] = nil
                     MarkBuffDirtyForCdID(cdID)
                     viewerScanDirty = true
@@ -4483,6 +4548,8 @@ loginInitFrame:SetScript("OnEvent", function()
 
     -- Register settings panel in the ESC menu at load time
     if ns.InitSettings then ns.InitSettings() end
+
+    if ns.RefreshIcons then ns.RefreshIcons() end
 end)
 
 local lastUnitAuraUpdate = 0
@@ -4529,12 +4596,14 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             InfallDB.chargeDurations = InfallDB.chargeDurations or {}
             AC.LoadDB()
 
-            -- Charge bases are no longer learned at runtime. Drop the recorded
-            -- ones: a reading taken during a loading screen or a different
-            -- talent build could pin a spell below its real charge count.
+            -- Drop recorded charge bases: a reading taken during a loading screen
+            -- or a different talent build can pin a spell below its real count.
             InfallDB.chargeObserved = nil
 
-            print("|cff00ff00[Infall]|r Loaded. Type |cffffff00/infall setup|r for settings or |cffffff00/infall|r for commands.")
+            if not InfallDB.seenWelcome then
+                InfallDB.seenWelcome = true
+                print("|cff00ff00[Infall]|r Loaded. Type |cffffff00/infall setup|r for settings or |cffffff00/infall|r for commands.")
+            end
         end
         
     elseif event == "PLAYER_ENTERING_WORLD" then
@@ -4615,88 +4684,16 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- Potion extras detection (spellID from event is NeverSecret, works in combat)
-        if POTION_BUFF_LOOKUP[spellID] then
-            for _, row in ipairs(cooldownBars) do
-                if row.extrasType == "potion" and row._potionBuffSpellID == spellID then
-                    local now = GetTime()
-                    -- Buff timer (manual DurObj for 30Hz fill, expiry timestamp for cleanup)
-                    local buffDurObj = C_DurationUtil.CreateDuration()
-                    buffDurObj:SetTimeFromStart(now, row._potionBuffDuration)
-                    row.activeBuffDuration = buffDurObj
-                    row._extrasBuffExpiry = now + row._potionBuffDuration
-                    if not row.buffBar:IsShown() then
-                        row.buffBar:SetValue(0)
-                    end
-                    row.buffBar:Show()
-                    -- CD timer (5 min shared potion CD)
-                    local cdDurObj = C_DurationUtil.CreateDuration()
-                    cdDurObj:SetTimeFromStart(now, row._potionCdDuration)
-                    row.activeCooldown = cdDurObj
-                    row._extrasCdExpiry = now + row._potionCdDuration
-                    if not row.cdBar:IsShown() then row.cdBar:Show() end
-                    FeedCdText(row, cdDurObj)
-                    -- Save to persistent timer cache
-                    ns._activeExtrasTimers[row.extrasKey] = {
-                        buffExpiry = row._extrasBuffExpiry,
-                        buffDuration = row._potionBuffDuration,
-                        cdExpiry = row._extrasCdExpiry,
-                        cdDuration = row._potionCdDuration,
-                    }
-                    break
-                end
-            end
-        end
 
-        -- Trinket extras detection
-        if TRINKET_SPELL_LOOKUP[spellID] then
+        -- Combat potion. Only a fresh cast arms the window, so a reload mid-buff
+        -- shows nothing until the next use.
+        local potionWindow = (not issecretvalue(spellID)) and POTION_BUFF_DURATIONS[spellID]
+        if potionWindow then
             for _, row in ipairs(cooldownBars) do
-                if row.extrasType == "trinket" and row._potionBuffSpellID == spellID then
-                    local now = GetTime()
-                    local buffDurObj = C_DurationUtil.CreateDuration()
-                    buffDurObj:SetTimeFromStart(now, row._potionBuffDuration)
-                    row.activeBuffDuration = buffDurObj
-                    row._extrasBuffExpiry = now + row._potionBuffDuration
-                    if not row.buffBar:IsShown() then
-                        row.buffBar:SetValue(0)
-                    end
-                    row.buffBar:Show()
-                    local cdDurObj = C_DurationUtil.CreateDuration()
-                    cdDurObj:SetTimeFromStart(now, row._potionCdDuration)
-                    row.activeCooldown = cdDurObj
-                    row._extrasCdExpiry = now + row._potionCdDuration
-                    if not row.cdBar:IsShown() then row.cdBar:Show() end
-                    FeedCdText(row, cdDurObj)
-                    ns._activeExtrasTimers[row.extrasKey] = {
-                        buffExpiry = row._extrasBuffExpiry,
-                        buffDuration = row._potionBuffDuration,
-                        cdExpiry = row._extrasCdExpiry,
-                        cdDuration = row._potionCdDuration,
-                    }
-                    break
+                if not row.isExtras and row.cooldownID
+                    and CombatPotionRowInfo(row.cooldownID) then
+                    ArmPotionWindow(row, potionWindow)
                 end
-            end
-        end
-
-        -- Racial extras buff detection (hardcoded durations)
-        for _, row in ipairs(cooldownBars) do
-            if row.extrasType == "racial" and row.spellID == spellID then
-                local buffDuration = RACIAL_BUFF_DURATIONS[spellID]
-                if buffDuration then
-                    local now = GetTime()
-                    local buffDurObj = C_DurationUtil.CreateDuration()
-                    buffDurObj:SetTimeFromStart(now, buffDuration)
-                    row.activeBuffDuration = buffDurObj
-                    row._extrasBuffExpiry = now + buffDuration
-                    if not row.buffBar:IsShown() then
-                        row.buffBar:SetValue(0)
-                    end
-                    row.buffBar:Show()
-                    ns._activeExtrasTimers[row.extrasKey] = ns._activeExtrasTimers[row.extrasKey] or {}
-                    ns._activeExtrasTimers[row.extrasKey].buffExpiry = row._extrasBuffExpiry
-                    ns._activeExtrasTimers[row.extrasKey].buffDuration = buffDuration
-                end
-                break
             end
         end
 
@@ -4710,6 +4707,8 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 if myToken ~= specChangeToken or specChangePending then return end
                 if InCombatLockdown() then return end
                 RedetectChargesAndRebuild()
+                -- Re-evaluates which configs still resolve to a real ability.
+                if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
             end)
         end
 
@@ -4749,6 +4748,13 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             C_Timer.After(0, LoadEssentialCooldowns)
         end
         
+    elseif event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
+        -- Deferred: the new scale is not readable from inside the event.
+        C_Timer.After(0, function()
+            if InCombatLockdown() then return end
+            ApplyLayoutToAllBars()
+        end)
+
     elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_SHOW" then
         local spellID = ...
         for _, row in ipairs(cooldownBars) do
@@ -4767,6 +4773,24 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end
         end
         
+    elseif event == "COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED" then
+        -- An override can change at runtime, notably on a zone transition. Re-resolve
+        -- display only; timing is re-read every pass anyway.
+        local baseSpellID, overrideSpellID = ...
+        if baseSpellID and not issecretvalue(baseSpellID) then
+            for _, row in ipairs(cooldownBars) do
+                if row.baseSpellID == baseSpellID then
+                    if overrideSpellID and not issecretvalue(overrideSpellID)
+                        and overrideSpellID ~= 0 then
+                        row.spellID = overrideSpellID
+                    else
+                        row.spellID = baseSpellID
+                    end
+                    ApplyRowDisplay(row, row.cooldownID)
+                end
+            end
+        end
+
     elseif event == "SPELL_UPDATE_USABLE" then
         UpdateAllIconStates()
         
@@ -4782,6 +4806,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         for _, row in ipairs(cooldownBars) do
             row._totemCooldownFed = false
             row._overlayTotemFed = false
+            row._thirdTotemFed = false
         end
         UpdateBars()
 
@@ -4796,7 +4821,20 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_SPELLCAST_STOP" or event == "UNIT_SPELLCAST_FAILED" or
            event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_CHANNEL_STOP"
            or event == "UNIT_SPELLCAST_EMPOWER_STOP" then
-        local _, _, spellID = ...
+        local _, castGUID, spellID = ...
+
+        -- The spark tracks casts with no row, so it cannot ride on activeCast's
+        -- guards. A stop is a stop; the interrupted cast is not finishing.
+        if sparkCast and (not spellID or spellID == sparkCast.spellID) then
+            sparkCast = nil
+            HideCastSpark()
+        end
+
+        -- A cast GUID identifies one cast; a spell id does not. Only when both are
+        -- present, so a missing id still reaches the guards below.
+        if activeCast and castGUID and activeCast.castID and castGUID ~= activeCast.castID then
+            return
+        end
         if activeCast and activeCast.row then
             -- Type guard: cast stops only affect casts, channel stops only affect channels.
             local isCastStop = (event == "UNIT_SPELLCAST_STOP" or event == "UNIT_SPELLCAST_FAILED" or event == "UNIT_SPELLCAST_INTERRUPTED")
@@ -4828,94 +4866,8 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_AURA" then
         local unit, updateInfo = ...
 
-        -- Secret IDs cannot be compared; ClearAuraInstanceInfo handles removal.
-        local removedIDs
-        if updateInfo and not (issecretvalue and issecretvalue(updateInfo)) then
-            local rOk, r = pcall(function() return updateInfo.removedAuraInstanceIDs end)
-            if rOk and r and not (issecretvalue and issecretvalue(r)) then removedIDs = r end
-        end
-        if removedIDs then
-            for _, removedID in ipairs(removedIDs) do
-                if issecretvalue and issecretvalue(removedID) then break end
-                for _, row in ipairs(cooldownBars) do
-                    if not (issecretvalue and issecretvalue(row.trackedBuffAuraInstanceID))
-                       and row.trackedBuffAuraInstanceID == removedID then
-                        row.activeBuffDuration = nil
-                        row.trackedBuffAuraInstanceID = nil
-                        row.buffBar:Hide()
-                        FeedHiddenCooldown(row, "buff", nil)
-                    end
-                    if row.trackedOverlayAuraInstanceID == removedID then
-                        row.activeBuffOverlayDuration = nil
-                        row.trackedOverlayAuraInstanceID = nil
-                        if row.buffBarOverlay then row.buffBarOverlay:Hide() end
-                        FeedHiddenCooldown(row, "overlay", nil)
-                    end
-                    if row.trackedThirdAuraInstanceID == removedID then
-                        row.activeBuffThirdDuration = nil
-                        row.trackedThirdAuraInstanceID = nil
-                        if row.buffBarThird then row.buffBarThird:Hide() end
-                        FeedHiddenCooldown(row, "third", nil)
-                    end
-                    -- Extras buff removal (racials only; potions/trinkets use expiry timer, custom rows use buffMappings)
-                    if row.isExtras and row.extrasType ~= "potion" and row.extrasType ~= "trinket" and row.extrasType ~= "custom" and row._extrasAuraInstanceID == removedID then
-                        row._extrasAuraInstanceID = nil
-                        row._extrasBuffExpiry = nil
-                        row.activeBuffDuration = nil
-                        row.buffBar:Hide()
-                        FeedHiddenCooldown(row, "buff", nil)
-                        local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
-                        if cache then cache.buffExpiry = nil end
-                    end
-                end
-            end
-        end
-
-        -- Extras buff detection via addedAuras (racials + potions).
-        -- 12.0.7 only. REMOVE WITH 12.0.7 SUPPORT.
-        if not (ns.AuraCompat and ns.AuraCompat.IS_121)
-           and unit == "player" and updateInfo and updateInfo.addedAuras then
-            for _, auraData in ipairs(updateInfo.addedAuras) do
-                local aSpellId = auraData.spellId
-                if aSpellId and not (issecretvalue and issecretvalue(aSpellId)) then
-                    for _, row in ipairs(cooldownBars) do
-                        if row.isExtras and row.extrasType ~= "custom" then
-                            local matchID = row._potionBuffSpellID or row.spellID
-                            if matchID == aSpellId then
-                                row._extrasAuraInstanceID = auraData.auraInstanceID
-                                local durOk, durObj = false, nil
-                                if not AC.AurasRestricted() then
-                                    durOk, durObj = pcall(C_UnitAuras.GetAuraDuration, "player", auraData.auraInstanceID)
-                                end
-                                if not (durOk and durObj) and row._potionBuffDuration then
-                                    durObj = C_DurationUtil.CreateDuration()
-                                    durObj:SetTimeFromStart(GetTime(), row._potionBuffDuration)
-                                    durOk = true
-                                end
-                                if durOk and durObj then
-                                    row.activeBuffDuration = durObj
-                                    FeedHiddenCooldown(row, "buff", durObj)
-                                    if not row.buffBar:IsShown() then
-                                        row.buffBar:SetValue(0)
-                                        row.buffBar:Show()
-                                    end
-                                end
-                                -- Potion/trinket CD timer (racials get CD via UpdateRowCooldown instead)
-                                if row.extrasType == "potion" or row.extrasType == "trinket" then
-                                    local cdDurObj = C_DurationUtil.CreateDuration()
-                                    cdDurObj:SetTimeFromStart(GetTime(), row._potionCdDuration)
-                                    row.activeCooldown = cdDurObj
-                                    row.hidden_cd:SetCooldown(GetTime(), row._potionCdDuration)
-                                    if not row.cdBar:IsShown() then row.cdBar:Show() end
-                                    FeedCdText(row, cdDurObj)
-                                end
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-        end
+        -- Aura removal is handled by the ClearAuraInstanceInfo hook. Do not read
+        -- removedAuraInstanceIDs here: the ids can be secret and comparing one throws.
 
         local now = GetTime()
         if now - lastUnitAuraUpdate >= UNIT_AURA_THROTTLE then
@@ -4971,7 +4923,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                             end
                             row.maxCharges = effectiveMax
                             local bH = row.cdBar.fullHeight or CONFIG.height
-                            row.cdBar.laneHeight = (bH - (effectiveMax - 1)) / effectiveMax
+                            SetChargeLaneMetrics(row, bH, effectiveMax)
                         end
                     end
                     FeedChargeBarTimers(row)
@@ -5004,27 +4956,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         ScheduleDeferredUpdate(0.1)
         ScheduleDeferredUpdate(0.2)
 
-    elseif event == "BAG_UPDATE_COOLDOWN" then
-        -- Detect server-side CD resets for extras (potions/trinkets)
-        for _, row in ipairs(cooldownBars) do
-            if row._extrasCdExpiry and row._extrasItemID then
-                local ok, startTime, duration = pcall(C_Item.GetItemCooldown, row._extrasItemID)
-                if ok and (not startTime or startTime == 0 or not duration or duration <= 2) then
-                    row._extrasCdExpiry = nil
-                    row.activeCooldown = nil
-                    row.cdBar:Hide()
-                    if row.cooldownFrame then row.cooldownFrame:Hide() end
-                    if row.activeCdSlide then
-                        DetachPastSlide(row.activeCdSlide)
-                        row.activeCdSlide = nil
-                    end
-                    if row.cdTextCooldown then row.cdTextCooldown:SetCooldown(0, 0) end
-                    UpdateDesaturation(row)
-                    local cache = row.extrasKey and ns._activeExtrasTimers[row.extrasKey]
-                    if cache then cache.cdExpiry = nil; cache.cdDuration = nil end
-                end
-            end
-        end
     end
 end)
 
@@ -5046,7 +4977,7 @@ end
 SLASH_INFALL1 = "/infall"
 SlashCmdList["INFALL"] = function(msg)
     msg = msg:lower():trim()
-    
+
     if msg == "runecd" then
         if not CONFIG.runeBaseCooldowns then
             print("|cff00ff00[Infall]|r No rune abilities on this class.")
@@ -5567,9 +5498,7 @@ ns.UpdateDurationTextSettings = function()
     end
 end
 
--- ============================================================================
 -- STACK INDICATORS
--- ============================================================================
 
 local SI_DEFAULTS = {
     position = "TOP",
@@ -5614,50 +5543,80 @@ local indicatorRows = {}
 siIsBuilt = false
 local siRowPool = {}
 
-local function SnapPx(value, scale)
-    if value == 0 then return 0 end
-    local px = 768 / select(2, GetPhysicalScreenSize()) / scale
-    return math.floor(value / px + 0.5) * px
-end
+local siPipPool = {}
 
+-- Pooled: frames and textures are never freed, and pips rebuild on every zone
+-- change, spec change and reorder. Children are cached and reconfigured.
 local function CreateSIPip(parent, index, indicatorConfig, settings)
     local maxStacks = indicatorConfig.maxStacks or 3
     local hasOverflow = indicatorConfig.overflowMax and indicatorConfig.overflowMax > maxStacks
     local bs = settings.borderSize
 
-    local pip = CreateFrame("Frame", nil, parent)
+    local pip = table.remove(siPipPool)
+    if pip then
+        pip:SetParent(parent)
+        pip:ClearAllPoints()
+        pip:Show()
+    else
+        pip = CreateFrame("Frame", nil, parent)
+    end
 
     local bc = settings.borderColor or CONFIG.bordercolor or {0, 0, 0, 1}
     local br, bg2, bb, ba = bc[1], bc[2], bc[3], bc[4] or 1
     if bs > 0 then
-        local bTop = pip:CreateTexture(nil, "BACKGROUND")
+        if not pip.bTop then
+            pip.bTop = pip:CreateTexture(nil, "BACKGROUND")
+            pip.bBot = pip:CreateTexture(nil, "BACKGROUND")
+            pip.bLeft = pip:CreateTexture(nil, "BACKGROUND")
+            pip.bRight = pip:CreateTexture(nil, "BACKGROUND")
+        end
+
+        local bTop = pip.bTop
+        bTop:ClearAllPoints()
         bTop:SetPoint("TOPLEFT") bTop:SetPoint("TOPRIGHT")
         bTop:SetHeight(bs)
         bTop:SetColorTexture(br, bg2, bb, ba)
+        bTop:Show()
 
-        local bBot = pip:CreateTexture(nil, "BACKGROUND")
+        local bBot = pip.bBot
+        bBot:ClearAllPoints()
         bBot:SetPoint("BOTTOMLEFT") bBot:SetPoint("BOTTOMRIGHT")
         bBot:SetHeight(bs)
         bBot:SetColorTexture(br, bg2, bb, ba)
+        bBot:Show()
 
-        local bLeft = pip:CreateTexture(nil, "BACKGROUND")
+        local bLeft = pip.bLeft
+        bLeft:ClearAllPoints()
         bLeft:SetPoint("TOPLEFT", 0, -bs) bLeft:SetPoint("BOTTOMLEFT", 0, bs)
         bLeft:SetWidth(bs)
         bLeft:SetColorTexture(br, bg2, bb, ba)
+        bLeft:Show()
 
-        local bRight = pip:CreateTexture(nil, "BACKGROUND")
+        local bRight = pip.bRight
+        bRight:ClearAllPoints()
         bRight:SetPoint("TOPRIGHT", 0, -bs) bRight:SetPoint("BOTTOMRIGHT", 0, bs)
         bRight:SetWidth(bs)
         bRight:SetColorTexture(br, bg2, bb, ba)
+        bRight:Show()
+    elseif pip.bTop then
+        -- Border turned off on a pip that had one.
+        pip.bTop:Hide() pip.bBot:Hide() pip.bLeft:Hide() pip.bRight:Hide()
     end
 
     local ec = settings.emptyColor
-    local emptyTex = pip:CreateTexture(nil, "BORDER")
+    local emptyTex = pip.emptyTex
+    if not emptyTex then
+        emptyTex = pip:CreateTexture(nil, "BORDER")
+        pip.emptyTex = emptyTex
+    end
+    emptyTex:ClearAllPoints()
     emptyTex:SetPoint("TOPLEFT", bs, -bs)
     emptyTex:SetPoint("BOTTOMRIGHT", -bs, bs)
     emptyTex:SetColorTexture(ec[1], ec[2], ec[3], ec[4] or 0.6)
+    emptyTex:Show()
 
-    local baseBar = CreateFrame("StatusBar", nil, pip)
+    local baseBar = pip.baseBar or CreateFrame("StatusBar", nil, pip)
+    baseBar:ClearAllPoints()
     baseBar:SetPoint("TOPLEFT", pip, "TOPLEFT", bs, -bs)
     baseBar:SetPoint("BOTTOMRIGHT", pip, "BOTTOMRIGHT", -bs, bs)
     baseBar:SetMinMaxValues(index - 1, index)
@@ -5670,9 +5629,11 @@ local function CreateSIPip(parent, index, indicatorConfig, settings)
     CrispBar(baseBar)
 
     pip.baseBar = baseBar
+    baseBar:Show()
 
     if hasOverflow then
-        local overflowBar = CreateFrame("StatusBar", nil, pip)
+        local overflowBar = pip.overflowBar or CreateFrame("StatusBar", nil, pip)
+        overflowBar:ClearAllPoints()
         overflowBar:SetPoint("TOPLEFT", pip, "TOPLEFT", bs, -bs)
         overflowBar:SetPoint("BOTTOMRIGHT", pip, "BOTTOMRIGHT", -bs, bs)
         overflowBar:SetMinMaxValues(maxStacks + index - 1, maxStacks + index)
@@ -5685,14 +5646,35 @@ local function CreateSIPip(parent, index, indicatorConfig, settings)
         CrispBar(overflowBar)
 
         pip.overflowBar = overflowBar
+        overflowBar:Show()
+    elseif pip.overflowBar then
+        pip.overflowBar:Hide()
     end
 
     return pip
 end
 
+local siGlowPool = {}
+
 local function CreateSIGlowOverlay(parent, settings, totalMax)
     -- StatusBar glow: fills to 100% at totalMax via SetValue.
-    local glowBar = CreateFrame("StatusBar", nil, parent)
+    -- Pooled with its animation group; a dropped one keeps looping.
+    local glowBar = table.remove(siGlowPool)
+    if glowBar then
+        glowBar:SetParent(parent)
+        glowBar:ClearAllPoints()
+        glowBar:SetAllPoints()
+        glowBar:SetFrameLevel(parent:GetFrameLevel() + 10)
+        glowBar:SetMinMaxValues(totalMax - 0.5, totalMax)
+        glowBar:SetValue(0)
+        local gc = settings.glowColor or {1, 1, 1, 0.6}
+        glowBar:GetStatusBarTexture():SetVertexColor(gc[1], gc[2], gc[3], gc[4] or 0.6)
+        glowBar:Hide()
+        if glowBar.anim and not glowBar.anim:IsPlaying() then glowBar.anim:Play() end
+        return glowBar
+    end
+
+    glowBar = CreateFrame("StatusBar", nil, parent)
     glowBar:SetAllPoints()
     glowBar:SetFrameLevel(parent:GetFrameLevel() + 10)
     glowBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
@@ -5717,6 +5699,7 @@ local function CreateSIGlowOverlay(parent, settings, totalMax)
     fadeOut:SetDuration(0.65)
     fadeOut:SetOrder(2)
 
+    glowBar.anim = ag
     ag:Play()
 
     return glowBar
@@ -5733,13 +5716,19 @@ local function SyncStackLayout()
 
     local function LayoutContainer(container, rows, isBottom)
         if not container then return end
+        -- The icon strip can be set to sit between the frame and the pips, in
+        -- which case the pips start beyond it instead of at the frame edge.
+        local edge = gap
+        if ns.Icons and ns.Icons.GetEdgeHeight then
+            edge = edge + ns.Icons.GetEdgeHeight(isBottom and "BOTTOM" or "TOP")
+        end
         container:ClearAllPoints()
         if isBottom then
-            container:SetPoint("TOPLEFT", EH_Parent, "BOTTOMLEFT", 0, -gap)
-            container:SetPoint("TOPRIGHT", EH_Parent, "BOTTOMRIGHT", 0, -gap)
+            container:SetPoint("TOPLEFT", EH_Parent, "BOTTOMLEFT", 0, -edge)
+            container:SetPoint("TOPRIGHT", EH_Parent, "BOTTOMRIGHT", 0, -edge)
         else
-            container:SetPoint("BOTTOMLEFT", EH_Parent, "TOPLEFT", 0, gap)
-            container:SetPoint("BOTTOMRIGHT", EH_Parent, "TOPRIGHT", 0, gap)
+            container:SetPoint("BOTTOMLEFT", EH_Parent, "TOPLEFT", 0, edge)
+            container:SetPoint("BOTTOMRIGHT", EH_Parent, "TOPRIGHT", 0, edge)
         end
 
         local containerWidth = container:GetWidth()
@@ -5771,20 +5760,23 @@ local function SyncStackLayout()
                 local rowH = rowData.height or pipHeight
                 rowFrame:SetHeight(rowH)
 
-                local es = rowFrame:GetEffectiveScale()
-                local onePx = 768 / select(2, GetPhysicalScreenSize()) / es
-                local snap = function(v) return math.floor(v / onePx + 0.5) * onePx end
-                local snappedSpacing = snap(pipSpacing)
-                local snappedContainerW = snap(containerWidth)
-                local idealPipW = (snappedContainerW - (numPips - 1) * snappedSpacing) / numPips
-                local stride = idealPipW + snappedSpacing
+                local onePx = ns.OnePxForFrame(rowFrame)
+                local snap = ns.SnapPx
+                local snappedSpacing = snap(pipSpacing, onePx)
+                local snappedContainerW = snap(containerWidth, onePx)
+
+                -- Snap the cut points and add whole gaps, so every gap is
+                -- identical. Rounding each pip's start and end separately let
+                -- neighbours land a pixel apart or touching.
+                local usableW = snappedContainerW - (numPips - 1) * snappedSpacing
                 for j, pip in ipairs(rowData.pips) do
                     local idx = j - 1
-                    local startX = snap(idx * stride)
-                    local endX = (j == numPips) and snappedContainerW or snap(idx * stride + idealPipW)
+                    local startX = snap(idx * usableW / numPips, onePx) + idx * snappedSpacing
+                    local endX = (j == numPips) and snappedContainerW
+                        or (snap(j * usableW / numPips, onePx) + idx * snappedSpacing)
                     pip:ClearAllPoints()
                     pip:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", startX, 0)
-                    pip:SetSize(endX - startX, rowH)
+                    pip:SetSize(math.max(onePx, endX - startX), rowH)
                 end
 
                 if rowData.glow then
@@ -5823,10 +5815,167 @@ local function SyncStackLayout()
     LayoutContainer(stackContainerBottom, bottomRows, true)
 end
 
+-- EDGE ORDER
+--
+-- Pips, the resource bar and the icon strip all sit on the same two edges and
+-- each stored its place a different way: list order, an insert index, and an
+-- inside/outside flag. This is the one reading of that, ordered OUTWARD from
+-- the frame, so every tab can show the same list and move things the same way.
+--
+-- The two edges stack in opposite directions internally: the top container
+-- lays its rows out in reverse so index 1 ends up nearest the frame on both
+-- sides. That flip is handled here and never reaches a caller.
+
+local function EdgeItemLabel(entry)
+    if entry.indicatorType == "power" then
+        local info = ns.POWER_TYPE_INFO and ns.POWER_TYPE_INFO[entry.powerType]
+        return (info and info.name) or ("Power " .. tostring(entry.powerType or "?"))
+    end
+    local spellID = entry.auraSpellID
+    if (not spellID or spellID == 0) and entry.cooldownID then
+        local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, entry.cooldownID)
+        if ok and info then spellID = info.spellID end
+    end
+    return (spellID and C_Spell.GetSpellName(spellID)) or "Stack row"
+end
+
+local function Reversed(t)
+    local out = {}
+    for i = #t, 1, -1 do out[#out + 1] = t[i] end
+    return out
+end
+
+ns.EdgeOrder = {}
+
+function ns.EdgeOrder.Items(position)
+    local rows = {}
+    if CONFIG.stackIndicators then
+        for i, entry in ipairs(GetSIList()) do
+            if (entry.position or "TOP") == position then
+                rows[#rows + 1] = { kind = "pip", listIndex = i, label = EdgeItemLabel(entry) }
+            end
+        end
+    end
+
+    local rb = CONFIG.resourceBar
+    if rb and rb.enabled and (rb.position or "BOTTOM") == position then
+        local at = math.max(1, math.min(rb.order or (#rows + 1), #rows + 1))
+        table.insert(rows, at, { kind = "resource", label = "Resource bar" })
+    end
+
+    if position == "TOP" then rows = Reversed(rows) end
+
+    -- Strips sit outside the shared container, at one end of it or the other.
+    local items = {}
+    if CONFIG.iconsEnabled then
+        for _, cfg in ipairs(CONFIG.iconContainers or {}) do
+            if cfg.anchor == position then
+                local entry = { kind = "strip", key = cfg.key, label = "Icon strip" }
+                if (cfg.edgeOrder or "outside") == "inside" then
+                    items[#items + 1] = entry
+                else
+                    rows[#rows + 1] = entry
+                end
+            end
+        end
+    end
+    for _, r in ipairs(rows) do items[#items + 1] = r end
+    return items
+end
+
+local function SameItem(a, b)
+    if a.kind ~= b.kind then return false end
+    if a.kind == "pip" then return a.listIndex == b.listIndex end
+    if a.kind == "strip" then return a.key == b.key end
+    return true
+end
+
+-- delta -1 moves toward the frame, +1 away from it.
+function ns.EdgeOrder.CanMove(position, item, delta)
+    local items = ns.EdgeOrder.Items(position)
+    for i, it in ipairs(items) do
+        if SameItem(it, item) then
+            local j = i + delta
+            return j >= 1 and j <= #items
+        end
+    end
+    return false
+end
+
+function ns.EdgeOrder.Move(position, item, delta)
+    local items = ns.EdgeOrder.Items(position)
+    local idx
+    for i, it in ipairs(items) do
+        if SameItem(it, item) then
+            idx = i
+            break
+        end
+    end
+    if not idx then return false end
+    local other = items[idx + delta]
+    if not other then return false end
+
+    -- A pip trading places with the resource bar is the resource bar moving the
+    -- other way, so there is only ever one rule per pair.
+    if item.kind == "pip" and other.kind == "resource" then
+        return ns.EdgeOrder.Move(position, other, -delta)
+    end
+    if item.kind == "resource" and other.kind == "strip" then
+        return ns.EdgeOrder.Move(position, other, -delta)
+    end
+    if item.kind == "pip" and other.kind == "strip" then
+        return ns.EdgeOrder.Move(position, other, -delta)
+    end
+
+    if item.kind == "strip" then
+        for _, cfg in ipairs(CONFIG.iconContainers or {}) do
+            if cfg.key == item.key then
+                cfg.edgeOrder = (delta < 0) and "inside" or "outside"
+            end
+        end
+
+    elseif item.kind == "resource" then
+        local rb = CONFIG.resourceBar
+        if not rb then return false end
+        local pipCount = 0
+        if CONFIG.stackIndicators then
+            for _, entry in ipairs(GetSIList()) do
+                if (entry.position or "TOP") == position then pipCount = pipCount + 1 end
+            end
+        end
+        -- Stored as an insert index among the pip rows, which runs the other way
+        -- on top.
+        local step = (position == "TOP") and -delta or delta
+        local cur = math.max(1, math.min(rb.order or (pipCount + 1), pipCount + 1))
+        local nextAt = math.max(1, math.min(cur + step, pipCount + 1))
+        rb.order = (nextAt > pipCount) and nil or nextAt
+
+    elseif item.kind == "pip" then
+        if other.kind ~= "pip" then return false end
+        local list = GetSIList()
+        local a, b = item.listIndex, other.listIndex
+        list[a], list[b] = list[b], list[a]
+    end
+
+    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+    if ns.SyncStackContainerLayout then ns.SyncStackContainerLayout() end
+    return true
+end
+
+-- Pip rows and the resource bar share one container per edge. Only while shown:
+-- an empty one keeps a 1px height and offsetting past it would be a dead gap.
+function ns.GetStackEdgeFrame(position)
+    local c = (position == "BOTTOM") and stackContainerBottom or stackContainerTop
+    if c and c:IsShown() then return c end
+    return nil
+end
+
 SyncStackContainerLayout = function()
     if siIsBuilt then
         SyncStackLayout()
     end
+    -- The strip anchors off that container.
+    if CONFIG.iconsEnabled and ns.Icons then ns.Icons.Layout() end
 end
 ns.SyncStackContainerLayout = SyncStackContainerLayout
 
@@ -5835,8 +5984,8 @@ UpdateAllSIPips = function()
     local settings = GetSISettings()
     local layoutDirty = false
 
-    for i, rowData in ipairs(indicatorRows) do
-        local config = list[i]
+    for _, rowData in ipairs(indicatorRows) do
+        local config = list[rowData.configIndex]
         if config then
             local applications = 0
 
@@ -5844,7 +5993,7 @@ UpdateAllSIPips = function()
                 local ok, power = pcall(UnitPower, "player", config.powerType)
                 if ok then applications = power end
             elseif config.cooldownID then
-                local buffFrame = persistentBuffMap[config.cooldownID]
+                local buffFrame = ResolveBuffFrame(config.cooldownID)
                 if buffFrame and buffFrame.auraInstanceID ~= nil then
                     local appVal = AC.ReadApplications(buffFrame)
                     if appVal ~= nil then
@@ -5890,12 +6039,18 @@ end
 local function WipeSIIndicators()
     for _, rowData in ipairs(indicatorRows) do
         if rowData.glow then
+            if rowData.glow.anim and rowData.glow.anim:IsPlaying() then
+                rowData.glow.anim:Stop()
+            end
             rowData.glow:SetValue(0)
             rowData.glow:Hide()
+            rowData.glow:SetParent(UIParent)
+            siGlowPool[#siGlowPool + 1] = rowData.glow
         end
         for _, pip in ipairs(rowData.pips) do
             pip:Hide()
-            pip:SetParent(nil)
+            pip:SetParent(UIParent)
+            siPipPool[#siPipPool + 1] = pip
         end
         rowData.frame:Hide()
         siRowPool[#siRowPool + 1] = rowData.frame
@@ -6013,11 +6168,12 @@ local function BuildSIIndicators()
             glow = CreateSIGlowOverlay(rowFrame, settings, totalMax)
         end
 
-        indicatorRows[i] = {
+        indicatorRows[#indicatorRows + 1] = {
             frame = rowFrame,
             pips = pips,
             glow = glow,
             position = pos,
+            configIndex = i,
         }
         end -- skipRow
     end
@@ -6025,10 +6181,8 @@ local function BuildSIIndicators()
     -- Expose row counts for resource bar ordering
     local topCount, bottomCount = 0, 0
     for _, rd in ipairs(indicatorRows) do
-        if rd then
-            if rd.position == "BOTTOM" then bottomCount = bottomCount + 1
-            else topCount = topCount + 1 end
-        end
+        if rd.position == "BOTTOM" then bottomCount = bottomCount + 1
+        else topCount = topCount + 1 end
     end
     ns.siRowCounts = {top = topCount, bottom = bottomCount}
 

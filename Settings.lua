@@ -8,9 +8,7 @@ InfallDB = InfallDB or {}
 InfallDB.profiles = InfallDB.profiles or {}
 InfallDB.namedProfiles = InfallDB.namedProfiles or {}
 
--- ============================================================================
 -- PROFILE HELPERS
--- ============================================================================
 
 local TOGGLE_KEYS = {
     "reactiveIcons", "desaturateOnCooldown", "redshift",
@@ -20,12 +18,13 @@ local TOGGLE_KEYS = {
     "showVariantNames", "smoothBars", "showPastBars",
     "forceViewersAlways", "stackIndicators",
     "showCooldownDuration", "estimateRuneCooldowns",
+    "iconsEnabled", "iconIgnoreGCD", "iconGlow", "castSpark", "castSparkMatchCast",
 }
 
 local DISPLAY_KEYS = {
     "width", "height", "spacing", "paddingTop", "paddingBottom",
     "paddingLeft", "paddingRight", "future", "past", "iconSize",
-    "iconGap", "nowLineWidth", "gcdSparkWidth", "scale",
+    "iconGap", "hiddenIconWidth", "nowLineWidth", "gcdSparkWidth", "castSparkWidth", "scale",
     "staticHeight", "staticFrames", "lines",
     "font", "fontSize", "fontFlags",
     "chargeTextAnchor", "chargeTextRelPoint", "chargeTextOffsetX", "chargeTextOffsetY",
@@ -39,8 +38,8 @@ local DISPLAY_KEYS = {
 }
 
 local COLOR_KEYS = {
-    "cooldownColor", "castColor", "buffColor", "debuffColor", "petBuffColor",
-    "bgcolor", "bordercolor", "nowLineColor", "gcdColor", "gcdSparkColor", "linesColor",
+    "cooldownColor", "castColor", "buffColor", "debuffColor", "potionBuffColor",
+    "bgcolor", "bordercolor", "nowLineColor", "gcdColor", "gcdSparkColor", "castSparkColor", "linesColor",
     "iconUsableColor", "iconNotEnoughManaColor", "iconNotUsableColor", "iconNotInRangeColor",
     "chargeTextColor", "stackTextColor",
     "variantTextColor",
@@ -77,11 +76,22 @@ function ns.AutoPopulateSelfBuffMappings()
     if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then return end
     if not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
 
+    -- Essential AND Utility. The timeline only ever loaded Essential, but the
+    -- icon strip takes both, and a Utility spell whose buff is itself, like a
+    -- movement cooldown, has no other route to a mapping.
     local cooldownIDs = {}
-    local success, result = pcall(function()
-        return C_CooldownViewer.GetCooldownViewerCategorySet(0, false)
-    end)
-    if success and result then cooldownIDs = result end
+    local seenID = {}
+    for _, cat in ipairs({ 0, 1 }) do
+        local success, result = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, cat, false)
+        if success and result then
+            for _, id in ipairs(result) do
+                if not seenID[id] then
+                    seenID[id] = true
+                    cooldownIDs[#cooldownIDs + 1] = id
+                end
+            end
+        end
+    end
 
     CONFIG.buffMappings = CONFIG.buffMappings or {}
     local created = false
@@ -163,6 +173,25 @@ function ns.GetSpecKey()
     return name .. "-" .. realm .. "-" .. (specID or 0)
 end
 
+-- No pet handling: the Cooldown Manager scans player and target only, so an aura
+-- EH can see is never on the pet.
+local function PairingDefaultColor(buffCdID, isDebuff)
+    if isDebuff then return DeepCopy(CONFIG.debuffColor), "target" end
+    return DeepCopy(CONFIG.buffColor), nil
+end
+
+-- Icon for a CDM entry. Item entries carry no spellID, so GetSpellTexture returns
+-- nil for them and ns.ResolveCooldownDisplay must be used instead.
+local function CooldownIcon(cooldownID, cdInfo)
+    local sid = cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
+    if sid then
+        local tex = C_Spell.GetSpellTexture(sid)
+        if tex then return tex end
+    end
+    local _, rIcon = ns.ResolveCooldownDisplay(cooldownID, cdInfo)
+    return rIcon or 134400
+end
+
 function ns.SeedProfileFromClassConfig(specKey)
     local profile = {
         toggles = {},
@@ -178,6 +207,9 @@ function ns.SeedProfileFromClassConfig(specKey)
         stackIndicatorSettings = {},
         stackIndicatorList = {},
         customIcons = {},
+        iconContainers = {},
+        iconList = {},
+        iconStates = {},
     }
 
     for _, key in ipairs(TOGGLE_KEYS) do
@@ -223,6 +255,9 @@ function ns.SeedProfileFromClassConfig(specKey)
     end
     if CONFIG.extras then
         profile.extras = DeepCopy(CONFIG.extras)
+    end
+    if CONFIG.customIcons then
+        profile.customIcons = DeepCopy(CONFIG.customIcons)
     end
 
     -- Capture current frame position (per-character)
@@ -318,15 +353,30 @@ function ns.ApplyProfile(profile)
     CONFIG.resourceBar = profile.resourceBar and DeepCopy(profile.resourceBar) or {}
     CONFIG.extras = profile.extras and DeepCopy(profile.extras) or {}
     CONFIG.customIcons = profile.customIcons and DeepCopy(profile.customIcons) or {}
+    CONFIG.iconContainers = profile.iconContainers and DeepCopy(profile.iconContainers) or {}
+    CONFIG.iconList = profile.iconList and DeepCopy(profile.iconList) or {}
+    CONFIG.iconStates = profile.iconStates and DeepCopy(profile.iconStates) or {}
+
+    -- Both custom lists are in place now, so collisions carried in from a
+    -- profile written before the keyspace was shared can be separated.
+    if ns.MigrateCustomKeyCollisions then
+        local n = ns.MigrateCustomKeyCollisions()
+        if n > 0 then
+            print("|cff00ff00[Infall]|r Separated " .. n
+                .. " custom icon(s) that shared a key with a custom timeline row.")
+        end
+    end
+
+    -- Scale BEFORE position: a SetPoint offset is in the frame's own units, so
+    -- scaling afterwards multiplies the saved offset and slides the frame.
+    if EH_Parent then
+        EH_Parent:SetScale(CONFIG.scale or 1.0)
+    end
 
     -- Restore per-profile frame position
     if profile.position and EH_Parent then
         EH_Parent:ClearAllPoints()
         EH_Parent:SetPoint(profile.position.point, UIParent, profile.position.relPoint, profile.position.x, profile.position.y)
-    end
-
-    if EH_Parent then
-        EH_Parent:SetScale(CONFIG.scale or 1.0)
     end
     if ns.ApplyBackdrop then
         ns.ApplyBackdrop()
@@ -349,11 +399,17 @@ function ns.ApplyProfile(profile)
     if ns.RebuildStackIndicators then
         ns.RebuildStackIndicators()
     end
+    if ns.RefreshIcons then
+        ns.RefreshIcons()
+    end
     if ns.RefreshStacksTab then
         ns.RefreshStacksTab()
     end
     if ns.RefreshResourceTab then
         ns.RefreshResourceTab()
+    end
+    if ns.RefreshIconsTab then
+        ns.RefreshIconsTab()
     end
     if ns.UpdateDurationTextSettings then
         ns.UpdateDurationTextSettings()
@@ -392,6 +448,9 @@ function ns.SaveCurrentProfile()
     profile.resourceBar = DeepCopy(CONFIG.resourceBar or {})
     profile.extras = DeepCopy(CONFIG.extras or {})
     profile.customIcons = DeepCopy(CONFIG.customIcons or {})
+    profile.iconContainers = DeepCopy(CONFIG.iconContainers or {})
+    profile.iconList = DeepCopy(CONFIG.iconList or {})
+    profile.iconStates = DeepCopy(CONFIG.iconStates or {})
 
     -- Save current frame position (per-character)
     if EH_Parent then
@@ -421,6 +480,9 @@ ns.classConfigDefaults = {
     resourceBar = DeepCopy(CONFIG.resourceBar or {}),
     extras = DeepCopy(CONFIG.extras or {}),
     customIcons = DeepCopy(CONFIG.customIcons or {}),
+    iconContainers = DeepCopy(CONFIG.iconContainers or {}),
+    iconList = DeepCopy(CONFIG.iconList or {}),
+    iconStates = DeepCopy(CONFIG.iconStates or {}),
 }
 for _, key in ipairs(TOGGLE_KEYS) do
     ns.classConfigDefaults.toggles[key] = CONFIG[key]
@@ -433,9 +495,7 @@ for _, key in ipairs(COLOR_KEYS) do
     ns.classConfigDefaults.colors[key] = DeepCopy(CONFIG[key])
 end
 
--- ============================================================================
 -- SETTINGS FRAME
--- ============================================================================
 
 local settingsBuilt = false
 local settingsFrame
@@ -496,9 +556,7 @@ local FONT_FLAG_OPTIONS = {
     {text = "None", value = ""},
 }
 
--- ============================================================================
 -- WIDGET FACTORY
--- ============================================================================
 
 local function CreateSlider(parent, label, minVal, maxVal, step, default, onChange)
     local container = CreateFrame("Frame", nil, parent)
@@ -577,7 +635,9 @@ local function CreateSlider(parent, label, minVal, maxVal, step, default, onChan
     return container
 end
 
-local function CreateCheckbox(parent, label, description, default, onChange)
+-- `description` prints under the box; `tooltip` waits for hover. Long text in
+-- a description runs out of its panel.
+local function CreateCheckbox(parent, label, description, default, onChange, tooltip)
     local container = CreateFrame("Frame", nil, parent)
     container:SetSize(300, 36)
 
@@ -598,6 +658,16 @@ local function CreateCheckbox(parent, label, description, default, onChange)
         desc:SetSpacing(2)
         desc:SetText(description)
         container:SetHeight(36 + desc:GetStringHeight())
+    end
+
+    if tooltip then
+        cb:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(label)
+            GameTooltip:AddLine(tooltip, 0.7, 0.7, 0.7, true)
+            GameTooltip:Show()
+        end)
+        cb:SetScript("OnLeave", function() GameTooltip:Hide() end)
     end
 
     cb:SetScript("OnClick", function(self)
@@ -694,6 +764,18 @@ local function CreateColorSwatch(parent, label, defaultColor, onChange)
     end
 
     return container
+end
+
+local openMenus = {}
+
+-- A menu whose page is hidden keeps its shown flag and returns with the page.
+function ns.CloseAllMenus()
+    for _, close in ipairs(openMenus) do close() end
+    if ns.CloseSpellPicker then ns.CloseSpellPicker() end
+    if Menu and Menu.GetManager then
+        local mgr = Menu.GetManager()
+        if mgr and mgr.CloseMenus then pcall(mgr.CloseMenus, mgr) end
+    end
 end
 
 local function CreateDropdown(parent, label, options, default, onChange, forceScroll, searchable)
@@ -874,7 +956,82 @@ local function CreateDropdown(parent, label, options, default, onChange, forceSc
         return button.selectedValue
     end
 
+    function container:Close()
+        menuFrame:Hide()
+    end
+    openMenus[#openMenus + 1] = function() menuFrame:Hide() end
+
     return container
+end
+
+-- One control, three tabs. Everything on an edge in draw order, nearest the
+-- frame first. `itemFn` returns the descriptor to move, or nil if not on it.
+function ns.CreateEdgeOrderControl(parent, positionFn, itemFn, onChange)
+    local c = CreateFrame("Frame", nil, parent)
+    c:SetSize(360, 96)
+
+    local title = c:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 0, 0)
+    title:SetText("Order On This Edge")
+
+    local list = c:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    list:SetPoint("TOPLEFT", 0, -18)
+    list:SetWidth(240)
+    list:SetJustifyH("LEFT")
+    list:SetSpacing(2)
+
+    local closer = CreateFrame("Button", nil, c, "UIPanelButtonTemplate")
+    closer:SetSize(110, 22)
+    closer:SetPoint("TOPRIGHT", 0, -16)
+    closer:SetText("Toward frame")
+
+    local further = CreateFrame("Button", nil, c, "UIPanelButtonTemplate")
+    further:SetSize(110, 22)
+    further:SetPoint("TOPRIGHT", closer, "BOTTOMRIGHT", 0, -4)
+    further:SetText("Away")
+
+    local function Refresh()
+        local pos = positionFn()
+        local me = itemFn()
+        local items = (ns.EdgeOrder and ns.EdgeOrder.Items(pos)) or {}
+        local lines = {}
+        for i, it in ipairs(items) do
+            local mine = me and it.kind == me.kind
+                and (me.kind ~= "pip" or it.listIndex == me.listIndex)
+                and (me.kind ~= "strip" or it.key == me.key)
+            lines[#lines + 1] = (mine and "|cffffd100" or "|cff9d9d9d")
+                .. i .. ". " .. it.label .. "|r"
+        end
+        if #lines == 0 then
+            list:SetText("|cff9d9d9dNothing on this edge yet.|r")
+        else
+            list:SetText(table.concat(lines, "\n"))
+        end
+        c:SetHeight(math.max(96, 22 + math.max(list:GetStringHeight() or 0, 48) + 12))
+
+        local canIn = me and ns.EdgeOrder and ns.EdgeOrder.CanMove(pos, me, -1)
+        local canOut = me and ns.EdgeOrder and ns.EdgeOrder.CanMove(pos, me, 1)
+        closer:SetEnabled(canIn and true or false)
+        further:SetEnabled(canOut and true or false)
+    end
+    c.Refresh = Refresh
+
+    local function Move(delta)
+        local me = itemFn()
+        if not me then return end
+        if ns.EdgeOrder then ns.EdgeOrder.Move(positionFn(), me, delta) end
+        Refresh()
+        if onChange then onChange() end
+    end
+    closer:SetScript("OnClick", function() Move(-1) end)
+    further:SetScript("OnClick", function() Move(1) end)
+
+    -- The model lives in Bars.lua, which loads after both tabs that build this,
+    -- so the first paint can happen before it exists. Repainting on show also
+    -- covers a change made from one of the other two tabs.
+    c:SetScript("OnShow", Refresh)
+    Refresh()
+    return c
 end
 
 local function CreateEditBox(parent, label, default, onChange)
@@ -913,6 +1070,27 @@ local function CreateEditBox(parent, label, default, onChange)
     return container
 end
 
+-- The one remove control, for every list row in every tab. NoScripts is the base
+-- deliberately: plain UIPanelCloseButton carries an OnClick that hides its parent.
+function ns.CreateRemoveButton(parent, tooltip, onClick, size, tooltipBody)
+    local btn = CreateFrame("Button", nil, parent, "UIPanelCloseButtonNoScripts")
+    size = size or 22
+    btn:SetSize(size, size)
+    btn:SetScript("OnClick", onClick)
+    if tooltip then
+        btn:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(tooltip)
+            if tooltipBody then
+                GameTooltip:AddLine(tooltipBody, 0.7, 0.7, 0.7, true)
+            end
+            GameTooltip:Show()
+        end)
+        btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    end
+    return btn
+end
+
 local function CreateSectionHeader(parent, text)
     local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     header:SetText(text)
@@ -920,18 +1098,116 @@ local function CreateSectionHeader(parent, text)
     return header
 end
 
--- ============================================================================
 -- TAB SYSTEM
--- ============================================================================
 
-local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Resource", "Profiles"}
+-- Index order is load bearing: tabFrames slots are assigned by number from three
+-- files. Insert a name without moving those and two tabs share a slot.
+local TAB_NAMES = {"Bars", "Display", "Colours", "Toggles", "Stacks", "Resource", "Icons", "Profiles"}
 local tabFrames = {}
 local tabButtons = {}
 local currentTab = 1
+-- The Cooldown Manager is not a managed UI panel: ShowUIPanel finds no area
+-- attribute and falls through to a plain Show. Nothing was ever forcing it and
+-- the options window apart, so the old close-then-open was hiding the settings
+-- for no reason. It does open behind the options window, which is what read as
+-- "it did not open", so raise it and let the player drag it clear.
+function ns.OpenCooldownManager()
+    if InCombatLockdown() then
+        print("|cff00ff00[Infall]|r Cannot open the Cooldown Manager in combat.")
+        return
+    end
+    local cdm = CooldownViewerSettings
+    if not cdm then
+        print("|cff00ff00[Infall]|r Cooldown Manager not available.")
+        return
+    end
+
+    -- Not a managed panel, so it lands under the options window with no way to
+    -- move it. Nothing here is protected.
+    if not cdm.infallDraggable then
+        cdm.infallDraggable = true
+        pcall(function()
+            cdm:SetMovable(true)
+            cdm:EnableMouse(true)
+            cdm:RegisterForDrag("LeftButton")
+            cdm:SetScript("OnDragStart", cdm.StartMoving)
+            cdm:SetScript("OnDragStop", cdm.StopMovingOrSizing)
+        end)
+    end
+
+    -- Raised, never moved: it keeps Blizzard's own top left anchor, and it is
+    -- draggable now if it lands somewhere awkward.
+    local collides = SettingsPanel and SettingsPanel:IsShown()
+    if collides then
+        pcall(cdm.SetFrameStrata, cdm, "FULLSCREEN_DIALOG")
+        pcall(cdm.SetToplevel, cdm, true)
+    end
+
+    C_Timer.After(0, function()
+        -- Plain Show. Not a managed panel, so ShowUIPanel resolves to this
+        -- anyway, minus its protected gamepad call, which throws first.
+        if not cdm:IsShown() then pcall(cdm.Show, cdm) end
+        -- Blizzard's own slash command route, if a plain Show is not enough.
+        if not cdm:IsShown() and cdm.TogglePanel then
+            pcall(cdm.TogglePanel, cdm)
+        end
+        if not cdm:IsShown() then pcall(ShowUIPanel, cdm) end
+        if collides then pcall(cdm.Raise, cdm) end
+        if not cdm:IsShown() then
+            print("|cff00ff00[Infall]|r The Cooldown Manager would not open. Try Esc, Options, Edit Mode, Cooldown Manager and tell me if that works.")
+        end
+    end)
+end
+
+-- A category move fires no game event; the layout manager's notification is the
+-- only signal. Both guards are load bearing: this also fires at login setup, and
+-- the rebuild wipes every row before repopulating.
+do
+    local owner = {}
+    local pending = false
+
+    local function ProviderHasEntries()
+        if not CooldownViewerSettings or not CooldownViewerSettings.GetDataProvider then
+            return false
+        end
+        local dp = CooldownViewerSettings:GetDataProvider()
+        if not dp then return false end
+        local ids = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
+        return ids and #ids > 0 or false
+    end
+
+    local function Apply()
+        pending = false
+        if InCombatLockdown() then return end
+        if not ProviderHasEntries() then return end
+        if ns.LoadEssentialCooldowns then ns.LoadEssentialCooldowns() end
+        if ns.RefreshCooldownRows then ns.RefreshCooldownRows() end
+        if ns.RefreshIconsTab then ns.RefreshIconsTab() end
+        if ns.RefreshIcons then ns.RefreshIcons() end
+    end
+
+    local function OnDataChanged()
+        if not (CooldownViewerSettings and CooldownViewerSettings:IsShown()) then return end
+        -- Dragging an entry fires this repeatedly; one rebuild covers the burst.
+        if pending then return end
+        pending = true
+        C_Timer.After(0.1, Apply)
+    end
+
+    if EventRegistry and EventRegistry.RegisterCallback then
+        EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", OnDataChanged, owner)
+    end
+end
+
 local function SelectTab(index)
     currentTab = index
     GameTooltip:Hide()
-    for i, frame in ipairs(tabFrames) do
+    if ns.CloseAllMenus then ns.CloseAllMenus() end
+    -- Indexed, not ipairs: a tab assigned from another file leaves a nil hole if
+    -- that file fails to load, and ipairs stops at the hole, leaving later tabs
+    -- shown on top of each other.
+    for i = 1, #TAB_NAMES do
+        local frame = tabFrames[i]
         if frame then frame:Hide() end
         if tabButtons[i] then
             PanelTemplates_DeselectTab(tabButtons[i])
@@ -945,9 +1221,7 @@ local function SelectTab(index)
     end
 end
 
--- ============================================================================
 -- SCROLL FRAME HELPER
--- ============================================================================
 
 local function CreateScrollableContent(parent)
     local scrollFrame = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
@@ -965,9 +1239,7 @@ local function CreateScrollableContent(parent)
     return scrollFrame, content
 end
 
--- ============================================================================
 -- INLINE COLOUR PICKER (for per-slot buff colours)
--- ============================================================================
 
 local function OpenInlineColorPicker(currentColor, onChange)
     local prevR, prevG, prevB, prevA = currentColor[1], currentColor[2], currentColor[3], currentColor[4] or 1
@@ -997,11 +1269,9 @@ local function OpenInlineColorPicker(currentColor, onChange)
     ColorPickerFrame:SetupColorPickerAndShow(info)
 end
 
--- ============================================================================
 -- SHARED SPELL PICKER
 -- Opens a searchable popup listing the player's learned spells (including
 -- passives). Used by the Stacks tab and the custom icon override in Bars tab.
--- ============================================================================
 
 local spellPickerFrame
 local spellPickerCache
@@ -1009,7 +1279,7 @@ local spellPickerCacheDirty = true
 local spellPickerCurrentOpts
 
 -- Common consumables / class buffs not always in the player's spellbook.
--- Used so name search in the picker can find things like Healthstone, Phial of Tepid Versatility, etc.
+-- Used so name search in the picker can find things like Healthstone or Phial of Tepid Versatility.
 local PICKER_COMMON_SPELLS = {
     6262,    -- Healthstone
     433889,  -- Algari Healing Potion
@@ -1353,7 +1623,21 @@ local function BuildSpellPickerFrame()
 
     searchBox:SetScript("OnTextChanged", Refresh)
 
-    f:SetScript("OnHide", function()
+    -- The anchor button is excluded so its own click does not immediately
+    -- reclose the frame it just opened.
+    f:SetScript("OnShow", function(self)
+        self:SetScript("OnUpdate", function(self2)
+            if IsMouseButtonDown("LeftButton") and not self2:IsMouseOver() then
+                local a = spellPickerCurrentOpts and spellPickerCurrentOpts.anchor
+                if not (a and a.IsMouseOver and a:IsMouseOver()) then
+                    self2:Hide()
+                end
+            end
+        end)
+    end)
+
+    f:SetScript("OnHide", function(self)
+        self:SetScript("OnUpdate", nil)
         spellPickerCurrentOpts = nil
         searchBox:SetText("")
     end)
@@ -1366,6 +1650,10 @@ local function BuildSpellPickerFrame()
 
     spellPickerFrame = f
     return f
+end
+
+function ns.CloseSpellPicker()
+    if spellPickerFrame then spellPickerFrame:Hide() end
 end
 
 local function OpenSpellPicker(opts)
@@ -1391,9 +1679,7 @@ end
 
 ns.OpenSpellPicker = OpenSpellPicker
 
--- ============================================================================
 -- TAB BUILDERS
--- ============================================================================
 
 local function BuildColoursTab(contentArea, tabFrames)
     local coloursTab = CreateFrame("Frame", nil, contentArea)
@@ -1456,11 +1742,14 @@ local function BuildColoursTab(contentArea, tabFrames)
     end)
     AddColourWidget(debuffColourSwatch)
 
-    local petBuffColourSwatch = CreateColorSwatch(colourContent, "Pet Buff", DeepCopy(CONFIG.petBuffColor), function(c)
-        CONFIG.petBuffColor = c
+    -- Potion aura bars use a fixed window, not a mirrored CDM bar.
+    AddColourDescription("Potion colours are temporarily controlled here, until Blizzard fixes their 12.1 potion bars.")
+
+    local potionColourSwatch = CreateColorSwatch(colourContent, "Potion Buff", DeepCopy(CONFIG.potionBuffColor), function(c)
+        CONFIG.potionBuffColor = c
         DebouncedApplyAndSave()
     end)
-    AddColourWidget(petBuffColourSwatch)
+    AddColourWidget(potionColourSwatch)
 
     -- Frame Colours
     AddColourHeader("Frame Colours")
@@ -1621,49 +1910,25 @@ local function BuildColoursTab(contentArea, tabFrames)
     local chargeAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.chargeTextAnchor, function(v)
         CONFIG.chargeTextAnchor = v
         CONFIG.chargeTextRelPoint = v
-        LoadEssentialCooldowns()
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
         ns.SaveCurrentProfile()
     end)
     AddColourWidget(chargeAnchorDropdown)
 
     local chargeOffXSlider = CreateSlider(colourContent, "Charge Offset X", -20, 20, 1, CONFIG.chargeTextOffsetX, function(v)
         CONFIG.chargeTextOffsetX = v
-        LoadEssentialCooldowns()
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
         ns.SaveCurrentProfile()
     end)
     AddColourWidget(chargeOffXSlider)
 
     local chargeOffYSlider = CreateSlider(colourContent, "Charge Offset Y", -20, 20, 1, CONFIG.chargeTextOffsetY, function(v)
         CONFIG.chargeTextOffsetY = v
-        LoadEssentialCooldowns()
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
         ns.SaveCurrentProfile()
     end)
     AddColourWidget(chargeOffYSlider)
 
-    AddColourHeader("Stack Text Anchor")
-    AddColourDescription("Where stack count text is positioned on each bar. Works the same way as charge text anchoring.")
-
-    local stackAnchorDropdown = CreateDropdown(colourContent, "Anchor Point", ANCHOR_POINTS, CONFIG.stackTextAnchor, function(v)
-        CONFIG.stackTextAnchor = v
-        CONFIG.stackTextRelPoint = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackAnchorDropdown)
-
-    local stackOffXSlider = CreateSlider(colourContent, "Stack Offset X", -20, 20, 1, CONFIG.stackTextOffsetX, function(v)
-        CONFIG.stackTextOffsetX = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackOffXSlider)
-
-    local stackOffYSlider = CreateSlider(colourContent, "Stack Offset Y", -20, 20, 1, CONFIG.stackTextOffsetY, function(v)
-        CONFIG.stackTextOffsetY = v
-        LoadEssentialCooldowns()
-        ns.SaveCurrentProfile()
-    end)
-    AddColourWidget(stackOffYSlider)
 
     -- Variant Name Text
     AddColourHeader("Variant Name Text")
@@ -1751,8 +2016,8 @@ local function BuildColoursTab(contentArea, tabFrames)
         if CONFIG.cooldownColor then cdColourSwatch:SetColor(DeepCopy(CONFIG.cooldownColor)) end
         if CONFIG.castColor then castColourSwatch:SetColor(DeepCopy(CONFIG.castColor)) end
         if CONFIG.buffColor then buffColourSwatch:SetColor(DeepCopy(CONFIG.buffColor)) end
+        if CONFIG.potionBuffColor then potionColourSwatch:SetColor(DeepCopy(CONFIG.potionBuffColor)) end
         if CONFIG.debuffColor then debuffColourSwatch:SetColor(DeepCopy(CONFIG.debuffColor)) end
-        if CONFIG.petBuffColor then petBuffColourSwatch:SetColor(DeepCopy(CONFIG.petBuffColor)) end
         if CONFIG.bgcolor then bgColourSwatch:SetColor(DeepCopy(CONFIG.bgcolor)) end
         if CONFIG.bordercolor then borderColourSwatch:SetColor(DeepCopy(CONFIG.bordercolor)) end
         if CONFIG.nowLineColor then nowLineColourSwatch:SetColor(DeepCopy(CONFIG.nowLineColor)) end
@@ -1777,9 +2042,6 @@ local function BuildColoursTab(contentArea, tabFrames)
         chargeAnchorDropdown:SetValue(CONFIG.chargeTextAnchor)
         chargeOffXSlider:SetValue(CONFIG.chargeTextOffsetX)
         chargeOffYSlider:SetValue(CONFIG.chargeTextOffsetY)
-        stackAnchorDropdown:SetValue(CONFIG.stackTextAnchor)
-        stackOffXSlider:SetValue(CONFIG.stackTextOffsetX)
-        stackOffYSlider:SetValue(CONFIG.stackTextOffsetY)
         variantTextSizeSlider:SetValue(CONFIG.variantTextSize)
         variantAnchorDropdown:SetValue(CONFIG.variantTextAnchor)
         variantOffXSlider:SetValue(CONFIG.variantTextOffsetX)
@@ -1797,11 +2059,10 @@ local function BuildColoursTab(contentArea, tabFrames)
     end)
 end
 
--- ============================================================================
 -- TAB F: STACKS
--- ============================================================================
 
-local POWER_TYPE_INFO = {
+-- Shared: the edge order list in Bars.lua names power pips from this.
+ns.POWER_TYPE_INFO = {
     [4]  = {name = "Combo Points",   max = 5, color = {1.0, 0.96, 0.41, 1}},
     [5]  = {name = "Runes",          max = 6, color = {0.77, 0.12, 0.23, 1}},
     [7]  = {name = "Soul Shards",    max = 5, color = {0.58, 0.51, 0.79, 1}},
@@ -1810,6 +2071,7 @@ local POWER_TYPE_INFO = {
     [16] = {name = "Arcane Charges", max = 4, color = {0.1, 0.5, 0.8, 1}},
     [19] = {name = "Essence",        max = 5, color = {0.0, 0.8, 0.4, 1}},
 }
+local POWER_TYPE_INFO = ns.POWER_TYPE_INFO
 
 local function BuildStacksTab(contentArea, tabFrames)
     local stacksTab = CreateFrame("Frame", nil, contentArea)
@@ -1841,6 +2103,32 @@ local function BuildStacksTab(contentArea, tabFrames)
         desc:SetText(text)
         yOff = yOff + desc:GetStringHeight() + 6
     end
+
+    -- The count on the bar, not the pips. Only its colour stays in Colours.
+    AddStacksHeader("Stack Count Text")
+    AddStacksDescription("Where the stack number sits on each bar. Nothing to do with the pip indicators below; this shows whether or not those are enabled. With icons hidden it is positioned across the bar itself.")
+
+    local stackAnchorDropdown = CreateDropdown(stacksContent, "Anchor Point", ANCHOR_POINTS, CONFIG.stackTextAnchor, function(v)
+        CONFIG.stackTextAnchor = v
+        CONFIG.stackTextRelPoint = v
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(stackAnchorDropdown)
+
+    local stackOffXSlider = CreateSlider(stacksContent, "Stack Offset X", -20, 20, 1, CONFIG.stackTextOffsetX, function(v)
+        CONFIG.stackTextOffsetX = v
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(stackOffXSlider)
+
+    local stackOffYSlider = CreateSlider(stacksContent, "Stack Offset Y", -20, 20, 1, CONFIG.stackTextOffsetY, function(v)
+        CONFIG.stackTextOffsetY = v
+        if ns.RefreshTextAnchors then ns.RefreshTextAnchors() end
+        ns.SaveCurrentProfile()
+    end)
+    AddStacksWidget(stackOffYSlider)
 
     -- Section 1: Enable Toggle
     AddStacksHeader("Stack Indicators")
@@ -1985,11 +2273,6 @@ local function BuildStacksTab(contentArea, tabFrames)
         local list = CONFIG.stackIndicatorList or {}
         local rowY = 0
         local defaultPos = (CONFIG.stackIndicatorSettings or {}).position or "TOP"
-        local topCount, bottomCount = 0, 0
-        for _, e in ipairs(list) do
-            local p = e.position or defaultPos
-            if p == "BOTTOM" then bottomCount = bottomCount + 1 else topCount = topCount + 1 end
-        end
 
         for idx, entry in ipairs(list) do
             local sis = CONFIG.stackIndicatorSettings or {}
@@ -2039,11 +2322,7 @@ local function BuildStacksTab(contentArea, tabFrames)
             nameText:SetJustifyH("LEFT")
             nameText:SetText(resolvedName)
 
-            local delBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
-            delBtn:SetSize(22, 22)
-            delBtn:SetPoint("TOPRIGHT", rf, "TOPRIGHT", -6, -10)
-            delBtn:SetText("X")
-            delBtn:SetScript("OnClick", function()
+            local delBtn = ns.CreateRemoveButton(rf, "Remove", function()
                 table.remove(CONFIG.stackIndicatorList, idx)
                 if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
                 ns.SaveCurrentProfile()
@@ -2051,12 +2330,7 @@ local function BuildStacksTab(contentArea, tabFrames)
                 if RefreshStacksGrid then RefreshStacksGrid() end
                 if RefreshPowerTypeGrid then RefreshPowerTypeGrid() end
             end)
-            delBtn:SetScript("OnEnter", function(self)
-                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                GameTooltip:SetText("Remove")
-                GameTooltip:Show()
-            end)
-            delBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            delBtn:SetPoint("TOPRIGHT", rf, "TOPRIGHT", -6, -10)
 
             local posBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
             posBtn:SetSize(56, 20)
@@ -2079,74 +2353,53 @@ local function BuildStacksTab(contentArea, tabFrames)
             end)
             posBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-            local myPos = resolvedPos
-            local groupCount = (myPos == "BOTTOM") and bottomCount or topCount
-            if groupCount > 1 then
-                local function FindNeighbor(dir)
-                    local l = CONFIG.stackIndicatorList
-                    local step = dir == "up" and -1 or 1
-                    local k = idx + step
-                    while k >= 1 and k <= #l do
-                        local p = l[k].position or defaultPos
-                        if p == myPos then return k end
-                        k = k + step
-                    end
-                    return nil
-                end
-
-                local nextDown = FindNeighbor("down")
-                local nextUp = FindNeighbor("up")
-
-                local downBtn = CreateFrame("Button", nil, rf)
-                downBtn:SetSize(18, 16)
-                downBtn:SetPoint("RIGHT", posBtn, "LEFT", -6, 0)
-                downBtn:SetNormalAtlas("UI-ScrollBar-ScrollDownButton-Up")
-                downBtn:SetPushedAtlas("UI-ScrollBar-ScrollDownButton-Down")
-                downBtn:SetHighlightAtlas("UI-ScrollBar-ScrollDownButton-Highlight")
-                downBtn:SetDisabledAtlas("UI-ScrollBar-ScrollDownButton-Disabled")
-                if not nextDown then downBtn:Disable() end
-                downBtn:SetScript("OnClick", function()
-                    local target = FindNeighbor("down")
-                    if target then
-                        local l = CONFIG.stackIndicatorList
-                        l[idx], l[target] = l[target], l[idx]
-                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
-                        ns.SaveCurrentProfile()
-                        RebuildSIListUI()
-                    end
-                end)
-                downBtn:SetScript("OnEnter", function(self)
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetText("Move Down")
-                    GameTooltip:Show()
-                end)
-                downBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-                local upBtn = CreateFrame("Button", nil, rf)
-                upBtn:SetSize(18, 16)
-                upBtn:SetPoint("RIGHT", downBtn, "LEFT", -2, 0)
-                upBtn:SetNormalAtlas("UI-ScrollBar-ScrollUpButton-Up")
-                upBtn:SetPushedAtlas("UI-ScrollBar-ScrollUpButton-Down")
-                upBtn:SetHighlightAtlas("UI-ScrollBar-ScrollUpButton-Highlight")
-                upBtn:SetDisabledAtlas("UI-ScrollBar-ScrollUpButton-Disabled")
-                if not nextUp then upBtn:Disable() end
-                upBtn:SetScript("OnClick", function()
-                    local target = FindNeighbor("up")
-                    if target then
-                        local l = CONFIG.stackIndicatorList
-                        l[idx], l[target] = l[target], l[idx]
-                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
-                        ns.SaveCurrentProfile()
-                        RebuildSIListUI()
-                    end
-                end)
-                upBtn:SetScript("OnEnter", function(self)
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetText("Move Up")
-                    GameTooltip:Show()
-                end)
-                upBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            -- Shared edge model, so a pip can step past the resource bar and
+            -- the strip. Toward/away reads the same on both edges; list order
+            -- does not, because the top edge lays out in reverse.
+            local me = { kind = "pip", listIndex = idx }
+            local function EdgeMove(delta)
+                if not (ns.EdgeOrder and ns.EdgeOrder.Move(resolvedPos, me, delta)) then return end
+                ns.SaveCurrentProfile()
+                RebuildSIListUI()
             end
+            local function EdgeCan(delta)
+                return ns.EdgeOrder and ns.EdgeOrder.CanMove(resolvedPos, me, delta)
+            end
+
+            local downBtn = CreateFrame("Button", nil, rf)
+            downBtn:SetSize(18, 16)
+            downBtn:SetPoint("RIGHT", posBtn, "LEFT", -6, 0)
+            downBtn:SetNormalAtlas("UI-ScrollBar-ScrollDownButton-Up")
+            downBtn:SetPushedAtlas("UI-ScrollBar-ScrollDownButton-Down")
+            downBtn:SetHighlightAtlas("UI-ScrollBar-ScrollDownButton-Highlight")
+            downBtn:SetDisabledAtlas("UI-ScrollBar-ScrollDownButton-Disabled")
+            if not EdgeCan(1) then downBtn:Disable() end
+            downBtn:SetScript("OnClick", function() EdgeMove(1) end)
+            downBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Move Away From The Bars")
+                GameTooltip:AddLine("Steps past whatever is next on this edge, including the resource bar and the icon strip.", 0.7, 0.7, 0.7, true)
+                GameTooltip:Show()
+            end)
+            downBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+            local upBtn = CreateFrame("Button", nil, rf)
+            upBtn:SetSize(18, 16)
+            upBtn:SetPoint("RIGHT", downBtn, "LEFT", -2, 0)
+            upBtn:SetNormalAtlas("UI-ScrollBar-ScrollUpButton-Up")
+            upBtn:SetPushedAtlas("UI-ScrollBar-ScrollUpButton-Down")
+            upBtn:SetHighlightAtlas("UI-ScrollBar-ScrollUpButton-Highlight")
+            upBtn:SetDisabledAtlas("UI-ScrollBar-ScrollUpButton-Disabled")
+            if not EdgeCan(-1) then upBtn:Disable() end
+            upBtn:SetScript("OnClick", function() EdgeMove(-1) end)
+            upBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Move Toward The Bars")
+                GameTooltip:AddLine("Steps past whatever is next on this edge, including the resource bar and the icon strip.", 0.7, 0.7, 0.7, true)
+                GameTooltip:Show()
+            end)
+            upBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
 
             -- Row 2: Max Stacks + Overflow + OV Colour
             local maxLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -2266,24 +2519,14 @@ local function BuildStacksTab(contentArea, tabFrames)
                 zonesLabel:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", 12, 14)
                 zonesLabel:SetText("Zones:")
 
-                local clearZonesBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
-                clearZonesBtn:SetSize(18, 18)
-                clearZonesBtn:SetPoint("LEFT", zonesLabel, "RIGHT", 4, 0)
-                clearZonesBtn:SetText("X")
-                clearZonesBtn:SetScript("OnClick", function()
+                local clearZonesBtn = ns.CreateRemoveButton(rf, "Remove Zones", function()
                     entry.color = DeepCopy(entry.colorZones[1] and entry.colorZones[1].color or entry.color or {0.8, 0.2, 0.1, 1})
                     entry.colorZones = nil
                     if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
                     ns.SaveCurrentProfile()
                     RebuildSIListUI()
-                end)
-                clearZonesBtn:SetScript("OnEnter", function(self)
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetText("Remove Zones")
-                    GameTooltip:AddLine("Revert to a single pip colour.", 0.7, 0.7, 0.7, true)
-                    GameTooltip:Show()
-                end)
-                clearZonesBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                end, 18, "Revert to a single pip colour.")
+                clearZonesBtn:SetPoint("LEFT", zonesLabel, "RIGHT", 4, 0)
 
                 local zones = entry.colorZones
                 local zoneXOff = 76
@@ -2354,22 +2597,13 @@ local function BuildStacksTab(contentArea, tabFrames)
                     zoneXOff = zoneXOff + 32
 
                     if zi > 1 then
-                        local zDel = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
-                        zDel:SetSize(18, 18)
-                        zDel:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 11)
-                        zDel:SetText("X")
-                        zDel:SetScript("OnClick", function()
+                        local zDel = ns.CreateRemoveButton(rf, "Remove Zone", function()
                             table.remove(entry.colorZones, zoneIdx)
                             if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
                             ns.SaveCurrentProfile()
                             RebuildSIListUI()
-                        end)
-                        zDel:SetScript("OnEnter", function(self)
-                            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                            GameTooltip:SetText("Remove Zone")
-                            GameTooltip:Show()
-                        end)
-                        zDel:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                        end, 18)
+                        zDel:SetPoint("BOTTOMLEFT", rf, "BOTTOMLEFT", zoneXOff, 11)
                         zoneXOff = zoneXOff + 22
                     end
 
@@ -2888,6 +3122,9 @@ local function BuildStacksTab(contentArea, tabFrames)
         siEmptyColourSwatch:SetColor(DeepCopy(sis.emptyColor or {0.12, 0.12, 0.12, 0.6}))
         siBorderColourSwatch:SetColor(DeepCopy(sis.borderColor or CONFIG.bordercolor or {0, 0, 0, 1}))
         siGlowColourSwatch:SetColor(DeepCopy(sis.glowColor or {1, 1, 1, 0.6}))
+        stackAnchorDropdown:SetValue(CONFIG.stackTextAnchor)
+        stackOffXSlider:SetValue(CONFIG.stackTextOffsetX)
+        stackOffYSlider:SetValue(CONFIG.stackTextOffsetY)
         RebuildSIListUI()
         RefreshStacksGrid()
         RefreshPowerTypeGrid()
@@ -2897,9 +3134,7 @@ local function BuildStacksTab(contentArea, tabFrames)
     ns.RefreshStacksTab = RefreshStacksTab
 end
 
--- ============================================================================
 -- BUILD THE SETTINGS PANEL (deferred)
--- ============================================================================
 
 local function BuildSettings()
     if settingsBuilt then return end
@@ -2925,7 +3160,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.6")
+    versionText:SetText("v1.3.7")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -2998,9 +3233,7 @@ local function BuildSettings()
     contentArea:SetPoint("TOPLEFT", tabButtons[1], "BOTTOMLEFT", 0, 2)
     contentArea:SetPoint("BOTTOMRIGHT", settingsFrame, "BOTTOMRIGHT", -16, 16)
 
-    -- ========================================================================
     -- TAB A: BARS
-    -- ========================================================================
     local barsTab = CreateFrame("Frame", nil, contentArea)
     barsTab:SetAllPoints()
     barsTab:Hide()
@@ -3021,8 +3254,6 @@ local function BuildSettings()
     local buffPoolCacheCount = 0
     local castPoolCache = {}
     local castPoolCacheCount = 0
-    local extrasRowCache = {}
-    local extrasRowCacheCount = 0
     local customRowCache = {}
     local customRowCacheCount = 0
     local extrasHeaderFrame
@@ -3128,27 +3359,11 @@ local function BuildSettings()
     cdmBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Cooldown Manager")
-        GameTooltip:AddLine("Opens WoW's Cooldown Manager settings panel.", 0.7, 0.7, 0.7, true)
+        GameTooltip:AddLine("Opens it in front of this window, and makes it draggable so you can put the two side by side.", 0.7, 0.7, 0.7, true)
         GameTooltip:Show()
     end)
     cdmBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    cdmBtn:SetScript("OnClick", function()
-        if InCombatLockdown() then
-            print("|cff00ff00[Infall]|r Cannot open the Cooldown Manager in combat. Try again out of combat.")
-            return
-        end
-        if CooldownViewerSettings then
-            -- Close settings panel so ShowUIPanel can open CDM
-            if SettingsPanel then
-                pcall(HideUIPanel, SettingsPanel)
-            end
-            C_Timer.After(0.1, function()
-                pcall(ShowUIPanel, CooldownViewerSettings)
-            end)
-        else
-            print("|cff00ff00[Infall]|r CooldownViewerSettings not available.")
-        end
-    end)
+    cdmBtn:SetScript("OnClick", ns.OpenCooldownManager)
 
     -- Top panel: Cooldown Rows with visibility checkboxes and buff pairing
     local topPanel = CreateFrame("Frame", nil, barsTab, "BackdropTemplate")
@@ -3378,7 +3593,7 @@ local function BuildSettings()
             slot.icon:Show()
             slot.pairedCooldownID = bID
             slot.pairedColor = m.color
-            local c = m.color or (m.unit == "target" and CONFIG.debuffColor) or (m.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+            local c = m.color or (m.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
             colorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
             colorBtn:Show()
             colorBtn.procDot:SetShown(m.requireGlow == true)
@@ -3412,7 +3627,7 @@ local function BuildSettings()
         if stackMapping and stackMapping.buffCooldownID then
             local sInfoOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, stackMapping.buffCooldownID)
             local sSID = sInfoOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
-            local sIcon = sSID and C_Spell.GetSpellTexture(sSID) or 134400
+            local sIcon = CooldownIcon(stackMapping.buffCooldownID, sInfoOk and sInfo or nil)
             stackSlot.icon:SetTexture(sIcon)
             stackSlot.icon:Show()
             stackSlot.pairedCooldownID = stackMapping.buffCooldownID
@@ -3482,11 +3697,11 @@ local function BuildSettings()
                 local buffCdID = selectedBuff
                 local bOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                 local bSID = bOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
-                local bIcon = bSID and C_Spell.GetSpellTexture(bSID) or 134400
+                local bIcon = CooldownIcon(buffCdID, bOk and bInfo or nil)
                 slot.icon:SetTexture(bIcon); slot.icon:Show()
                 self.pairedCooldownID = buffCdID
                 local isDebuff = bSID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSID)
-                local defaultColor = isDebuff and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
+                local defaultColor, pairUnit = PairingDefaultColor(buffCdID, isDebuff)
                 if slotIndex >= 2 then defaultColor[4] = 0.3 end
                 self.pairedColor = defaultColor
                 colorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
@@ -3494,7 +3709,7 @@ local function BuildSettings()
                 CONFIG.buffMappings = CONFIG.buffMappings or {}
                 CONFIG.buffMappings[cooldownID] = CONFIG.buffMappings[cooldownID] or {}
                 local mapping = { buffCooldownIDs = {buffCdID}, color = defaultColor }
-                if isDebuff then mapping.unit = "target" end
+                if pairUnit then mapping.unit = pairUnit end
                 CONFIG.buffMappings[cooldownID][slotIndex] = mapping
                 ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
                 statusText:SetText("")
@@ -3529,7 +3744,7 @@ local function BuildSettings()
                     return
                 end
                 local mapData = m and m[slotIndex]
-                local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                 local currentColor = (mapData and mapData.color) or slot.pairedColor or DeepCopy(defaultColor)
                 if slotIndex >= 2 then currentColor[4] = currentColor[4] or 0.3 end
                 OpenInlineColorPicker(currentColor, function(c)
@@ -3687,7 +3902,7 @@ local function BuildSettings()
             local buffCdID = selectedBuff
             local sOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
             local sSID = sOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
-            local sIcon = sSID and C_Spell.GetSpellTexture(sSID) or 134400
+            local sIcon = CooldownIcon(buffCdID, sOk and sInfo or nil)
             stackSlot.icon:SetTexture(sIcon); stackSlot.icon:Show()
             self.pairedCooldownID = buffCdID
             local defaultColor = DeepCopy(CONFIG.stackTextColor)
@@ -3720,6 +3935,11 @@ local function BuildSettings()
     end
 
     -- Refresh Cooldown Rows
+    -- Reads the upvalue at call time, so placement here is safe.
+    function ns.RefreshCooldownRows()
+        if RefreshCooldownRows then RefreshCooldownRows() end
+    end
+
     RefreshCooldownRows = function()
         -- Frame recycling
         for i = 1, cooldownRowCacheCount do
@@ -3730,14 +3950,11 @@ local function BuildSettings()
         local cooldownIDs = {}
         -- Use data provider if available, fall back to category set
         local foundSource = false
-        if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
-            local dataProvider = CooldownViewerSettings:GetDataProvider()
-            if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
-                local displayed = dataProvider:GetOrderedCooldownIDsForCategory(0)
-                if displayed and #displayed > 0 then
-                    cooldownIDs = displayed
-                    foundSource = true
-                end
+        do
+            local displayed = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
+            if displayed and #displayed > 0 then
+                cooldownIDs = displayed
+                foundSource = true
             end
         end
         if not foundSource then
@@ -4092,13 +4309,13 @@ local function BuildSettings()
                         local buffCdID = mappings[1].buffCooldownIDs[1]
                         local bInfoOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                         local bSpellID = bInfoOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
-                        local bIcon = bSpellID and C_Spell.GetSpellTexture(bSpellID) or 134400
+                        local bIcon = CooldownIcon(buffCdID, bInfoOk and bInfo or nil)
                         buff1Slot.icon:SetTexture(bIcon)
                         buff1Slot.icon:Show()
                         buff1Slot.pairedCooldownID = buffCdID
                         buff1Slot.pairedColor = mappings[1].color
 
-                        local bc = mappings[1].color or (mappings[1].unit == "target" and CONFIG.debuffColor) or (mappings[1].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        local bc = mappings[1].color or (mappings[1].unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                         buff1ColorBtn.tex:SetColorTexture(bc[1], bc[2], bc[3], bc[4] or 1)
                         buff1ColorBtn:Show()
                         buff1ColorBtn.procDot:SetShown(mappings[1].requireGlow == true)
@@ -4108,13 +4325,13 @@ local function BuildSettings()
                         local buff2CdID = mappings[2].buffCooldownIDs[1]
                         local oInfoOk, oInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buff2CdID)
                         local oSpellID = oInfoOk and oInfo and (oInfo.overrideTooltipSpellID or oInfo.overrideSpellID or oInfo.spellID)
-                        local oIcon = oSpellID and C_Spell.GetSpellTexture(oSpellID) or 134400
+                        local oIcon = CooldownIcon(buff2CdID, oInfoOk and oInfo or nil)
                         buff2Slot.icon:SetTexture(oIcon)
                         buff2Slot.icon:Show()
                         buff2Slot.pairedCooldownID = buff2CdID
                         buff2Slot.pairedColor = mappings[2].color
 
-                        local oc = mappings[2].color or (mappings[2].unit == "target" and CONFIG.debuffColor) or (mappings[2].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        local oc = mappings[2].color or (mappings[2].unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                         buff2ColorBtn.tex:SetColorTexture(oc[1], oc[2], oc[3], oc[4] or 1)
                         buff2ColorBtn:Show()
                         buff2ColorBtn.procDot:SetShown(mappings[2].requireGlow == true)
@@ -4124,13 +4341,13 @@ local function BuildSettings()
                         local buff3CdID = mappings[3].buffCooldownIDs[1]
                         local tInfoOk, tInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buff3CdID)
                         local tSpellID = tInfoOk and tInfo and (tInfo.overrideTooltipSpellID or tInfo.overrideSpellID or tInfo.spellID)
-                        local tIcon = tSpellID and C_Spell.GetSpellTexture(tSpellID) or 134400
+                        local tIcon = CooldownIcon(buff3CdID, tInfoOk and tInfo or nil)
                         buff3Slot.icon:SetTexture(tIcon)
                         buff3Slot.icon:Show()
                         buff3Slot.pairedCooldownID = buff3CdID
                         buff3Slot.pairedColor = mappings[3].color
 
-                        local tc = mappings[3].color or (mappings[3].unit == "target" and CONFIG.debuffColor) or (mappings[3].unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                        local tc = mappings[3].color or (mappings[3].unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                         buff3ColorBtn.tex:SetColorTexture(tc[1], tc[2], tc[3], tc[4] or 1)
                         buff3ColorBtn:Show()
                         buff3ColorBtn.procDot:SetShown(mappings[3].requireGlow == true)
@@ -4191,13 +4408,13 @@ local function BuildSettings()
                             local buffCdID = selectedBuff
                             local bInfoOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                             local bSpellID = bInfoOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
-                            local bIcon = bSpellID and C_Spell.GetSpellTexture(bSpellID) or 134400
+                            local bIcon = CooldownIcon(buffCdID, bInfoOk and bInfo or nil)
                             slot.icon:SetTexture(bIcon)
                             slot.icon:Show()
                             self.pairedCooldownID = buffCdID
 
                             local isDebuff = bSpellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSpellID)
-                            local defaultColor = isDebuff and DeepCopy(CONFIG.debuffColor) or DeepCopy(CONFIG.buffColor)
+                            local defaultColor, pairUnit = PairingDefaultColor(buffCdID, isDebuff)
                             if slotIndex >= 2 then defaultColor[4] = 0.3 end
                             self.pairedColor = defaultColor
 
@@ -4210,7 +4427,7 @@ local function BuildSettings()
                                 buffCooldownIDs = {buffCdID},
                                 color = defaultColor,
                             }
-                            if isDebuff then mapping.unit = "target" end
+                            if pairUnit then mapping.unit = pairUnit end
                             CONFIG.buffMappings[cooldownID][slotIndex] = mapping
                             ns.SaveCurrentProfile()
                             LoadEssentialCooldowns()
@@ -4249,7 +4466,7 @@ local function BuildSettings()
                         return
                     end
                     local mapData = m and m[1]
-                    local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local defaultColor = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                     local currentColor = (mapData and mapData.color) or buff1Slot.pairedColor or DeepCopy(defaultColor)
                     OpenInlineColorPicker(currentColor, function(c)
                         buff1ColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
@@ -4284,7 +4501,7 @@ local function BuildSettings()
                         return
                     end
                     local mapData = m and m[2]
-                    local defaultColor2 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local defaultColor2 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                     local currentColor = (mapData and mapData.color) or buff2Slot.pairedColor or DeepCopy(defaultColor2)
                     currentColor[4] = currentColor[4] or 0.3
                     OpenInlineColorPicker(currentColor, function(c)
@@ -4320,7 +4537,7 @@ local function BuildSettings()
                         return
                     end
                     local mapData = m and m[3]
-                    local defaultColor3 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or (mapData and mapData.unit == "pet" and CONFIG.petBuffColor) or CONFIG.buffColor
+                    local defaultColor3 = (mapData and mapData.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                     local currentColor = (mapData and mapData.color) or buff3Slot.pairedColor or DeepCopy(defaultColor3)
                     currentColor[4] = currentColor[4] or 0.3
                     OpenInlineColorPicker(currentColor, function(c)
@@ -4431,7 +4648,7 @@ local function BuildSettings()
                 if stackMapping and stackMapping.buffCooldownID then
                     local sInfoOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, stackMapping.buffCooldownID)
                     local sSpellID = sInfoOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
-                    local sIcon = sSpellID and C_Spell.GetSpellTexture(sSpellID) or 134400
+                    local sIcon = CooldownIcon(stackMapping.buffCooldownID, sInfoOk and sInfo or nil)
                     stackSlot.icon:SetTexture(sIcon)
                     stackSlot.icon:Show()
                     stackSlot.pairedCooldownID = stackMapping.buffCooldownID
@@ -4538,7 +4755,7 @@ local function BuildSettings()
                     local buffCdID = selectedBuff
                     local sInfoOk, sInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                     local sSpellID = sInfoOk and sInfo and (sInfo.overrideTooltipSpellID or sInfo.overrideSpellID or sInfo.spellID)
-                    local sIcon = sSpellID and C_Spell.GetSpellTexture(sSpellID) or 134400
+                    local sIcon = CooldownIcon(buffCdID, sInfoOk and sInfo or nil)
                     stackSlot.icon:SetTexture(sIcon)
                     stackSlot.icon:Show()
                     self.pairedCooldownID = buffCdID
@@ -4628,16 +4845,13 @@ local function BuildSettings()
             if cooldownRowCache[i] then cooldownRowCache[i]:Hide() end
         end
 
-        -- Extras section (Racials, Potions, Trinkets, and user added Custom Rows)
-        for i = 1, extrasRowCacheCount do
-            if extrasRowCache[i] then extrasRowCache[i]:Hide() end
-        end
+        -- Extras section (user added Custom Rows)
         for i = 1, customRowCacheCount do
             if customRowCache[i] then customRowCache[i]:Hide() end
         end
         if extrasHeaderFrame then extrasHeaderFrame:Hide() end
 
-        if CONFIG.extras and #CONFIG.extras > 0 then
+        if CONFIG.extras then
             yOffset = yOffset + 6
 
             if not extrasHeaderFrame then
@@ -4648,11 +4862,7 @@ local function BuildSettings()
                 extrasHeaderFrame.text:SetText("Extras")
                 extrasHeaderFrame.note = extrasHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
                 extrasHeaderFrame.note:SetPoint("TOPLEFT", extrasHeaderFrame.text, "BOTTOMLEFT", 0, -2)
-                if ns.AuraCompat and ns.AuraCompat.IS_121 then
                     extrasHeaderFrame.note:SetText("Racials now come from the Cooldown Manager. Add them there for exact timing.")
-                else
-                    extrasHeaderFrame.note:SetText("These can only be shown either above or below the cooldown manager bars.")
-                end
                 extrasHeaderFrame.note:SetTextColor(0.6, 0.6, 0.6)
                 -- Position buttons
                 extrasHeaderFrame.posLabel = extrasHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -4685,12 +4895,10 @@ local function BuildSettings()
                         anchor = self,
                         onSelect = function(pickedID, pickedName, pickedIcon)
                             CONFIG.extras = CONFIG.extras or {}
-                            local n = 1
-                            local keyTaken = {}
-                            for _, e in ipairs(CONFIG.extras) do keyTaken[e.key] = true end
-                            while keyTaken["custom_" .. n] do n = n + 1 end
                             table.insert(CONFIG.extras, {
-                                key = "custom_" .. n,
+                                -- Unique across the strip's custom icons too:
+                                -- both lists index the same shared tables.
+                                key = ns.NextCustomKey(),
                                 type = "custom",
                                 iconSpellID = pickedID,
                                 iconTexture = pickedIcon,
@@ -4727,15 +4935,8 @@ local function BuildSettings()
             extrasHeaderFrame:SetPoint("TOPLEFT", 0, -yOffset)
             yOffset = yOffset + 88
 
-            -- 12.1 hides racials only; they come from the CDM there.
-            -- REMOVE WITH 12.0.7 SUPPORT.
-            local extrasNativeIn121 = ns.AuraCompat and ns.AuraCompat.IS_121
             for extIdx, extra in ipairs(CONFIG.extras) do
-                if extra._unavailable then
-                    -- unavailable, skip
-                elseif extrasNativeIn121 and extra.type == "racial" then
-                    -- superseded by the Cooldown Manager, skip
-                elseif extra.type == "custom" then
+                if extra.type == "custom" then
                     -- Custom row: wider layout with slot widgets (buff 1/2/3, cast 1/2, stack)
                     local cRow = customRowCache[extIdx]
                     if not cRow then
@@ -4746,7 +4947,10 @@ local function BuildSettings()
                         cRow.cb:SetSize(22, 22)
                         cRow.abilIcon = cRow:CreateTexture(nil, "ARTWORK")
                         cRow.abilIcon:SetSize(24, 24)
-                        cRow.abilIcon:SetPoint("LEFT", cRow.cb, "RIGHT", 4, 0)
+                        -- 22, not 4: a cooldown row is cb +2 swatch(16) +4 icon, and a custom
+                        -- row has no cooldown swatch. Matching the total keeps every slot column
+                        -- below aligned with the cooldown rows above.
+                        cRow.abilIcon:SetPoint("LEFT", cRow.cb, "RIGHT", 22, 0)
                         cRow.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
                         cRow.iconBtn = CreateFrame("Button", nil, cRow)
                         cRow.iconBtn:SetAllPoints(cRow.abilIcon)
@@ -4889,7 +5093,6 @@ local function BuildSettings()
                             if CONFIG.stackMappings then CONFIG.stackMappings[key] = nil end
                             if CONFIG.cooldownColors then CONFIG.cooldownColors[key] = nil end
                             if CONFIG.customIcons then CONFIG.customIcons[key] = nil end
-                            if ns._activeExtrasTimers then ns._activeExtrasTimers[key] = nil end
                         end
                         ns.SaveCurrentProfile()
                         LoadEssentialCooldowns()
@@ -4897,175 +5100,7 @@ local function BuildSettings()
                     end)
 
                     yOffset = yOffset + 30
-                elseif not extra._unavailable and extra.type ~= "custom" then
-                local eRow = extrasRowCache[extIdx]
-                if not eRow then
-                    eRow = CreateFrame("Frame", nil, topContent)
-                    eRow:SetSize(topContent:GetWidth() or 700, 28)
-                    eRow.cb = CreateFrame("CheckButton", nil, eRow, "UICheckButtonTemplate")
-                    eRow.cb:SetPoint("LEFT", 2, 0)
-                    eRow.cb:SetSize(22, 22)
-
-                    eRow.cdColorBtn = CreateFrame("Button", nil, eRow)
-                    eRow.cdColorBtn:SetSize(16, 16)
-                    eRow.cdColorBtn:SetPoint("LEFT", eRow.cb, "RIGHT", 2, 0)
-                    local cdBg = eRow.cdColorBtn:CreateTexture(nil, "BACKGROUND")
-                    cdBg:SetAllPoints()
-                    cdBg:SetColorTexture(0, 0, 0, 1)
-                    eRow.cdColorBtn.tex = eRow.cdColorBtn:CreateTexture(nil, "OVERLAY")
-                    eRow.cdColorBtn.tex:SetPoint("TOPLEFT", 1, -1)
-                    eRow.cdColorBtn.tex:SetPoint("BOTTOMRIGHT", -1, 1)
-
-                    eRow.abilIcon = eRow:CreateTexture(nil, "ARTWORK")
-                    eRow.abilIcon:SetSize(24, 24)
-                    eRow.abilIcon:SetPoint("LEFT", eRow.cdColorBtn, "RIGHT", 4, 0)
-                    eRow.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-
-                    eRow.buffColorBtn = CreateFrame("Button", nil, eRow)
-                    eRow.buffColorBtn:SetSize(16, 16)
-                    eRow.buffColorBtn:SetPoint("LEFT", eRow.abilIcon, "RIGHT", 4, 0)
-                    local buffBg = eRow.buffColorBtn:CreateTexture(nil, "BACKGROUND")
-                    buffBg:SetAllPoints()
-                    buffBg:SetColorTexture(0, 0, 0, 1)
-                    eRow.buffColorBtn.tex = eRow.buffColorBtn:CreateTexture(nil, "OVERLAY")
-                    eRow.buffColorBtn.tex:SetPoint("TOPLEFT", 1, -1)
-                    eRow.buffColorBtn.tex:SetPoint("BOTTOMRIGHT", -1, 1)
-
-                    eRow.nameText = eRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-                    eRow.nameText:SetPoint("LEFT", eRow.buffColorBtn, "RIGHT", 4, 0)
-                    eRow.nameText:SetWidth(180)
-                    eRow.nameText:SetJustifyH("LEFT")
-                    eRow.nameText:SetWordWrap(false)
-
-                    eRow.upBtn = CreateFrame("Button", nil, eRow)
-                    eRow.upBtn:SetSize(16, 16)
-                    eRow.upBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollUp-Up")
-                    eRow.upBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollUp-Highlight")
-                    eRow.upBtn:SetPoint("LEFT", eRow.nameText, "RIGHT", 20, 0)
-
-                    eRow.downBtn = CreateFrame("Button", nil, eRow)
-                    eRow.downBtn:SetSize(16, 16)
-                    eRow.downBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Up")
-                    eRow.downBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Highlight")
-                    eRow.downBtn:SetPoint("LEFT", eRow.upBtn, "RIGHT", 2, 0)
-
-                    extrasRowCache[extIdx] = eRow
-                    extrasRowCacheCount = math.max(extrasRowCacheCount, extIdx)
                 end
-
-                eRow:Show()
-                eRow:ClearAllPoints()
-                eRow:SetPoint("TOPLEFT", 0, -yOffset)
-
-                local spellIcon = C_Spell.GetSpellTexture(extra.spellID) or 134400
-                local spellName = C_Spell.GetSpellName(extra.spellID) or extra.key
-                local typeLabel = extra.type == "racial" and " (Racial)" or extra.type == "trinket" and " (Trinket)" or " (Potion)"
-
-                eRow.abilIcon:SetTexture(spellIcon)
-                eRow.abilIcon:SetDesaturated(not extra.enabled)
-                eRow.nameText:SetText(spellName .. typeLabel)
-                eRow.nameText:SetTextColor(
-                    extra.enabled and 1 or 0.5,
-                    extra.enabled and 0.82 or 0.5,
-                    extra.enabled and 0 or 0.5)
-                eRow.cb:SetChecked(extra.enabled)
-
-                local capturedIdx = extIdx
-                eRow.cb:SetScript("OnClick", function(self)
-                    CONFIG.extras[capturedIdx].enabled = self:GetChecked() and true or false
-                    eRow.abilIcon:SetDesaturated(not CONFIG.extras[capturedIdx].enabled)
-                    eRow.nameText:SetTextColor(
-                        CONFIG.extras[capturedIdx].enabled and 1 or 0.5,
-                        CONFIG.extras[capturedIdx].enabled and 0.82 or 0.5,
-                        CONFIG.extras[capturedIdx].enabled and 0 or 0.5)
-                    ns.SaveCurrentProfile()
-                    LoadEssentialCooldowns()
-                end)
-
-                -- CD colour button
-                local cdColor = extra.cdColor or DeepCopy(CONFIG.cooldownColor)
-                eRow.cdColorBtn.tex:SetColorTexture(cdColor[1], cdColor[2], cdColor[3], cdColor[4] or 1)
-                eRow.cdColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-                eRow.cdColorBtn:SetScript("OnClick", function(self, button)
-                    if button == "RightButton" then
-                        CONFIG.extras[capturedIdx].cdColor = nil
-                        self.tex:SetColorTexture(unpack(CONFIG.cooldownColor))
-                        ns.SaveCurrentProfile()
-                        ApplyLayoutToAllBars()
-                        return
-                    end
-                    local cur = CONFIG.extras[capturedIdx].cdColor or DeepCopy(CONFIG.cooldownColor)
-                    OpenInlineColorPicker(cur, function(c)
-                        self.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                        CONFIG.extras[capturedIdx].cdColor = c
-                        DebouncedApplyAndSave()
-                    end)
-                end)
-                eRow.cdColorBtn:SetScript("OnEnter", function(self)
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetText("Cooldown Colour")
-                    if extra.cdColor then
-                        GameTooltip:AddLine("Right click to reset to default.", 0.5, 0.8, 0.5, true)
-                    else
-                        GameTooltip:AddLine("Click to set a custom colour for this cooldown bar.", 0.7, 0.7, 0.7, true)
-                    end
-                    GameTooltip:Show()
-                end)
-                eRow.cdColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-                -- Buff colour button
-                local buffColor = extra.buffColor or DeepCopy(CONFIG.buffColor)
-                eRow.buffColorBtn.tex:SetColorTexture(buffColor[1], buffColor[2], buffColor[3], buffColor[4] or 1)
-                eRow.buffColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-                eRow.buffColorBtn:SetScript("OnClick", function(self, button)
-                    if button == "RightButton" then
-                        CONFIG.extras[capturedIdx].buffColor = nil
-                        self.tex:SetColorTexture(unpack(CONFIG.buffColor))
-                        ns.SaveCurrentProfile()
-                        ApplyLayoutToAllBars()
-                        return
-                    end
-                    local cur = CONFIG.extras[capturedIdx].buffColor or DeepCopy(CONFIG.buffColor)
-                    OpenInlineColorPicker(cur, function(c)
-                        self.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
-                        CONFIG.extras[capturedIdx].buffColor = c
-                        DebouncedApplyAndSave()
-                    end)
-                end)
-                eRow.buffColorBtn:SetScript("OnEnter", function(self)
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetText("Buff Colour")
-                    if extra.buffColor then
-                        GameTooltip:AddLine("Right click to reset to default.", 0.5, 0.8, 0.5, true)
-                    else
-                        GameTooltip:AddLine("Click to set a custom colour for this buff bar.", 0.7, 0.7, 0.7, true)
-                    end
-                    GameTooltip:Show()
-                end)
-                eRow.buffColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-                eRow.upBtn:SetEnabled(extIdx > 1)
-                eRow.downBtn:SetEnabled(extIdx < #CONFIG.extras)
-
-                eRow.upBtn:SetScript("OnClick", function()
-                    if capturedIdx <= 1 then return end
-                    local t = CONFIG.extras
-                    t[capturedIdx], t[capturedIdx - 1] = t[capturedIdx - 1], t[capturedIdx]
-                    ns.SaveCurrentProfile()
-                    LoadEssentialCooldowns()
-                    RefreshCooldownRows()
-                end)
-                eRow.downBtn:SetScript("OnClick", function()
-                    if capturedIdx >= #CONFIG.extras then return end
-                    local t = CONFIG.extras
-                    t[capturedIdx], t[capturedIdx + 1] = t[capturedIdx + 1], t[capturedIdx]
-                    ns.SaveCurrentProfile()
-                    LoadEssentialCooldowns()
-                    RefreshCooldownRows()
-                end)
-
-                yOffset = yOffset + 30
-                end -- not _unavailable
             end
         end
 
@@ -5100,31 +5135,34 @@ local function BuildSettings()
         end
 
         -- Labels only annotated on 12.1; both are exact on earlier builds.
-        local is121 = ns.AuraCompat and ns.AuraCompat.IS_121
         local sections = {
-            { cat = 2, label = is121 and "Tracked Buffs (estimated timing)" or "Tracked Buffs" },
-            { cat = 3, label = is121 and "Tracked Bars (exact timing)" or "Tracked Bars" },
+            { cat = 2, label = "Tracked Buffs (estimated timing)" },
+            { cat = 3, label = "Tracked Bars (exact timing)" },
         }
         local catLabel = {}
         local seen = {}
         local totalCount = 0
 
-        -- Use CDM DataProvider if available (matches CDM settings display)
-        local dataProvider
-        if CooldownViewerSettings and CooldownViewerSettings.GetDataProvider then
-            dataProvider = CooldownViewerSettings:GetDataProvider()
+        -- The DataProvider reports the player's real layout, including entries moved
+        -- between sections. GetCooldownViewerCategorySet reports the static default
+        -- category and ignores those moves, so it is a last resort. An empty result
+        -- for one section is valid and means everything was moved out of it. Only
+        -- both sections empty is ambiguous enough to fall back.
+        local dpIds, dpAnyContent = {}, false
+        if ns.OrderedCooldownIDs then
+            for _, sec in ipairs(sections) do
+                local dpResult = ns.OrderedCooldownIDs(sec.cat)
+                if type(dpResult) == "table" then
+                    dpIds[sec.cat] = dpResult
+                    if #dpResult > 0 then dpAnyContent = true end
+                end
+            end
         end
 
         for _, sec in ipairs(sections) do
             sec.ids = {}
             catLabel[sec.cat] = sec.label
-            local catIds
-            if dataProvider and dataProvider.GetOrderedCooldownIDsForCategory then
-                local dpOk, dpResult = pcall(dataProvider.GetOrderedCooldownIDsForCategory, dataProvider, sec.cat)
-                if dpOk and dpResult and #dpResult > 0 then
-                    catIds = dpResult
-                end
-            end
+            local catIds = dpAnyContent and dpIds[sec.cat] or nil
             if not catIds then
                 local catOk, catResult = pcall(function()
                     return C_CooldownViewer.GetCooldownViewerCategorySet(sec.cat, false)
@@ -5210,7 +5248,7 @@ local function BuildSettings()
                             GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
                         end
                         -- Estimated section only: show what has been learned.
-                        if is121 and secCat == 2 and ns.AuraCompat then
+                        if secCat == 2 and ns.AuraCompat then
                             local state, dur = ns.AuraCompat.GetLearnState(spellID)
                             if state == "permanent" then
                                 GameTooltip:AddLine("Permanent buff, drawn as a full bar.", 0.5, 0.9, 0.5, true)
@@ -5420,15 +5458,16 @@ local function BuildSettings()
         SelectPoolTab(1)
     end)
 
-    -- ========================================================================
     -- TAB B: DISPLAY
-    -- ========================================================================
     local displayTab = CreateFrame("Frame", nil, contentArea)
     displayTab:SetAllPoints()
     displayTab:Hide()
     tabFrames[2] = displayTab
 
     local dispScroll, dispContent = CreateScrollableContent(displayTab)
+    -- A slider's SetValue fires its own OnValueChanged, so every handler below
+    -- must honour this or viewing the tab writes every value back out. Extras
+    -- Bar Height is the damaging one: nil there means follow bar height.
     local dispRefreshing = false
 
     local dispY = 0
@@ -5489,6 +5528,7 @@ local function BuildSettings()
     end)
 
     local pastSlider = CreateSlider(dispContent, "Past (seconds)", 0, 10, 0.5, CONFIG.past, function(v)
+        if dispRefreshing then return end
         CONFIG.past = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5500,6 +5540,7 @@ local function BuildSettings()
     AddDispDescription("Controls the size of each bar row. Width and height set the dimensions in pixels. Spacing is the gap between rows. Scale multiplies the entire frame.")
 
     local widthSlider = CreateSlider(dispContent, "Bar Width", 100, 600, 1, CONFIG.width, function(v)
+        if dispRefreshing then return end
         CONFIG.width = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5507,6 +5548,7 @@ local function BuildSettings()
     AddDispWidget(widthSlider)
 
     local heightSlider = CreateSlider(dispContent, "Bar Height", 8, 40, 1, CONFIG.height, function(v)
+        if dispRefreshing then return end
         CONFIG.height = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5514,6 +5556,7 @@ local function BuildSettings()
     AddDispWidget(heightSlider)
 
     local extrasHeightSlider = CreateSlider(dispContent, "Extras Bar Height", 8, 40, 1, CONFIG.extrasHeight or CONFIG.height, function(v)
+        if dispRefreshing then return end
         CONFIG.extrasHeight = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5521,6 +5564,7 @@ local function BuildSettings()
     AddDispWidget(extrasHeightSlider)
 
     local spacingSlider = CreateSlider(dispContent, "Spacing", 0, 5, 0.5, CONFIG.spacing, function(v)
+        if dispRefreshing then return end
         CONFIG.spacing = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5528,6 +5572,7 @@ local function BuildSettings()
     AddDispWidget(spacingSlider)
 
     local scaleSlider = CreateSlider(dispContent, "Scale", 0.5, 3.0, 0.05, CONFIG.scale, function(v)
+        if dispRefreshing then return end
         CONFIG.scale = v
         if EH_Parent then EH_Parent:SetScale(v) end
         if ns.SyncStackContainerLayout then ns.SyncStackContainerLayout() end
@@ -5561,6 +5606,7 @@ local function BuildSettings()
     AddDispDescription("Extra space around the bar frame edges. Useful for fine-tuning alignment with other UI elements.")
 
     local padTopSlider = CreateSlider(dispContent, "Padding Top", 0, 20, 1, CONFIG.paddingTop, function(v)
+        if dispRefreshing then return end
         CONFIG.paddingTop = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5568,6 +5614,7 @@ local function BuildSettings()
     AddDispWidget(padTopSlider)
 
     local padBotSlider = CreateSlider(dispContent, "Padding Bottom", 0, 20, 1, CONFIG.paddingBottom, function(v)
+        if dispRefreshing then return end
         CONFIG.paddingBottom = v
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
@@ -5606,6 +5653,15 @@ local function BuildSettings()
     end)
     AddDispWidget(iconGapSlider)
 
+    local hiddenIconSlider = CreateSlider(dispContent, "Space Left Of Bars When Icons Off", 0, 40, 1,
+        CONFIG.hiddenIconWidth or 0, function(v)
+        CONFIG.hiddenIconWidth = v
+        ApplyLayoutToAllBars()
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(hiddenIconSlider)
+    AddDispDescription("At 0 the bars sit flush against the left padding, which is usually the point of hiding icons. Raise it to keep a column for the charge and stack text; at 0 that text moves onto the bars and is positioned with the anchors in Colours.")
+
     -- Now Line
     AddDispHeader("Now Line")
     AddDispDescription("The vertical line showing the current moment in time. Wider values make it easier to see.")
@@ -5627,6 +5683,37 @@ local function BuildSettings()
         ns.SaveCurrentProfile()
     end)
     AddDispWidget(gcdSparkSlider)
+
+    -- Toggle, width and colour together, not split across tabs.
+    AddDispHeader("Cast Spark")
+    AddDispDescription("Draws a line at the end of a cast, crossing every lane and travelling toward the now line, so you can read where the cast lands against everything else on the timeline.")
+
+    local castSparkCheck = CreateCheckbox(dispContent, "Enable Cast Spark",
+        "Off by default. Channels and empowered casts use it too.", CONFIG.castSpark, function(v)
+        CONFIG.castSpark = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(castSparkCheck)
+
+    local castSparkWidthSlider = CreateSlider(dispContent, "Cast Spark Width", 1, 6, 1, CONFIG.castSparkWidth, function(v)
+        CONFIG.castSparkWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(castSparkWidthSlider)
+
+    local castSparkMatchCheck = CreateCheckbox(dispContent, "Match The Cast Bar Colour",
+        "Uses the colour of the spell being cast, including any per spell cast colour. Untick to always use the colour below.",
+        CONFIG.castSparkMatchCast, function(v)
+        CONFIG.castSparkMatchCast = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(castSparkMatchCheck)
+
+    local castSparkSwatch = CreateColorSwatch(dispContent, "Cast Spark Colour", DeepCopy(CONFIG.castSparkColor), function(c)
+        CONFIG.castSparkColor = c
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(castSparkSwatch)
 
     -- Static Height
     AddDispHeader("Static Height")
@@ -5755,8 +5842,9 @@ local function BuildSettings()
 
     dispContent:SetHeight(dispY + 20)
 
-    displayTab:SetScript("OnShow", function()
-        dispRefreshing = true
+    -- Body split out so the flag can be restored through a pcall: a throw in
+    -- here would otherwise leave the whole Display tab read only.
+    local function RefreshDisplayTab()
         futureSlider:SetValue(CONFIG.future or 16)
         pastSlider:SetValue(CONFIG.past or 2.5)
         widthSlider:SetValue(CONFIG.width or 352)
@@ -5770,8 +5858,13 @@ local function BuildSettings()
         padRightSlider:SetValue(CONFIG.paddingRight or 5)
         iconSizeSlider:SetValue(CONFIG.iconSize or 30)
         iconGapSlider:SetValue(CONFIG.iconGap or 10)
+        hiddenIconSlider:SetValue(CONFIG.hiddenIconWidth or 0)
         nowLineSlider:SetValue(CONFIG.nowLineWidth or 2)
         gcdSparkSlider:SetValue(CONFIG.gcdSparkWidth or 3)
+        castSparkCheck:SetChecked(CONFIG.castSpark or false)
+        castSparkWidthSlider:SetValue(CONFIG.castSparkWidth or 1)
+        castSparkMatchCheck:SetChecked(CONFIG.castSparkMatchCast ~= false)
+        if CONFIG.castSparkColor then castSparkSwatch:SetColor(DeepCopy(CONFIG.castSparkColor)) end
         staticCheck:SetChecked(CONFIG.staticHeight ~= nil)
         staticHeightSlider:SetValue(CONFIG.staticHeight or 150)
         staticFramesSlider:SetValue(CONFIG.staticFrames or 0)
@@ -5791,17 +5884,22 @@ local function BuildSettings()
         posYSlider:SetValue(py)
         smoothCheck:SetChecked(CONFIG.smoothBars or false)
         growUpCheck:SetChecked(CONFIG.growDirection == "UP")
-        dispRefreshing = false
+    end
+
+    displayTab:SetScript("OnShow", function()
+        local was = dispRefreshing
+        dispRefreshing = true
+        local ok, err = pcall(RefreshDisplayTab)
+        dispRefreshing = was
+        if not ok then
+            print("|cff00ff00[Infall]|r The display settings could not be refreshed. Reload if it looks wrong: " .. tostring(err))
+        end
     end)
 
-    -- ========================================================================
     -- TAB C: COLOURS
-    -- ========================================================================
     BuildColoursTab(contentArea, tabFrames)
 
-    -- ========================================================================
     -- TAB D: TOGGLES
-    -- ========================================================================
     local togglesTab = CreateFrame("Frame", nil, contentArea)
     togglesTab:SetAllPoints()
     togglesTab:Hide()
@@ -6012,11 +6110,13 @@ local function BuildSettings()
     AddTogWidget(cdMinDurSlider)
 
     -- Rune abilities. Only built when the class declares base cooldowns, so no
-    -- other class sees a control that would do nothing.
+    -- other class sees a control that would do nothing. Declared outside the
+    -- branch so the OnShow restore can reach it.
+    local runeCdCheck
     if CONFIG.runeBaseCooldowns then
         AddTogHeader("Rune Abilities")
 
-        local runeCdCheck = CreateCheckbox(togContent, "Estimate Rune Cooldowns",
+        runeCdCheck = CreateCheckbox(togContent, "Estimate Rune Cooldowns",
             "The game reports the later of an ability's own cooldown and the wait for runes, and gives addons no way to tell them apart. With this on, bars are rebuilt from the ability's real cooldown instead, so abilities with no cooldown of their own stop drawing a bar. Estimated: a cooldown reduction effect will make a bar run long.",
             CONFIG.estimateRuneCooldowns, function(v)
                 CONFIG.estimateRuneCooldowns = v
@@ -6085,16 +6185,17 @@ local function BuildSettings()
         hideUtilityCheck:SetChecked(CONFIG.hideUtilityCD)
         hideBuffIconCheck:SetChecked(CONFIG.hideBuffIconCD)
         hideBuffBarCheck:SetChecked(CONFIG.hideBuffBarCD)
+        showCdDurationCheck:SetChecked(CONFIG.showCooldownDuration)
+        cdMinDurSlider:SetValue(CONFIG.cdTextMinDuration or 30)
+        if runeCdCheck then runeCdCheck:SetChecked(CONFIG.estimateRuneCooldowns) end
         RefreshCDMStatus()
     end)
 
-    -- ========================================================================
     -- TAB E: PROFILES
-    -- ========================================================================
     local profilesTab = CreateFrame("Frame", nil, contentArea)
     profilesTab:SetAllPoints()
     profilesTab:Hide()
-    tabFrames[7] = profilesTab
+    tabFrames[8] = profilesTab
 
     local profScroll, profContent = CreateScrollableContent(profilesTab)
 
@@ -6338,9 +6439,7 @@ local function BuildSettings()
 
     profY = profY + 32
 
-    -- ========================================================================
     -- IMPORT / EXPORT
-    -- ========================================================================
 
     profY = profY + 10
     local ieHeader = CreateSectionHeader(profContent, "Import / Export")
@@ -6380,6 +6479,17 @@ local function BuildSettings()
     ieEditBox:SetMaxLetters(0)
     ieEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
     ieScroll:SetScrollChild(ieEditBox)
+
+    -- A scroll child is only as tall as its content, so an empty box is one
+    -- clickable line. Hand focus over instead. Do not force a height: that
+    -- clips a long export string with no way to scroll to it.
+    local function FocusIE()
+        ieEditBox:SetFocus()
+    end
+    ieBoxFrame:EnableMouse(true)
+    ieBoxFrame:SetScript("OnMouseDown", FocusIE)
+    ieScroll:EnableMouse(true)
+    ieScroll:SetScript("OnMouseDown", FocusIE)
 
     profY = profY + 88
 
@@ -6533,14 +6643,10 @@ local function BuildSettings()
         SelectTab(currentTab)
     end
 
-    -- ========================================================================
     -- TAB F: STACKS
-    -- ========================================================================
     BuildStacksTab(contentArea, tabFrames)
 
-    -- ========================================================================
     -- TAB G: RESOURCE BAR
-    -- ========================================================================
     if ns.BuildResourceBarTab then
         ns.BuildResourceBarTab(contentArea, tabFrames, {
             CreateCheckbox = CreateCheckbox,
@@ -6555,9 +6661,22 @@ local function BuildSettings()
         })
     end
 
-    -- ========================================================================
+    -- TAB H: ICONS
+    if ns.BuildIconsTab then
+        ns.BuildIconsTab(contentArea, tabFrames, {
+            CreateCheckbox = CreateCheckbox,
+            CreateSlider = CreateSlider,
+            CreateSectionHeader = CreateSectionHeader,
+            CreateScrollableContent = CreateScrollableContent,
+            CreateDropdown = CreateDropdown,
+            CreateColorSwatch = CreateColorSwatch,
+            GetFontOptions = GetFontOptions,
+            FONT_FLAG_OPTIONS = FONT_FLAG_OPTIONS,
+            ANCHOR_POINTS = ANCHOR_POINTS,
+        })
+    end
+
     -- REGISTRATION
-    -- ========================================================================
 
     local category = Settings.RegisterCanvasLayoutCategory(settingsFrame, "EventHorizon Infall")
     Settings.RegisterAddOnCategory(category)
@@ -6579,9 +6698,7 @@ local function BuildSettings()
     SelectTab(1)
 end
 
--- ============================================================================
 -- SETTINGS API
--- ============================================================================
 
 -- Called at PLAYER_LOGIN to register the panel in the ESC menu
 ns.InitSettings = BuildSettings
