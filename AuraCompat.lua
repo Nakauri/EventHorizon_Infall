@@ -1,6 +1,6 @@
 -- EventHorizon Infall: aura timing sources.
--- Bar-configured auras read the CDM's own bar value. Icon-configured auras use
--- a DurationObject built from a recorded start and a learned duration.
+-- Bar-configured auras mirror the CDM's bar value; icon-configured auras use a
+-- DurationObject built from a recorded start and a learned duration.
 
 local ns = EventHorizon_Infall
 local AC = {}
@@ -13,11 +13,9 @@ local issecret = issecretvalue or function() return false end
 local probeStamp = -1
 local probeAnswer = false
 
--- True while aura queries raise an error for addons. Probes the call itself
--- rather than C_Secrets.ShouldAurasBeSecret, which reports secrecy rather than
--- whether the query works.
--- Memoized per frame: callers run per row per update cycle, and an uncached
--- probe costs a pcall plus an API call every time.
+-- True while aura queries raise an error for addons. Probes the call itself rather
+-- than C_Secrets.ShouldAurasBeSecret, which reports secrecy, not whether it works.
+-- Memoized per frame: callers run per row per update cycle.
 function AC.AurasRestricted()
     local now = GetTime()
     if now == probeStamp then return probeAnswer end
@@ -50,10 +48,9 @@ function AC.GetConfigSpellID(frame)
     local id = info.overrideSpellID or info.spellID
     if id and not issecret(id) then return id end
 
-    -- Item entries (trinket buffs, potions) carry no spellID, so learning and
-    -- permanence would never key off anything and the aura falls through to a
-    -- mirror that renders permanent buffs empty. The cooldownID is the CDM's
-    -- own stable identity; namespace it so it cannot collide with a spellID.
+    -- Item entries carry no spellID, so learning and permanence would key off nothing
+    -- and the aura falls through to a mirror that renders permanent buffs empty. The
+    -- cooldownID is the CDM's own identity; namespace it against spellIDs.
     if info.equipSlot or info.spellCategoryID then
         return "cd:" .. tostring(cdID)
     end
@@ -114,9 +111,8 @@ function AC.Learn(frame)
     end
 end
 
--- Sweeps both buff viewers so any aura the player has up while unrestricted is
--- learned, not just ones currently drawn on a row. Rarely used cooldowns would
--- otherwise stay unlearned for a long time.
+-- Sweeps both buff viewers, so any aura the player has up while unrestricted is
+-- learned, not just ones currently drawn on a row.
 local VIEWERS = { "BuffIconCooldownViewer", "BuffBarCooldownViewer" }
 
 function AC.LearnVisible()
@@ -187,10 +183,8 @@ function AC.ResolveFill(frame, unit)
         return "mirror", bar
     end
 
-    -- Last resort when there is no .Bar to mirror: rebuild from a learned duration
-    -- and the recorded start. Works under restriction; GetAuraDuration does not,
-    -- it is refused to tainted callers. Only fires for auras seen unrestricted at
-    -- least once. Item buffs never learn, and use a cast-armed window in Bars.lua.
+    -- Last resort, and the only restriction-proof route: GetAuraDuration is
+    -- refused to tainted callers. Needs one unrestricted sighting to learn.
     local start = AC.GetAuraStart(frame)
     local dur = AC.GetLearnedDuration(spellID)
     if dur and start then

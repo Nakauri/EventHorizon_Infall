@@ -128,10 +128,8 @@ ns.CONFIG = {
 
     customIcons = {},
 
-    -- Icon strip. Defaults live HERE, not in Icons.lua: ns.classConfigDefaults is
-    -- built at Settings.lua file scope, which loads first, so a default declared
-    -- later snapshots as empty and Reset to Default would wipe the user's setup.
-    -- Two levels each, mirroring stackIndicatorSettings / stackIndicatorList.
+    -- Icon strip defaults live HERE, not in Icons.lua: ns.classConfigDefaults is built
+    -- at Settings.lua file scope, so a default declared later snapshots as empty.
     iconsEnabled = false,
     iconContainers = {},   -- { key, anchor, grow, mode, size, spacing, perLine, zoom, text = {} }
     iconList = {},         -- { cooldownID, container, enabled, states = {} }
@@ -168,9 +166,8 @@ end
 ns.cooldownBars = {}
 ns.barPool = {}
 
--- Generic display for item categories that have no recent source yet. Mirrors
--- the Cooldown Manager's own spellCategoryMetadataLookup, so the names and
--- icons match what the player sees there.
+-- Generic display for item categories that have no recent source yet. Mirrors the
+-- Cooldown Manager's own lookup, so the names and icons match.
 ns.SPELL_CATEGORY_DISPLAY = {
     [4]    = { icon = "Interface/ICONS/INV_POTION_114",      name = COOLDOWN_VIEWER_TOOLTIP_POTION_COMBAT_TITLE },
     [30]   = { icon = "Interface/ICONS/INV_POTION_54",       name = COOLDOWN_VIEWER_TOOLTIP_POTION_HEALTH_TITLE },
@@ -178,13 +175,9 @@ ns.SPELL_CATEGORY_DISPLAY = {
     [2566] = { icon = "Interface/ICONS/Warlock_ Bloodstone",  name = COOLDOWN_VIEWER_TOOLTIP_POTION_DEMONIC_HEALTHSTONE_TITLE },
 }
 
--- Display name and icon for a Cooldown Manager entry.
---
--- Not every entry is a spell. Potions and consumables carry a spellCategoryID
--- with no spellID, and trinkets carry an equipSlot, so a spell lookup returns
--- nothing and the entry renders as a bare cooldown id. Resolution order
--- follows the Cooldown Manager's own: equipped item, then the most recent
--- source in the spell category, then the spell.
+-- Display name and icon for a Cooldown Manager entry. Not every entry is a spell:
+-- potions carry a spellCategoryID with no spellID, trinkets carry an equipSlot.
+-- Order is equipped item, then the most recent source in the category, then the spell.
 function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
     if not cooldownID then return nil, nil end
     if not cdInfo then
@@ -208,14 +201,11 @@ function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
         if slotTex then return nil, slotTex end
     end
 
-    -- Bag item, ie a potion or healthstone. The category reports whatever most
-    -- recently started a cooldown in it, so it is unresolved until the player
-    -- uses one; the category metadata below covers that case.
+    -- Bag item, ie a potion or healthstone. The category reports whatever most recently
+    -- started a cooldown in it, so it is unresolved until the player uses one.
     if cdInfo.spellCategoryID then
-        -- GetLastCategoryCooldownSource carries SecretWhenCooldownsRestricted,
-        -- so both returns are secret in combat. C_Item's lookups reject secret
-        -- arguments outright, and a secret name cannot be sorted or compared,
-        -- so anything secret falls through to the static metadata below.
+        -- GetLastCategoryCooldownSource is secret in combat, C_Item rejects secret arguments,
+        -- and a secret name cannot be sorted, so anything secret falls through to metadata.
         local issecret = issecretvalue or function() return false end
         if C_Spell.GetLastCategoryCooldownSource then
             local ok, spellID, itemID = pcall(C_Spell.GetLastCategoryCooldownSource, cdInfo.spellCategoryID)
@@ -243,10 +233,9 @@ function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
     return nil, nil
 end
 
--- Cooldown Manager order, read without building it.
--- Its accessors build lazily; a build on our stack is created tainted and
--- Blizzard's own frames then throw on it. IsDirty and GetDisplayData build
--- nothing, so read only when it is already built. Never call an accessor.
+-- Cooldown Manager order, read without building it. Its accessors build lazily and
+-- a build on our stack is created tainted. IsDirty and GetDisplayData build nothing,
+-- so read only when it is already built. Never call an accessor.
 
 local orderCache = {}
 
@@ -265,23 +254,68 @@ function ns.CooldownOrderReady()
     return CleanProvider() ~= nil
 end
 
--- The player's real order, or nil if it cannot be had without building it.
+local CATEGORY_VIEWER = {
+    [0] = "EssentialCooldownViewer",
+    [1] = "UtilityCooldownViewer",
+    [2] = "BuffIconCooldownViewer",
+    [3] = "BuffBarCooldownViewer",
+}
+
+local function ByLayoutIndex(a, b)
+    return a.order < b.order
+end
+
+-- nil means unknown, an empty table means the category is empty. A viewer only
+-- fills in cooldownIDs while it is shown, and pads to two frames once laid out.
+local function ViewerCooldownIDs(category)
+    local viewerName = CATEGORY_VIEWER[category]
+    local viewer = viewerName and _G[viewerName]
+    local pool = viewer and viewer.itemFramePool
+    if not pool or not pool.EnumerateActive then return nil end
+    local shownOk, shown = pcall(viewer.IsShown, viewer)
+    if not shownOk or not shown then return nil end
+
+    local rows, active = {}, 0
+    local ok = pcall(function()
+        for frame in pool:EnumerateActive() do
+            active = active + 1
+            local id = frame.cooldownID
+            if id then
+                rows[#rows + 1] = { id = id, order = frame.layoutIndex or #rows + 1 }
+            end
+        end
+    end)
+    if not ok or active == 0 then return nil end
+
+    local sortOk = pcall(table.sort, rows, ByLayoutIndex)
+    if not sortOk then return nil end
+
+    local ids = {}
+    for i = 1, #rows do ids[i] = rows[i].id end
+    return ids
+end
+
+-- The player's real order, or nil if neither source can answer.
 -- Callers fall back to GetCooldownViewerCategorySet, which is static defaults.
 function ns.OrderedCooldownIDs(category)
     local dp = CleanProvider()
     if dp then
         local ok, ids = pcall(dp.GetOrderedCooldownIDsForCategory, dp, category)
-        if ok and ids and #ids > 0 then
+        if ok and type(ids) == "table" then
             orderCache[category] = ids
             return ids
         end
     end
+    local live = ViewerCooldownIDs(category)
+    if live then
+        orderCache[category] = live
+        return live
+    end
     return orderCache[category]
 end
 
--- Custom row and custom icon keys share one keyspace: the key indexes
--- buffMappings, extraCasts, stackMappings, cooldownColors and customIcons, and
--- none of those know which list an entry came from. Generate across both.
+-- Custom row and custom icon keys share one keyspace: the key indexes buffMappings,
+-- extraCasts, stackMappings, cooldownColors and customIcons. Generate across both.
 
 -- Mutated field by field, never replaced, so this reference stays valid.
 local CONFIG = ns.CONFIG
@@ -350,8 +384,8 @@ function ns.MigrateCustomKeyCollisions()
 end
 
 -- Pixel grid. One physical pixel in a frame's own units, and snapping onto it.
--- GetPhysicalScreenSize can report 0 mid display-mode change, and 768/0 would
--- NaN every size derived from it, so the last good height stands in.
+-- GetPhysicalScreenSize can report 0 mid display-mode change, so the last good
+-- height stands in.
 local lastPhysH = 1080
 
 function ns.OnePx(scale)

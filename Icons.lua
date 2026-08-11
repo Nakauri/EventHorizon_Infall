@@ -1,6 +1,5 @@
 -- EventHorizon Infall: icon strip.
--- Containers on an edge of the EH frame, holding icons for Cooldown Manager
--- entries. Membership is a toggle on the same entries the timeline uses.
+-- Containers on an edge of the EH frame holding Cooldown Manager entries.
 
 local ns = EventHorizon_Infall
 local CONFIG = ns.CONFIG
@@ -33,8 +32,7 @@ local CONTAINER_DEFAULTS = {
 }
 
 -- Precedence buff > cooldown > recharging > proc > unusable > ready.
--- `show` decides whether the icon takes a slot, `opacity` how strongly it draws.
--- Glow is not a state field: a proc can run under a buff and still needs to draw.
+-- `show` takes a slot, `opacity` draws. Glow is not a state: a proc can run under a buff.
 local STATE_DEFAULTS = {
     ready    = { show = true, opacity = 1,    desaturate = false, sweep = "none", timer = false },
     buff     = { show = true, opacity = 1,    desaturate = false, sweep = "buff", timer = true,
@@ -73,9 +71,8 @@ local function CountdownFont(cfg)
         and "GameFontHighlightHugeOutline" or "GameFontHighlightOutline"
 end
 
--- Editing a buff's look with no buff up is editing blind, so a modal can force
--- one icon to render a state. Values are stand-ins; everything else is the real
--- paint path, so what is on screen is what will happen.
+-- A modal can force one icon to render a state, so a buff's look can be edited
+-- with no buff up. Values are stand-ins; the paint path is the real one.
 ICON.preview = nil
 
 local function ColorOf(rules, field, fallback)
@@ -170,9 +167,7 @@ local function RulesFor(entry, state)
     return ruleScratch
 end
 
--- Pixel grid
---
--- Satellites are never scaled. Derive the pixel, size in multiples of it.
+-- Pixel grid. Satellites are never scaled: derive the pixel, size in multiples.
 
 local OnePx  = ns.OnePxForFrame
 local SnapPx = ns.SnapPx
@@ -191,7 +186,6 @@ end
 
 -- `size` became width and height; oocOpacity and followRedshift became the three
 -- context alphas. Old keys are cleared so a profile has one source of truth.
--- Exported: the tab reads containers on profiles Layout never touched.
 local function MigrateContainer(cfg)
     if cfg.size then
         cfg.width = cfg.width or cfg.size
@@ -212,10 +206,8 @@ local function MigrateContainer(cfg)
 end
 ICON.MigrateContainer = MigrateContainer
 
--- A strip is keyed by the side it lives on, so there is nothing to name and an
--- entry's container reads as its position. The single "main" container from
--- before becomes whichever side it was already anchored to, and its icons go
--- with it.
+-- A strip is keyed by the side it lives on. The single "main" container from
+-- before becomes whichever side it was anchored to, and its icons go with it.
 local function MigrateContainers()
     local list = CONFIG.iconContainers
     if not list then return end
@@ -265,8 +257,7 @@ end
 
 -- Presence is a nil check on auraInstanceID, never a comparison. Keyed on the
 -- BASE spell: the live one can be secret and a secret table key throws.
--- Prefers a mapped buff that can be timed. A present frame with no .Bar carries
--- no duration, and taking it strands the icon when a second buff takes over.
+-- Prefers a mapped buff that can be timed; a frame with no .Bar carries no duration.
 local function ActiveBuffFrame(cooldownID, baseSpellID)
     if not ns.GetPersistentBuffFrame then return nil end
     local maps = CONFIG.buffMappings
@@ -354,9 +345,8 @@ local function GetIcon(key, index)
     end
     ic.radial:Hide()
 
-    -- Buff remaining, copied from Blizzard's own string, never read.
-    -- Above the wedge, which is a frame in its own right and would otherwise
-    -- draw over the number it is timing.
+    -- Buff remaining, copied from Blizzard's own string, never read. Above the
+    -- wedge, which would otherwise draw over the number it is timing.
     ic.textLayer = CreateFrame("Frame", nil, ic)
     ic.textLayer:SetAllPoints()
     ic.textLayer:SetFrameLevel(ic.radial:GetFrameLevel() + 1)
@@ -431,10 +421,8 @@ local function CountValue(spellID, buffFrame)
             return info.currentCharges
         end
     end
-    -- Only when we can PROVE it is worth showing. A non-stacking aura reports 0
-    -- and would print a 0 on every icon. Under restriction the count is secret
-    -- and cannot be compared, so no aura stacks there; charges still work,
-    -- because maxCharges is NeverSecret.
+    -- A non-stacking aura reports 0 and would print a 0 on every icon. Under
+    -- restriction the count is secret; charges still work, maxCharges is NeverSecret.
     local AC = ns.AuraCompat
     if buffFrame and AC and AC.ReadApplications then
         local n = AC.ReadApplications(buffFrame)
@@ -466,17 +454,13 @@ local function PaintIcon(ic, entry, cfg)
 
     -- Feed the cooldown first: the state test reads this frame's IsShown().
     if spellID and (refeedCooldowns or not ic.cd:IsShown()) then
-        -- ignoreGCD returns the real cooldown and a zero span during a pure GCD,
-        -- so the strip does not flicker a sweep on every cast. Per entry, falling
-        -- back to the general setting.
+        -- ignoreGCD returns the real cooldown and a zero span during a pure GCD.
+        -- Per entry, falling back to the general setting.
         local ignoreGCD = entry.ignoreGCD
         if ignoreGCD == nil then ignoreGCD = CONFIG.iconIgnoreGCD ~= false end
 
-        -- A charge spell's own cooldown is zero while a charge is spare, so
-        -- reading it leaves the icon blank while the Cooldown Manager is still
-        -- counting the recharge down. The charge duration is what that entry
-        -- shows, and it is zero-span at full charges, which clearIfZero handles.
-        -- maxCharges is NeverSecret, so the test is safe.
+        -- A charge spell's own cooldown is zero while a charge is spare, so the charge
+        -- duration is what the entry shows. Zero-span at full charges, which clearIfZero handles.
         local durObj
         if C_Spell.GetSpellChargeDuration then
             local okC, info = pcall(C_Spell.GetSpellCharges, spellID)
@@ -500,10 +484,8 @@ local function PaintIcon(ic, entry, cfg)
         ic.cd:SetCooldown(0, 0)
     end
 
-    -- No info means the entry is not in the Cooldown Manager any more, usually
-    -- because the ability was talented away. Custom icons carry their own art
-    -- and are unaffected. Without this the slot keeps drawing the fallback
-    -- question mark until a reload.
+    -- No info means the entry left the Cooldown Manager, usually talented away.
+    -- Without this the slot keeps drawing the fallback question mark until a reload.
     if entry.cooldownID and not info
         and not (CONFIG.customIcons and CONFIG.customIcons[entry.cooldownID]) then
         SetGlow(ic, false)
@@ -513,14 +495,13 @@ local function PaintIcon(ic, entry, cfg)
 
     local buffFrame, buffCdID = ActiveBuffFrame(ICON.EntryID(entry), baseSpellID)
     local glowing = IsGlowing(spellID)
-    -- Matched on the entry itself, never its cooldownID: the same ability can
-    -- sit on several strips as separate entries, and previewing one must not
-    -- force the others.
+    -- Matched on the entry, never its cooldownID: the same ability can sit on
+    -- several strips as separate entries, and previewing one must not force the others.
     local pv = ICON.preview
     local forced = pv and pv.entry == entry and pv.state or nil
-    -- Resolved before the chain, because a running sweep means two different
-    -- things depending on it. Whole test inside the pcall: the comparison throws,
-    -- not the call. Never a charge count test; currentCharges is secret.
+    -- Resolved before the chain: a running sweep means two different things.
+    -- Whole test inside the pcall, the comparison throws and not the call.
+    -- Never a charge count test; currentCharges is secret.
     local unusable = false
     pcall(function()
         local u = C_Spell.IsSpellUsable(spellID)
@@ -656,15 +637,12 @@ local function PaintIcon(ic, entry, cfg)
     return true, live
 end
 
--- Layout
---
--- Compaction is one filtered list. Growth is which edge stays pinned.
+-- Layout. Compaction is one filtered list. Growth is which edge stays pinned.
 
 local HORIZONTAL = { TOP = true, BOTTOM = true }
 
--- Pips and the resource bar share one container per side. Outside means anchor
--- beyond it; inside means anchor to the frame and let it move out of the way,
--- which is why only one of the two ever offsets for the other.
+-- Pips and the resource bar share one container per side. Outside anchors beyond
+-- it, inside anchors to the frame, so only one of the two ever offsets.
 local function EdgeAnchor(cfg, parent)
     if not HORIZONTAL[cfg.anchor] or not ns.GetStackEdgeFrame then return parent end
     if cfg.edgeOrder == "inside" then return parent end
@@ -771,9 +749,8 @@ local function UpdateContainer(cfg, parent)
         return live
     end
 
-    -- Geometry only changes with the visible set or a size setting.
-    -- Occupancy belongs in the signature or turning pips on re-anchors nothing.
-    -- Height does not: the strip anchors to the frame and tracks it.
+    -- Geometry only changes with the visible set or a size setting. Occupancy belongs
+    -- in the signature; height does not, the strip anchors to the frame and tracks it.
     local edged = (HORIZONTAL[cfg.anchor] and ns.GetStackEdgeFrame
         and ns.GetStackEdgeFrame(cfg.anchor)) and "s" or "-"
 
@@ -836,9 +813,7 @@ function ICON.Relayout()
     ICON.Layout()
 end
 
--- Enable / disable
---
--- Disabled costs nothing per frame: no events, no OnUpdate, no frames.
+-- Enable / disable. Disabled costs nothing per frame: no events, no OnUpdate, no frames.
 
 local function OnTick(self, elapsed)
     self.acc = (self.acc or 0) + elapsed
@@ -870,9 +845,8 @@ function ICON.Refresh()
     end
 
     if not eventFrame then
-        -- PLAYER_REGEN_ENABLED lives on the event frame, so bailing here would
-        -- leave a strip enabled mid fight with nothing to wake it. Retry until
-        -- combat drops; only ever runs in this one transient case.
+        -- PLAYER_REGEN_ENABLED lives on the event frame, so bailing here would leave a
+        -- strip enabled mid fight with nothing to wake it. Retry until combat drops.
         if InCombatLockdown() then
             if not refreshRetryQueued then
                 refreshRetryQueued = true

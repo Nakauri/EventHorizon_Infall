@@ -33,11 +33,9 @@ local function DeepCopy(v)
     return copy
 end
 
--- Observed regen rate, in resource per second.
--- GetPowerRegenForPowerType returns a secret value in combat, so the rate is
--- measured from the player's own power ticks instead. Only a rise from below
--- the cap measures regen: a fall is a spend, and an interval that starts at the
--- cap is inflated. UnitPower can itself be secret, so that frame is skipped.
+-- Observed regen rate, in resource per second. GetPowerRegenForPowerType is secret
+-- in combat, so the rate is measured from the player's own power ticks. Only a rise
+-- from below the cap measures regen; a secret UnitPower skips that frame.
 local observedRegen = 0
 local regenPrev, regenPrevAt
 
@@ -72,9 +70,8 @@ end
 ns.ObservePowerTick = ObservePowerTick
 
 local function GetRegenRate()
-    -- Prefer the API whenever it is readable: exact, no warm-up, and a genuine
-    -- zero (classes that do not regen while casting) must not be overridden by
-    -- an observed out-of-cast rate. Fall back only when it is actually secret.
+    -- Prefer the API whenever it is readable: a genuine zero, classes that do not regen
+    -- while casting, must not be overridden. Fall back only when it is actually secret.
     if GetPowerRegenForPowerType and currentPowerType then
         local ok, _, casting = pcall(GetPowerRegenForPowerType, currentPowerType)
         if ok and type(casting) == "number" and not issecretvalue(casting) then
@@ -1304,10 +1301,8 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
         origSaveAndRebuild()
     end
 
-    -- Restored through a pcall. Every setter in this tab is gated on this flag,
-    -- so a throw anywhere in the repopulate used to leave it stuck true and the
-    -- whole tab silently read only until a reload, with no error to connect it
-    -- to. Same defect the Icons and Display tabs carried.
+    -- Restored through a pcall. Every setter in this tab is gated on this flag, so a
+    -- throw used to leave it stuck true and the whole tab read only until a reload.
     local function RefreshResourceTabInner()
         rb = CONFIG.resourceBar or {}
         enableCB:SetChecked(rb.enabled or false)

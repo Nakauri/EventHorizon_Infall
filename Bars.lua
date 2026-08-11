@@ -19,7 +19,7 @@ CONFIG.hiddenCooldownIDs = CONFIG.hiddenCooldownIDs or {}
 CONFIG.chargesDisabled = CONFIG.chargesDisabled or {}
 
 local activeCast
--- Own record, not activeCast: that only exists for casts matching a row.
+-- activeCast is row-matched only.
 local sparkCast
 local HideCastSpark
 local cachedGcdDurObj
@@ -38,11 +38,8 @@ local HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overla
 local POTION_BUFF_DURATION = 30
 local ArmPotionWindow
 
--- Match on config shape: GetLastCategoryCooldownSource is secret in combat,
--- CooldownViewerCooldown is not. Category 4 only; 30, 1711 and 2566 are health
--- potions and healthstones.
--- Cast spellID to window seconds, and the membership test: linkedSpellIDs is
--- empty on consumable entries. An id missing here draws no aura bar.
+-- Category 4 only. GetLastCategoryCooldownSource is secret in combat;
+-- CooldownViewerCooldown is not. An id missing here draws no aura bar.
 local POTION_BUFF_DURATIONS = {
     [1236616] = 30,   -- Light's Potential
     [1236998] = 30,   -- Draught of Rampant Abandon
@@ -138,10 +135,8 @@ if AlphaCurve then
 end
 
 
--- BuffFillCurve: 0s remaining → CONFIG.future (permanent buff, full bar), >0s → passthrough.
 -- Rebuilt whenever CONFIG.future changes. Built at file load it would capture
--- Core.lua's default forever: the saved value is not applied to CONFIG until
--- ApplyProfile runs from an event handler, well after this chunk.
+-- Core.lua's default forever: ApplyProfile runs later, from an event.
 local BuffFillCurve
 local buffFillCurveFuture
 local function RebuildBuffFillCurve()
@@ -269,12 +264,8 @@ end
 
 -- straddles now line
 
--- Cast/channel matching across spell transforms.
---
--- A transform reports a DIFFERENT spellID than the row holds (Halo turns Mind
--- Flay into Mind Flay: Insanity), so comparing spellID and baseSpellID alone
--- misses it and the overlay never draws. Resolve BOTH sides through every
--- transform relation the game exposes, then compare the sets.
+-- A transform reports a DIFFERENT spellID than the row holds, so comparing
+-- spellID and baseSpellID alone misses it. Resolve both sides, compare sets.
 local function SpellIdentitySet(id)
     if not id then return nil end
     local t = { [id] = true }
@@ -901,10 +892,8 @@ function ns.RefreshTextAnchors()
     end
 end
 
--- Lane height and pitch in whole physical pixels, so every lane and every
--- separator comes out identical. Snapping the height alone is not enough: the
--- separator rides on the pitch, and a pitch off the grid drifts by lane index.
--- Same rounding the stack pips had, on the other axis.
+-- Whole physical pixels. Snapping the height alone is NOT enough: the separator
+-- rides on the pitch, and a pitch off the grid drifts by lane index.
 local lanePitchCache = setmetatable({}, { __mode = "k" })
 
 local function ChargeLaneMetrics(frame, barHeight, maxC)
@@ -1970,9 +1959,8 @@ local buffViewerNames = {"BuffIconCooldownViewer", "BuffBarCooldownViewer"}
 local persistentCooldownMap = {}
 local persistentBuffMap = {}
 
--- A cooldown-viewer frame may stand in for a buff frame but has no Bar. Item
--- entries share one cooldownID across both, so the stand-in can hold the slot.
--- Tracked here so it can be upgraded on read.
+-- A cooldown-viewer frame can stand in for a buff frame but has no Bar.
+-- Tracked so it can be upgraded on read.
 local persistentBuffFallback = {}
 local buffPromoteNext = {}
 
@@ -2004,10 +1992,8 @@ local function ResolveBuffFrame(cdID)
         end
     end
 
-    -- No buff-viewer frame exists for this id. Stop retrying: most cooldown rows
-    -- have no buff twin, and re-walking both pools every second for each of them
-    -- puts frame-pool iteration back on the combat path. If one appears later the
-    -- SetCooldownID and SetAuraInstanceInfo hooks install it directly.
+    -- Stop retrying: re-walking both pools puts frame-pool iteration back on the
+    -- combat path. The SetCooldownID and SetAuraInstanceInfo hooks catch late ones.
     persistentBuffFallback[cdID] = nil
     buffPromoteNext[cdID] = nil
     return frame
@@ -2196,10 +2182,8 @@ local function MirrorECMState(row, cooldownViewerFrames)
     if row.hasCharges then
         local ok, chargeInfo = pcall(C_Spell.GetSpellCharges, row.spellID)
         if ok and chargeInfo then
-            -- Straight through, never concatenated. currentCharges is secret
-            -- under restriction (maxCharges and isActive beside it are flagged
-            -- NeverSecret, it is not), and the pcall above covers only the API
-            -- call, so a concat here threw out of the whole display pass.
+            -- Never concatenate: currentCharges is secret and the pcall above
+            -- covers only the API call.
             row.chargeText:SetText(chargeInfo.currentCharges)
             row.chargeText:Show()
         else
@@ -2210,9 +2194,8 @@ local function MirrorECMState(row, cooldownViewerFrames)
     end
 end
 
--- The spell whose cooldown a row should read. Item category entries (potions,
--- healthstones) have no spellID of their own; the category reports whichever
--- item most recently started its cooldown, which is the one being tracked.
+-- Item entries have no spellID; the category reports whichever item most
+-- recently started its cooldown.
 local function ResolveCooldownSpellID(row)
     if row.spellID then return row.spellID end
     if row._spellCategoryID and C_Spell.GetLastCategoryCooldownSource then
@@ -2222,10 +2205,8 @@ local function ResolveCooldownSpellID(row)
     return nil
 end
 
--- Estimated cooldowns for rune abilities.
--- The reported cooldown is the later of the spell's own cooldown and the wait
--- for runes, with no API separating them. Rebuilds the cooldown from a declared
--- base plus the cast time, in plain numbers, for spells listed in ClassConfig.
+-- The reported cooldown is the later of the spell's own and the rune wait,
+-- with no API separating them. Rebuilt from a ClassConfig base plus cast time.
 local runeCastAt = {}
 
 -- Resolves through the base as well: row.spellID holds the override form, and
@@ -2499,9 +2480,8 @@ UpdateBuffState = function(row, buffViewerFrames)
         thirdBuff = nil
     end
 
-    -- Primary lane → buffBar.
-    -- A live potion window is checked first: a resolved lane on a potion row gives
-    -- an empty mirror or nothing, and both would hide the window's bar.
+    -- A live potion window is checked first: a resolved lane on a potion row
+    -- gives an empty mirror, which would hide the window's bar.
     local potionWindowLive = row._potionWindowExpiry and GetTime() < row._potionWindowExpiry
     if potionWindowLive then
         -- Owned by the window. Reapplying it each tick makes the bar strobe.
@@ -3338,9 +3318,8 @@ local function ResetBarState(bar)
     ApplyTextAnchors(bar)
 end
 
--- Name and icon follow bar.spellID, which is the OVERRIDE when one exists. Using
--- the base spellID leaves a hero-talent form like Black Arrow showing its base
--- spell's art. Item entries have no spellID and resolve from the category.
+-- Follows bar.spellID, the OVERRIDE when one exists, or a hero-talent form
+-- shows its base spell's art. Item entries resolve from the category.
 local function ApplyRowDisplay(bar, cooldownID)
     local customID = CONFIG.customIcons and CONFIG.customIcons[cooldownID]
     local customTex = customID and C_Spell.GetSpellTexture(customID)
@@ -3410,17 +3389,14 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
     local maxCap = chargeOverride and chargeOverride.trueMax or nil
 
     if chargeInfo and chargeInfo.maxCharges then
-        -- maxCharges is NeverSecret, so the guard should
-        -- never fire. Kept as cheap insurance, but it fails safe rather than
-        -- falling back to a saved value: a stale max draws lanes for charges
-        -- the spell does not have.
+        -- maxCharges is NeverSecret so this should never fire. Fails safe rather
+        -- than using a saved value: a stale max draws lanes the spell lacks.
         if issecretvalue(chargeInfo.maxCharges) then
             -- no usable count, leave it as a single bar
         else
             local effectiveMax = chargeInfo.maxCharges
-            -- A proc can grant a temporary extra charge, so a bar built during
-            -- the proc would strand a lane. Those spells declare their real
-            -- base in ClassConfig; every other spell uses the live count.
+            -- A proc can grant a temporary extra charge and strand a lane. Those spells
+            -- declare their real base in ClassConfig.
             local declaredBase = chargeOverride and chargeOverride.base
             if declaredBase then effectiveMax = declaredBase end
             if maxCap and effectiveMax > maxCap then effectiveMax = maxCap end
@@ -3972,10 +3948,8 @@ LoadEssentialCooldowns = function()
         for _, bar in ipairs(cdm) do cooldownBars[#cooldownBars + 1] = bar end
     end
 
-    -- Hide text on unused pooled bars. cdTextCooldown needs clearing, not
-    -- hiding: it hangs off barTextOverlay, which is parented to EH_Parent and
-    -- not to the row, so hiding the row leaves the engine drawing its countdown
-    -- over nothing when the bar set shrinks mid-cooldown.
+    -- cdTextCooldown needs CLEARING, not hiding: it hangs off barTextOverlay,
+    -- which is parented to EH_Parent, so hiding the row leaves it drawing.
     for i = #cooldownBars + 1, #barPool do
         local bar = barPool[i]
         bar.chargeText:Hide()
@@ -3992,9 +3966,8 @@ LoadEssentialCooldowns = function()
     C_Timer.After(0.5, UpdateBars)
 end
 
--- Re-reads max charges from the API and rebuilds only when the count moved.
--- Rebuilding is how a charge row picks up a new lane count, since a live row
--- cannot have its maxCharges changed in place.
+-- Rebuilds only when the count moved. A live row cannot have its maxCharges
+-- changed in place.
 local function RedetectChargesAndRebuild()
     local oldCache = {}
     if InfallDB.chargeSpells then
@@ -4091,9 +4064,8 @@ EH_Parent:RegisterEvent("TRAIT_CONFIG_UPDATED")
 EH_Parent:RegisterEvent("SPELLS_CHANGED")
 EH_Parent:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")
 EH_Parent:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")
--- Every snapped measurement in this file divides by the effective scale, so all
--- of it goes stale when the scale or the resolution changes. Only the icon
--- strip was rebuilding on these.
+-- Every snapped measurement here divides by the effective scale, so all of
+-- it goes stale when the scale or resolution changes.
 EH_Parent:RegisterEvent("UI_SCALE_CHANGED")
 EH_Parent:RegisterEvent("DISPLAY_SIZE_CHANGED")
 
@@ -4144,9 +4116,8 @@ end
 local ecmVisQueued = false
 local ecmVisPending = false
 
--- Defers the mouse and alpha pass out of Blizzard's own call stack. Touching
--- CDM frames from inside their hooks taints the remainder of the secure
--- execution; see the RefreshLayout/SetCooldownID hooks below.
+-- Defers out of Blizzard's own call stack: touching CDM frames inside their
+-- hooks taints the rest of that secure execution.
 local function QueueECMVisibility()
     if ecmVisQueued then return end
     ecmVisQueued = true
@@ -4269,11 +4240,9 @@ local function ForceViewersAlways()
         print("|cff00ff00[Infall]|r CDM viewers need to be set to Always. Open Edit Mode and change each viewer's visibility, or create a custom layout.")
     end
 
-    -- SaveLayouts is called AT MOST ONCE, during init. Never at runtime.
-    -- A runtime call triggers a layout reapply from addon code, which taints
-    -- Blizzard frame properties including isActive, the field read on every
-    -- viewer child. Runtime callers get the layout data corrected in memory
-    -- and the write deferred to the next login.
+    -- SaveLayouts AT MOST ONCE, during init, NEVER at runtime: a runtime call
+    -- reapplies the layout from addon code and taints isActive, read on every
+    -- viewer child. Runtime callers get it in memory, written next login.
     if ns._editModeSaved or not isFirstCall then
         return true
     end
@@ -4698,9 +4667,8 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         end
 
     elseif event == "TRAIT_CONFIG_UPDATED" then
-        -- A talent can change max charges permanently, and a live row cannot
-        -- have its lane count changed in place. Let the API settle on the new
-        -- build before re-reading, then rebuild only if the count actually moved.
+        -- A talent can change max charges, and a live row cannot change lane count
+        -- in place. Let the API settle before re-reading.
         if not specChangePending then
             local myToken = specChangeToken
             C_Timer.After(2, function()
@@ -5765,9 +5733,8 @@ local function SyncStackLayout()
                 local snappedSpacing = snap(pipSpacing, onePx)
                 local snappedContainerW = snap(containerWidth, onePx)
 
-                -- Snap the cut points and add whole gaps, so every gap is
-                -- identical. Rounding each pip's start and end separately let
-                -- neighbours land a pixel apart or touching.
+                -- Snap the cut points and add whole gaps. Rounding each pip's start and end
+                -- separately let neighbours land a pixel apart or touching.
                 local usableW = snappedContainerW - (numPips - 1) * snappedSpacing
                 for j, pip in ipairs(rowData.pips) do
                     local idx = j - 1
@@ -5815,16 +5782,9 @@ local function SyncStackLayout()
     LayoutContainer(stackContainerBottom, bottomRows, true)
 end
 
--- EDGE ORDER
---
--- Pips, the resource bar and the icon strip all sit on the same two edges and
--- each stored its place a different way: list order, an insert index, and an
--- inside/outside flag. This is the one reading of that, ordered OUTWARD from
--- the frame, so every tab can show the same list and move things the same way.
---
--- The two edges stack in opposite directions internally: the top container
--- lays its rows out in reverse so index 1 ends up nearest the frame on both
--- sides. That flip is handled here and never reaches a caller.
+-- EDGE ORDER. One reading of pips, resource bar and strip on a shared edge,
+-- ordered OUTWARD from the frame. The top container lays its rows out in
+-- reverse; that flip is handled here and never reaches a caller.
 
 local function EdgeItemLabel(entry)
     if entry.indicatorType == "power" then

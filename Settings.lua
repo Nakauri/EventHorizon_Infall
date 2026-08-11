@@ -76,9 +76,8 @@ function ns.AutoPopulateSelfBuffMappings()
     if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then return end
     if not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
 
-    -- Essential AND Utility. The timeline only ever loaded Essential, but the
-    -- icon strip takes both, and a Utility spell whose buff is itself, like a
-    -- movement cooldown, has no other route to a mapping.
+    -- Essential AND Utility. The icon strip takes both, and a Utility spell whose
+    -- buff is itself, like a movement cooldown, has no other route to a mapping.
     local cooldownIDs = {}
     local seenID = {}
     for _, cat in ipairs({ 0, 1 }) do
@@ -1026,9 +1025,8 @@ function ns.CreateEdgeOrderControl(parent, positionFn, itemFn, onChange)
     closer:SetScript("OnClick", function() Move(-1) end)
     further:SetScript("OnClick", function() Move(1) end)
 
-    -- The model lives in Bars.lua, which loads after both tabs that build this,
-    -- so the first paint can happen before it exists. Repainting on show also
-    -- covers a change made from one of the other two tabs.
+    -- The model lives in Bars.lua, which loads after both tabs that build this.
+    -- Repainting on show also covers a change made from one of the other tabs.
     c:SetScript("OnShow", Refresh)
     Refresh()
     return c
@@ -1107,10 +1105,8 @@ local tabFrames = {}
 local tabButtons = {}
 local currentTab = 1
 -- The Cooldown Manager is not a managed UI panel: ShowUIPanel finds no area
--- attribute and falls through to a plain Show. Nothing was ever forcing it and
--- the options window apart, so the old close-then-open was hiding the settings
--- for no reason. It does open behind the options window, which is what read as
--- "it did not open", so raise it and let the player drag it clear.
+-- attribute and falls through to a plain Show. It opens BEHIND the options
+-- window, so raise it and let the player drag it clear.
 function ns.OpenCooldownManager()
     if InCombatLockdown() then
         print("|cff00ff00[Infall]|r Cannot open the Cooldown Manager in combat.")
@@ -1160,8 +1156,7 @@ function ns.OpenCooldownManager()
 end
 
 -- A category move fires no game event; the layout manager's notification is the
--- only signal. Both guards are load bearing: this also fires at login setup, and
--- the rebuild wipes every row before repopulating.
+-- only signal. Both guards are load bearing: this also fires at login setup.
 do
     local owner = {}
     local pending = false
@@ -1182,6 +1177,7 @@ do
         if not ProviderHasEntries() then return end
         if ns.LoadEssentialCooldowns then ns.LoadEssentialCooldowns() end
         if ns.RefreshCooldownRows then ns.RefreshCooldownRows() end
+        if ns.RefreshBuffPool then ns.RefreshBuffPool() end
         if ns.RefreshIconsTab then ns.RefreshIconsTab() end
         if ns.RefreshIcons then ns.RefreshIcons() end
     end
@@ -1203,9 +1199,8 @@ local function SelectTab(index)
     currentTab = index
     GameTooltip:Hide()
     if ns.CloseAllMenus then ns.CloseAllMenus() end
-    -- Indexed, not ipairs: a tab assigned from another file leaves a nil hole if
-    -- that file fails to load, and ipairs stops at the hole, leaving later tabs
-    -- shown on top of each other.
+    -- Indexed, not ipairs: a tab assigned from another file leaves a nil hole if that
+    -- file fails to load, and ipairs stops at the hole.
     for i = 1, #TAB_NAMES do
         local frame = tabFrames[i]
         if frame then frame:Hide() end
@@ -1269,9 +1264,8 @@ local function OpenInlineColorPicker(currentColor, onChange)
     ColorPickerFrame:SetupColorPickerAndShow(info)
 end
 
--- SHARED SPELL PICKER
--- Opens a searchable popup listing the player's learned spells (including
--- passives). Used by the Stacks tab and the custom icon override in Bars tab.
+-- SHARED SPELL PICKER. Searchable popup of the player's learned spells, passives
+-- included. Used by the Stacks tab and the custom icon override in the Bars tab.
 
 local spellPickerFrame
 local spellPickerCache
@@ -2353,8 +2347,7 @@ local function BuildStacksTab(contentArea, tabFrames)
             end)
             posBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-            -- Shared edge model, so a pip can step past the resource bar and
-            -- the strip. Toward/away reads the same on both edges; list order
+            -- Shared edge model. Toward and away read the same on both edges; list order
             -- does not, because the top edge lays out in reverse.
             local me = { kind = "pip", listIndex = idx }
             local function EdgeMove(delta)
@@ -2831,9 +2824,8 @@ local function BuildStacksTab(contentArea, tabFrames)
             end
         end
 
-        -- Show every CDM buff aura. The tooltip word "stack" is an unreliable
-        -- filter , some stacking auras (IE Shadow Techniques) never say it.
-        -- Picking a non-stacking buff still works; it just shows 0 or 1 pip.
+        -- Every CDM buff aura. The tooltip word "stack" is an unreliable filter, some
+        -- stacking auras never say it. A non-stacking pick just shows 0 or 1 pip.
         local filteredIDs = buffIDs
 
         local tracked = GetTrackedCooldownIDs()
@@ -3553,9 +3545,8 @@ local function BuildSettings()
     -- Cached empty-state text (one per pool).
     local emptyRowsText, emptyBuffsText, emptyCastsText
 
-    -- Wires up the Buff 1/2/3, Cast 1/2, and Stack slot widgets on a row.
-    -- Used by Custom Rows in the Extras section. Reads + writes CONFIG.buffMappings[cooldownID],
-    -- CONFIG.extraCasts[cooldownID], and CONFIG.stackMappings[cooldownID].
+    -- Wires the Buff 1/2/3, Cast 1/2 and Stack slot widgets on a row. Reads and writes
+    -- CONFIG.buffMappings, CONFIG.extraCasts and CONFIG.stackMappings by cooldownID.
     local function WireSlots(row, cooldownID)
         local buff1Slot, buff1ColorBtn = row.buff1Slot, row.buff1ColorBtn
         local buff2Slot, buff2ColorBtn = row.buff2Slot, row.buff2ColorBtn
@@ -3938,6 +3929,10 @@ local function BuildSettings()
     -- Reads the upvalue at call time, so placement here is safe.
     function ns.RefreshCooldownRows()
         if RefreshCooldownRows then RefreshCooldownRows() end
+    end
+
+    function ns.RefreshBuffPool()
+        if RefreshBuffPool then RefreshBuffPool() end
     end
 
     RefreshCooldownRows = function()
@@ -4947,9 +4942,8 @@ local function BuildSettings()
                         cRow.cb:SetSize(22, 22)
                         cRow.abilIcon = cRow:CreateTexture(nil, "ARTWORK")
                         cRow.abilIcon:SetSize(24, 24)
-                        -- 22, not 4: a cooldown row is cb +2 swatch(16) +4 icon, and a custom
-                        -- row has no cooldown swatch. Matching the total keeps every slot column
-                        -- below aligned with the cooldown rows above.
+                        -- 22, not 4: a cooldown row is cb +2 swatch(16) +4 icon, and a custom row has no
+                        -- cooldown swatch. Matching the total keeps the slot columns below aligned.
                         cRow.abilIcon:SetPoint("LEFT", cRow.cb, "RIGHT", 22, 0)
                         cRow.abilIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
                         cRow.iconBtn = CreateFrame("Button", nil, cRow)
@@ -5143,26 +5137,21 @@ local function BuildSettings()
         local seen = {}
         local totalCount = 0
 
-        -- The DataProvider reports the player's real layout, including entries moved
-        -- between sections. GetCooldownViewerCategorySet reports the static default
-        -- category and ignores those moves, so it is a last resort. An empty result
-        -- for one section is valid and means everything was moved out of it. Only
-        -- both sections empty is ambiguous enough to fall back.
-        local dpIds, dpAnyContent = {}, false
+        -- The DataProvider reports the player's real layout; GetCooldownViewerCategorySet
+        -- reports the static default category. An empty section is valid and means
+        -- everything was moved out of it, so only an unreadable one falls back.
+        local dpIds = {}
         if ns.OrderedCooldownIDs then
             for _, sec in ipairs(sections) do
                 local dpResult = ns.OrderedCooldownIDs(sec.cat)
-                if type(dpResult) == "table" then
-                    dpIds[sec.cat] = dpResult
-                    if #dpResult > 0 then dpAnyContent = true end
-                end
+                if type(dpResult) == "table" then dpIds[sec.cat] = dpResult end
             end
         end
 
         for _, sec in ipairs(sections) do
             sec.ids = {}
             catLabel[sec.cat] = sec.label
-            local catIds = dpAnyContent and dpIds[sec.cat] or nil
+            local catIds = dpIds[sec.cat]
             if not catIds then
                 local catOk, catResult = pcall(function()
                     return C_CooldownViewer.GetCooldownViewerCategorySet(sec.cat, false)
@@ -5465,9 +5454,8 @@ local function BuildSettings()
     tabFrames[2] = displayTab
 
     local dispScroll, dispContent = CreateScrollableContent(displayTab)
-    -- A slider's SetValue fires its own OnValueChanged, so every handler below
-    -- must honour this or viewing the tab writes every value back out. Extras
-    -- Bar Height is the damaging one: nil there means follow bar height.
+    -- A slider's SetValue fires its own OnValueChanged, so every handler below must
+    -- honour this. Extras Bar Height is the damaging one: nil means follow bar height.
     local dispRefreshing = false
 
     local dispY = 0
@@ -6109,9 +6097,8 @@ local function BuildSettings()
     end)
     AddTogWidget(cdMinDurSlider)
 
-    -- Rune abilities. Only built when the class declares base cooldowns, so no
-    -- other class sees a control that would do nothing. Declared outside the
-    -- branch so the OnShow restore can reach it.
+    -- Rune abilities. Only built when the class declares base cooldowns. Declared
+    -- outside the branch so the OnShow restore can reach it.
     local runeCdCheck
     if CONFIG.runeBaseCooldowns then
         AddTogHeader("Rune Abilities")
@@ -6480,9 +6467,8 @@ local function BuildSettings()
     ieEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
     ieScroll:SetScrollChild(ieEditBox)
 
-    -- A scroll child is only as tall as its content, so an empty box is one
-    -- clickable line. Hand focus over instead. Do not force a height: that
-    -- clips a long export string with no way to scroll to it.
+    -- A scroll child is only as tall as its content, so an empty box is one clickable
+    -- line. Hand focus over instead. Do not force a height: that clips a long export string.
     local function FocusIE()
         ieEditBox:SetFocus()
     end

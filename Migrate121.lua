@@ -1,6 +1,5 @@
--- EventHorizon Infall: 12.1 aura timing notice.
--- Shown once, then reachable from the 12.1 Note button in settings.
--- Does not modify the Cooldown Manager.
+-- EventHorizon Infall: 12.1 aura timing notice. Shown once, then reachable from
+-- the 12.1 Note button in settings. Does not modify the Cooldown Manager.
 
 local ns = EventHorizon_Infall
 local M = {}

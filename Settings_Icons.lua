@@ -1,6 +1,5 @@
 -- EventHorizon Infall: Icons settings tab.
--- Same shape as the Bars tab: a framed list on top, a framed pool below, sub
--- tabs across the top. Pairing writes the same CONFIG.buffMappings Bars does.
+-- Same shape as the Bars tab; pairing writes the same CONFIG.buffMappings.
 
 local ns = EventHorizon_Infall
 local CONFIG = ns.CONFIG
@@ -162,9 +161,8 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
 
     local refreshing = false
 
-    -- Every refresher goes through here. Setting a widget fires its handler,
-    -- and handlers save. Nested, and restored through a pcall: a throw would
-    -- otherwise strand the flag and leave the whole tab read only.
+    -- Every refresher goes through here: setting a widget fires its handler, and
+    -- handlers save. Nested, and restored through a pcall, or a throw strands the flag.
     local function Repopulate(fn)
         local was = refreshing
         refreshing = true
@@ -257,11 +255,8 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         return CONFIG.iconGlow ~= false
     end
 
-        -- One builder for the general panel and for every accordion. scopeFn returns
-    -- nil for the general settings or the entry being overridden. Checkboxes on
-    -- one line, the opacity slider on the next, because a full width slider does
-    -- not fit beside four checkboxes and a cramped row is what forced the old
-    -- typed percent box.
+        -- One builder for the general panel and every accordion. scopeFn returns nil for
+        -- the general settings, or the entry being overridden.
     local function BuildStateGroup(parent, startY, scopeFn, width)
         local checks, sliders, y = {}, {}, startY
 
@@ -425,19 +420,16 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         return y, Reload
     end
 
-    -- States, Text and Colours behind one strip. Identical in the general panel
-    -- and in every accordion, so the two can never drift apart.
-    -- States, Cooldown and Buff. A state that draws a sweep and a countdown owns
-    -- both, so its colour sits with its text instead of in a separate Colours
-    -- page that held two swatches and made you guess which belonged to which.
+    -- States, Text and Colours behind one strip, identical in the general panel and in
+    -- every accordion. A state that draws a sweep and a countdown owns both, so its
+    -- colour sits with its text.
     local function BuildLookPages(parent, startY, scopeFn, width)
         local strip = CreateFrame("Frame", nil, parent)
         strip:SetSize(width, 24)
         strip:SetPoint("TOPLEFT", parent, "TOPLEFT", 10, -startY)
 
-        -- The panel top runs UNDER the tabs, not below them. A tab that merely
-        -- touches the edge reads as a button sitting on a box; overlapping is what
-        -- makes it read as one piece of card, and it is what the main tab bar does.
+        -- The panel top runs UNDER the tabs, not below them. Overlapping is what makes it
+        -- read as one piece of card, and it is what the main tab bar does.
         local box = StyleAsPanel(CreateFrame("Frame", nil, parent, "BackdropTemplate"))
         box:SetPoint("TOPLEFT", parent, "TOPLEFT", 8, -(startY + 21))
         box:SetPoint("RIGHT", parent, "RIGHT", -8, 0)
@@ -732,11 +724,8 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
     local listPanel = StyleAsPanel(CreateFrame("Frame", nil, iconsTab, "BackdropTemplate"))
     listPanel:SetPoint("TOPLEFT", 0, 0)
     listPanel:SetPoint("RIGHT", 0, 0)
-    -- Chosen so the pool below starts at the same height as the Bars tab's:
-    -- its instruction block is 92 and its rows panel 250, mine are 68 plus a
-    -- 30px sub tab row, so the list has to give back the difference.
-    -- 20px taller than the figure that matched the Bars pool exactly, which is
-    -- what the strip selector under the title costs. The pool below gives it up.
+    -- Chosen so the pool below starts at the same height as the Bars tab's, plus the
+    -- 20px the strip selector under the title costs. The pool below gives it up.
     listPanel:SetHeight(220)
     PanelTitle(listPanel, "On The Strip")
 
@@ -914,11 +903,9 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         return nil
     end
 
-    -- One movable window per icon, several at once, so two can be compared side
-    -- by side. Keyed by the entry table, not by cooldownID: the same ability can
-    -- sit on more than one strip, and those are different icons with different
-    -- settings. A row index would not do either, because reordering must not
-    -- repoint an open window.
+    -- One movable window per icon, several at once. Keyed by the entry table, not by
+    -- cooldownID or row index: the same ability can sit on more than one strip, and
+    -- reordering must not repoint an open window.
     local function OpenIconModal(entry)
         if not entry then return nil end
         local cdID = entry.cooldownID or entry.key
@@ -1285,7 +1272,7 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
 
     -- The data provider reflects where the player actually put things.
     -- GetCooldownViewerCategorySet reports STATIC DEFAULTS, so anything dragged
-    -- to another section, potions and healthstones especially, never showed up.
+    -- to another section, potions especially, never showed up.
     local function CategoryIDs(cat)
         local shown = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(cat)
         if shown and #shown > 0 then return shown end
