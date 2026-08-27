@@ -108,6 +108,99 @@ local function ApplyTextStyle(fs, tcfg, anchorTo)
         TextField(tcfg, "offsetX"), TextField(tcfg, "offsetY"))
 end
 
+-- The engine draws the countdown, so its face comes from a named font object and
+-- never from a FontString. One object per icon, created on first restyle.
+local countdownFonts = 0
+
+local function StyleCountdown(ic, tcfg, cfg)
+    if not ic.cd.SetCountdownFont then return end
+
+    local base   = CountdownFont(cfg)
+    local path   = TextField(tcfg, "font")
+    local size   = TextField(tcfg, "size")
+    local flags  = TextField(tcfg, "flags")
+    local color  = TextField(tcfg, "color")
+    local anchor = TextField(tcfg, "anchor")
+    local rel    = TextField(tcfg, "relPoint")
+    local offX   = TextField(tcfg, "offsetX")
+    local offY   = TextField(tcfg, "offsetY")
+
+    -- Only the face is guarded: swapping a font object relayouts the string, and
+    -- a new cooldown reasserts Blizzard's own placement, so colour and points are
+    -- reapplied every pass the way the other two strings already are.
+    local sig = base .. "|" .. tostring(path) .. "|" .. tostring(size) .. "|" .. tostring(flags)
+    if ic.cdFaceSig ~= sig then
+        ic.cdFaceSig = sig
+        if not path and not size and not flags then
+            pcall(ic.cd.SetCountdownFont, ic.cd, base)
+        else
+            if not ic.cdFontName then
+                countdownFonts = countdownFonts + 1
+                ic.cdFontName = "EHInfallIconCountdown" .. countdownFonts
+                CreateFont(ic.cdFontName)
+            end
+            local fo, baseObj = _G[ic.cdFontName], _G[base]
+            local bF, bS, bFl = "Fonts\\FRIZQT__.TTF", 12, "OUTLINE"
+            if baseObj and baseObj.GetFont then
+                local gF, gS, gFl = baseObj:GetFont()
+                bF, bS, bFl = gF or bF, gS or bS, gFl or bFl
+            end
+            if fo then
+                -- SetFont reports a bad path by returning false rather than
+                -- erroring, and leaves the object with no face at all.
+                local okSet, took = pcall(fo.SetFont, fo, path or CONFIG.font or bF,
+                    size or bS, flags or bFl)
+                if okSet and took == false then
+                    pcall(fo.SetFont, fo, bF, size or bS, flags or bFl)
+                end
+                pcall(ic.cd.SetCountdownFont, ic.cd, ic.cdFontName)
+            end
+        end
+    end
+
+    -- The font object is inherited, so the engine can re-derive from it on any
+    -- update. Setting the string itself wins and is what the other two use.
+    if not ic.cd.GetCountdownFontString then return end
+    local ok, fs = pcall(ic.cd.GetCountdownFontString, ic.cd)
+    if not ok or not fs then return end
+    if path or size or flags then
+        local cF, cS, cFl = fs:GetFont()
+        local wantF = path or CONFIG.font or cF
+        local wantS = size or cS
+        local wantFl = flags or cFl
+        -- Never gate this on GetFont alone. SetCountdownFont above makes the
+        -- string INHERIT the font object, so GetFont reports the wanted values
+        -- straight back while the engine still draws its own derived size, and
+        -- the raw call that would have won never runs. Driven off our own
+        -- intent instead, and repeated whenever the engine disagrees.
+        if ic.cdFSSig ~= sig or cF ~= wantF or cS ~= wantS or cFl ~= wantFl then
+            ic.cdFSSig = sig
+            local okSet, took = pcall(fs.SetFont, fs, wantF, wantS, wantFl)
+            if okSet and took == false and wantF ~= cF then
+                pcall(fs.SetFont, fs, cF, wantS, wantFl)
+            end
+        end
+    else
+        -- A raw SetFont on the string is permanent. SetCountdownFont above only
+        -- swaps the object it INHERITS from, so a state carrying no text of its
+        -- own would keep wearing whatever the last styled state left behind.
+        local bObj = _G[base]
+        if bObj and bObj.GetFont then
+            local bF, bS, bFl = bObj:GetFont()
+            local cF, cS, cFl = fs:GetFont()
+            if bF and (cF ~= bF or cS ~= bS or cFl ~= bFl) then
+                pcall(fs.SetFont, fs, bF, bS, bFl)
+            end
+        end
+    end
+    fs:SetTextColor(color[1], color[2], color[3], color[4] or 1)
+    fs:ClearAllPoints()
+    -- Anchored to the Cooldown widget, never to the icon. Anchor it anywhere else
+    -- and the engine re-centres it and re-derives its size from the host frame,
+    -- which silently discards both the offsets and the font.
+    fs:SetPoint(anchor, ic.cd, rel, offX, offY)
+end
+
 -- How much room the strip takes on an edge before the pips start, which is
 -- nothing unless it is set to sit inside them.
 function ICON.GetEdgeHeight(position)
@@ -141,26 +234,44 @@ end
 local ruleScratch = {}
 local textScratch = {}
 
+-- Text only, never the rest of a state. A charge recharging draws the same
+-- number as a cooldown does, so it follows the Cooldown page unless it has been
+-- given text of its own. Desaturation and opacity stay independent, which is the
+-- whole reason the two states are separate.
+local TEXT_INHERIT = { recharging = "cooldown" }
+
 local function RulesFor(entry, state)
     local def = STATE_DEFAULTS[state]
     local global = CONFIG.iconStates and CONFIG.iconStates[state]
     local per = entry.states and entry.states[state]
-    if not global and not per then return def end
+
+    local gText = global and global.text
+    local pText = per and per.text
+    local src = TEXT_INHERIT[state]
+    if src and not gText and not pText then
+        local g2 = CONFIG.iconStates and CONFIG.iconStates[src]
+        local p2 = entry.states and entry.states[src]
+        gText = g2 and g2.text
+        pText = p2 and p2.text
+    end
+
+    if not global and not per and not gText and not pText then return def end
 
     for k, v in pairs(def) do ruleScratch[k] = v end
     if global then for k, v in pairs(global) do ruleScratch[k] = v end end
     if per then for k, v in pairs(per) do ruleScratch[k] = v end end
 
+    -- Only count carries a default text table, so any other state with no text of
+    -- its own kept whatever the previous lookup left here. count is the last
+    -- lookup of every paint, which is how its font reached every other state.
+    ruleScratch.text = def.text
+
     -- text is a table, so a plain overwrite would drop every field the per icon
     -- copy does not set and silently lose the general font behind one colour.
-    if global and global.text or per and per.text then
+    if gText or pText then
         wipe(textScratch)
-        if global and global.text then
-            for k, v in pairs(global.text) do textScratch[k] = v end
-        end
-        if per and per.text then
-            for k, v in pairs(per.text) do textScratch[k] = v end
-        end
+        if gText then for k, v in pairs(gText) do textScratch[k] = v end end
+        if pText then for k, v in pairs(pText) do textScratch[k] = v end end
         ruleScratch.text = textScratch
     end
 
@@ -248,11 +359,15 @@ local function ResolveEntry(cooldownID)
 
     local base = info.spellID
     local live = info.overrideTooltipSpellID or info.overrideSpellID or base
+    -- A bag item has no spellID; the category reports whichever item last
+    -- started a cooldown there. That id is secret in any combat. It still drives
+    -- a sweep, but can never key a table or be compared.
     if not live and info.spellCategoryID and C_Spell.GetLastCategoryCooldownSource then
         local sOk, sID = pcall(C_Spell.GetLastCategoryCooldownSource, info.spellCategoryID)
-        if sOk and sID then live = sID end
+        if sOk and sID ~= nil then live = sID end
     end
-    return info, live, base
+    if live ~= nil and issecretvalue(live) then return info, nil, base, live end
+    return info, live, base, live
 end
 
 -- Presence is a nil check on auraInstanceID, never a comparison. Keyed on the
@@ -287,6 +402,24 @@ local containerFrames = {}   -- [key] = frame
 local iconPool = {}          -- [key] = { icon frames }
 local lastSignature = {}     -- [key] = string, so geometry only runs on a change
 local eventFrame
+local deferFrame              -- one shot, armed by Show, disarms itself on run
+local deferRelayout = false
+local deferRefeed = false
+
+-- Only these can change a cooldown's DURATION, so only these justify re-feeding
+-- the Cooldown frame. Every other registered event still repaints, because state
+-- can change, but a re-feed on them restarts the swipe for nothing.
+--
+-- A cooldown STARTING is not missed by this: the feed also runs whenever the frame
+-- is not already showing, which is exactly the start case.
+local REFEED_EVENTS = {
+    SPELL_UPDATE_COOLDOWN = true,
+    SPELL_UPDATE_CHARGES = true,
+    COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED = true,
+    COOLDOWN_VIEWER_DATA_LOADED = true,
+    TRAIT_CONFIG_UPDATED = true,
+    PLAYER_ENTERING_WORLD = true,
+}
 local refreshRetryQueued = false
 local animating = false
 
@@ -325,7 +458,11 @@ local function GetIcon(key, index)
     ic.cd:SetAllPoints()
     ic.cd:SetDrawEdge(false)
     ic.cd:SetDrawBling(false)
-    ic.cd.wantsFont = true
+    -- Blizzard suppresses the number on short cooldowns, which is most of what a
+    -- rotational strip shows.
+    if ic.cd.SetMinimumCountdownDuration then
+        ic.cd:SetMinimumCountdownDuration(0)
+    end
 
     -- Radial StatusBar fed the CDM bar's values straight through. Marks the
     -- REMAINING arc: inverting it would mean subtracting from a secret.
@@ -441,19 +578,209 @@ end
 
 -- Paint
 
+-- INSTRUMENTATION, remove before release. A flash is a one frame swap between a
+-- state that draws greyed and one that does not. Both directions are recorded,
+-- because which way it goes is part of what this is meant to establish.
+--
+-- `fed` is the discriminator: "cd-err" or "cd-nil" means a failed read cleared a
+-- running cooldown, "cd" with shown=false means clearIfZero fired on a zero span,
+-- and buffed=true means a pooled buff frame reported an aura.
+local DESATURATED = { cooldown = true, unusable = true }
+-- Rolling, not first-N. A capped log that keeps the EARLIEST rows fills with the
+-- first minute and then silently drops the event actually worth seeing. Rows carry
+-- `t` and `serial`, so wrap order costs nothing: sort them on the way out.
+local flashLogCap = 300
+local flashLogNext = 0
+local sampleCap = 60
+local sampleNext = 0
+
+-- Every row carries the paint pass it happened in. Rows sharing a serial flipped
+-- in the SAME frame, which separates a global cause, an event pass or a layout
+-- rebuild hitting every icon at once, from a defect specific to one spell.
+local paintSerial = 0
+local flashThisPass = 0
+local lastBurstAt = 0
+local logsCleared = false
+
+-- Which events drove this pass. The deferral means the paint happens a frame
+-- after the event, so the names are carried rather than read at paint time.
+local pendingEvents = {}
+local passEvents = "?"
+
+-- A re-feed on a cooldown that was ALREADY running restarts the swipe without any
+-- state change, which is the only per-pass write not derived from `state`. Counted
+-- per driving event, because the fix is to stop re-feeding for events that cannot
+-- have changed a cooldown.
+-- Counters live in plain locals: incrementing a saved table once per icon per
+-- paint is 20Hz times the strip size for no benefit. Flushed once per pass by
+-- FlushCounters below. Run two produced no flashLog2 at all, which proved a
+-- condition never held but not which one, hence counting all four separately.
+local cPaints, cRefed, cShown, cUnchanged, cHits = 0, 0, 0, 0, 0
+local hitsThisPass = 0
+local pendingSample
+
+local function NotePaint(entry, wasShown, unchanged, refed)
+    cPaints = cPaints + 1
+    if refed then cRefed = cRefed + 1 end
+    if wasShown then cShown = cShown + 1 end
+    if unchanged then cUnchanged = cUnchanged + 1 end
+    if not (wasShown and unchanged and refed) then return end
+    cHits = cHits + 1
+    hitsThisPass = hitsThisPass + 1
+    if not pendingSample then pendingSample = entry.cooldownID or true end
+end
+
+local function FlushCounters()
+    if cPaints == 0 then return end
+    local db = InfallDB.flashLog2
+    if not db then
+        db = { events = {}, samples = {}, counts = {} }
+        InfallDB.flashLog2 = db
+    end
+    local c = db.counts
+    c.paints, c.refed, c.wasShown, c.unchanged, c.hits =
+        cPaints, cRefed, cShown, cUnchanged, cHits
+    if pendingSample then
+        db.events[passEvents] = (db.events[passEvents] or 0) + 1
+        sampleNext = sampleNext + 1
+        if sampleNext > sampleCap then sampleNext = 1 end
+        do
+            db.samples[sampleNext] = { t = GetTime(), serial = paintSerial,
+                cooldownID = pendingSample ~= true and pendingSample or nil,
+                events = passEvents,
+                combat = InCombatLockdown() and true or false }
+        end
+        pendingSample = nil
+    end
+end
+
+local function RecordFlash(ic, entry, state, fed, unusable, hasCharges, buffed, glowing)
+    local prev = ic._ehPrevState
+    ic._ehPrevState = state
+    if not prev or prev == state then return end
+    if DESATURATED[prev] == DESATURATED[state] then return end
+
+    flashThisPass = flashThisPass + 1
+    InfallDB.flashLog = InfallDB.flashLog or {}
+    local log = InfallDB.flashLog
+    flashLogNext = flashLogNext + 1
+    if flashLogNext > flashLogCap then flashLogNext = 1 end
+    log[flashLogNext] = {
+        t          = GetTime(),
+        serial     = paintSerial,
+        cooldownID = entry.cooldownID,
+        from       = prev,
+        to         = state,
+        fed        = fed,
+        shown      = ic.cd:IsShown() and true or false,
+        spellCd    = spellOnCd and true or false,
+        unusable   = unusable and true or false,
+        hasCharges = hasCharges and true or false,
+        buffed     = buffed and true or false,
+        glowing    = glowing and true or false,
+        combat     = InCombatLockdown() and true or false,
+    }
+end
+
 -- True on an event-driven pass. Duration objects get a fresh pointer per call,
 -- so feeding every frame would restart the swipe; event passes re-feed for CDR.
 local refeedCooldowns = true
 
+-- Longest a running cooldown can show a stale duration after cooldown reduction.
+-- Cheap to lower if CDR ever looks laggy on the strip.
+local REFEED_THROTTLE = 0.4
+
+-- How long IsSpellUsable must keep saying "no" before the icon is dimmed. The
+-- artefact it filters lasts 0.02 to 0.07s measured, so this has room either way.
+local UNUSABLE_HOLD = 0.15
+
+-- isOnGCD carries "do not trust this field unless responding to a
+-- SPELL_UPDATE_COOLDOWN event", so it is sampled INSIDE that event and cached,
+-- never read from the deferred paint. Reading it late produced a documented
+-- isActive/isOnGCD race: 67 one frame flickers in 24 minutes, seven icons at a
+-- time. Sampling at the event is also 3.6x CHEAPER, because a paint happens far
+-- more often than a cooldown event.
+--
+-- Expiry does NOT need an event. The cached flag answers "is this a real cooldown
+-- rather than the GCD"; ic.cd:IsShown() answers "is it still running", live and
+-- free. Neither question is asked of the wrong source.
+local trackedSpells = {}   -- [spellID] = true, every spell the strip is drawing
+local cdState = {}         -- [spellID] = true when a real, non-GCD cooldown runs
+local chargeState = {}     -- [spellID] = isActive, or nil when not a charge spell
+
+local function SampleSpell(sid)
+    local ok, cd = pcall(C_Spell.GetSpellCooldown, sid)
+    cdState[sid] = (ok and cd and cd.isActive and not cd.isOnGCD) and true or nil
+
+    chargeState[sid] = nil
+    if C_Spell.GetSpellCharges then
+        local okC, ci = pcall(C_Spell.GetSpellCharges, sid)
+        if okC and ci and ci.maxCharges ~= nil
+            and not issecretvalue(ci.maxCharges) and ci.maxCharges > 1 then
+            chargeState[sid] = ci.isActive and true or false
+        end
+    end
+end
+
+-- Called from the event handler, before the paint is deferred.
+local function SampleTrackedSpells()
+    for sid in pairs(trackedSpells) do SampleSpell(sid) end
+end
+
 -- Returns shown, live. `live` means something moves with no event behind it.
 local function PaintIcon(ic, entry, cfg)
-    local info, spellID, baseSpellID
+    -- spellID keys tables and drives comparisons, so it is nil for an item entry
+    -- in combat. feedID is the same id without that guarantee: sweeps and usable
+    -- reads take it, because those APIs accept secret arguments.
+    local info, spellID, baseSpellID, feedID
     if entry.cooldownID then
-        info, spellID, baseSpellID = ResolveEntry(entry.cooldownID)
+        info, spellID, baseSpellID, feedID = ResolveEntry(entry.cooldownID)
     end
 
+    -- One live read of the charge mechanic, shared by the feed below and the state
+    -- chain. maxCharges is static and non-secret, so this is safe in an instance.
+    -- Both used to answer this question from different sources, the feed live and
+    -- the state from InfallDB.chargeSpells, and whenever the two disagreed the
+    -- icon was fed a charge sweep while being painted as a plain cooldown.
+    -- First sight of a spell samples it immediately, so an icon is never drawn from
+    -- an empty cache; after that the event handler keeps it current.
+    if spellID and not trackedSpells[spellID] then
+        trackedSpells[spellID] = true
+        SampleSpell(spellID)
+    end
+
+    -- chargeActive answers "is a recharge in flight", which is NOT the same question
+    -- as the spell's own cooldown: at 1 of 2 a charge is recharging while the spell
+    -- itself is castable and has no cooldown at all.
+    local hasCharges = spellID ~= nil and chargeState[spellID] ~= nil
+    local chargeActive = hasCharges and chargeState[spellID] == true
+
     -- Feed the cooldown first: the state test reads this frame's IsShown().
-    if spellID and (refeedCooldowns or not ic.cd:IsShown()) then
+    -- `fed` is instrumentation: it separates "the API said no cooldown" from "the
+    -- API did not answer", which this branch currently treats identically.
+    local fed = "skip"
+    -- INSTRUMENTATION: captured before the feed, because the feed is what changes it.
+    local wasShown = ic.cd:IsShown()
+    -- One reading for the whole paint: the throttle and both holds must agree on
+    -- when "now" is, and three separate GetTime calls invite an off by a frame bug.
+    local now = GetTime()
+
+    -- A cooldown that is NOT running is always fed: that is how one starts, and it
+    -- must never be delayed. A cooldown that IS running only gets re-fed on a
+    -- throttle, because the sole reason to re-feed it is to pick up cooldown
+    -- reduction, and SPELL_UPDATE_COOLDOWN fires on every GCD with no payload
+    -- saying which spell moved. Re-feeding restarts the swipe, so the unthrottled
+    -- version paid a restart per icon per event to catch a rare CDR proc.
+    local refeedNow = refeedCooldowns
+    if refeedNow and wasShown then
+        if (ic._ehNextRefeed or 0) > now then
+            refeedNow = false
+        else
+            ic._ehNextRefeed = now + REFEED_THROTTLE
+        end
+    end
+
+    if feedID and (refeedNow or not wasShown) then
         -- ignoreGCD returns the real cooldown and a zero span during a pure GCD.
         -- Per entry, falling back to the general setting.
         local ignoreGCD = entry.ignoreGCD
@@ -462,17 +789,16 @@ local function PaintIcon(ic, entry, cfg)
         -- A charge spell's own cooldown is zero while a charge is spare, so the charge
         -- duration is what the entry shows. Zero-span at full charges, which clearIfZero handles.
         local durObj
-        if C_Spell.GetSpellChargeDuration then
-            local okC, info = pcall(C_Spell.GetSpellCharges, spellID)
-            if okC and info and info.maxCharges ~= nil
-                and not issecretvalue(info.maxCharges) and info.maxCharges > 1 then
-                local okD, d = pcall(C_Spell.GetSpellChargeDuration, spellID)
-                if okD then durObj = d end
-            end
+        if hasCharges and C_Spell.GetSpellChargeDuration then
+            local okD, d = pcall(C_Spell.GetSpellChargeDuration, feedID)
+            if okD then durObj = d end
         end
-        if durObj == nil then
-            local ok, d = pcall(C_Spell.GetSpellCooldownDuration, spellID, ignoreGCD)
+        if durObj then
+            fed = "charge"
+        else
+            local ok, d = pcall(C_Spell.GetSpellCooldownDuration, feedID, ignoreGCD)
             if ok then durObj = d end
+            fed = ok and (d and "cd" or "cd-nil") or "cd-err"
         end
 
         if durObj then
@@ -480,7 +806,8 @@ local function PaintIcon(ic, entry, cfg)
         else
             ic.cd:SetCooldown(0, 0)
         end
-    elseif not spellID then
+    elseif not feedID then
+        fed = "nospell"
         ic.cd:SetCooldown(0, 0)
     end
 
@@ -504,17 +831,83 @@ local function PaintIcon(ic, entry, cfg)
     -- Never a charge count test; currentCharges is secret.
     local unusable = false
     pcall(function()
-        local u = C_Spell.IsSpellUsable(spellID)
+        local u = C_Spell.IsSpellUsable(feedID)
         if u ~= nil and not issecretvalue(u) and u == false then unusable = true end
     end)
+
+    -- MEASURED 2026-08-23 over 23 minutes of dungeon: IsSpellUsable reports every
+    -- utility spell unusable simultaneously for two frames at a time, then takes it
+    -- back. Thirteen icons at once, 0.02 to 0.07s apart, about nine times. Painting
+    -- that verbatim is the flicker, because `unusable` is the only state that drops
+    -- opacity, so the whole strip dims and returns.
+    --
+    -- So a spell must STAY unusable before it is drawn that way. A real one holds
+    -- for as long as the reason holds; the artefact never survives the window.
+    -- Returning live keeps the tick alive so the pending decision resolves even if
+    -- no further event arrives.
+    local unusablePending = false
+    if unusable then
+        ic._unusableSince = ic._unusableSince or now
+        if now - ic._unusableSince < UNUSABLE_HOLD then
+            unusable = false
+            unusablePending = true
+        end
+    else
+        ic._unusableSince = nil
+    end
+
+    -- Exclude the global cooldown EXPLICITLY, never by asking the API to do it.
+    -- GetSpellCooldownDuration's ignoreGCD returned GCD length sweeps anyway:
+    -- measured over a raid, six utility icons went ready -> cooldown -> ready
+    -- together 27 times, 0.02 to 0.83s, while the shortest real cooldown in the
+    -- same log was 8.6s. A time based filter cannot separate those without
+    -- delaying every real cooldown by a second, which is worse than the flash.
+    --
+    -- isActive and isOnGCD both carry NeverSecret in Blizzard's own annotations,
+    -- so this is safe bare under restriction. Only startTime, duration and modRate
+    -- on that structure are secret; do not touch them here.
+    --
+    -- spellID, not baseSpellID: ResolveEntry already resolved the override, and a
+    -- transform's real cooldown ticks on the override id while the base id reports
+    -- isOnGCD for that whole duration and would suppress the sweep throughout.
+    -- Cached flag says it is a real cooldown and not the GCD; IsShown says it is
+    -- still running. Both are needed: the flag alone goes stale when a cooldown
+    -- expires with no event, and IsShown alone cannot tell a GCD from a cooldown.
+    -- An item entry has no cdState sample, because sampling keys a table and its
+    -- id is secret. Its sweep is fed with ignoreGCD, so IsShown is already free
+    -- of the GCD and answers the question on its own.
+    local cdKnown = (spellID ~= nil and cdState[spellID] == true)
+        or (spellID == nil and feedID ~= nil)
+    local spellOnCd = cdKnown and ic.cd:IsShown()
+
+    -- Two different questions, and conflating them is what put charge spells in the
+    -- wrong state twice already. A charge spell shows a sweep whenever a recharge is
+    -- in flight, INCLUDING at 1 of 2 where the spell itself has no cooldown. Its own
+    -- cooldown running means every charge is spent, which is the greyed case.
+    local onCooldown = hasCharges and chargeActive or spellOnCd
+    local spent = hasCharges and spellOnCd
+
 
     local state
     if buffFrame then
         state = "buff"
-    elseif ic.cd:IsShown() then
-        -- The sweep is running. If the spell is still castable it is a charge
-        -- recharging with one to spare, which the game itself does not grey out.
-        state = unusable and "cooldown" or "recharging"
+    elseif onCooldown then
+        -- The sweep is running. Recharging is the CHARGE case only: a spell with a
+        -- spare charge, which the game itself does not grey out.
+        --
+        -- The charge test is not optional. Without it a single charge spell flips
+        -- to recharging for one frame every time IsSpellUsable turns true, and
+        -- since recharging is the one state that is NOT desaturated, that reads as
+        -- a full saturation flash on an icon that should have stayed greyed.
+        -- SPELL_UPDATE_USABLE repaints immediately, so target dependent utilities
+        -- did it constantly. hasCharges is the live read taken above, never a
+        -- cached table: the cache only ever held Essential entries, so every
+        -- charge spell outside that category painted as a plain cooldown.
+        --
+        -- `spent` means the spell's own cooldown is running, so every charge is
+        -- gone. 0 of 2 is not castable and greys like any other cooldown; only
+        -- 1 of 2, a recharge with one still in hand, stays bright.
+        state = (unusable or not hasCharges or spent) and "cooldown" or "recharging"
     elseif glowing then
         state = "proc"
     else
@@ -525,6 +918,15 @@ local function PaintIcon(ic, entry, cfg)
         state = forced
         -- Tuning the proc state with nothing procced would show no art at all.
         if forced == "proc" then glowing = true end
+    else
+        -- INSTRUMENTATION, remove before release. Never on a preview pass: a
+        -- forced state is the settings panel talking, not the game.
+        local prevState = ic._ehPrevState
+        RecordFlash(ic, entry, state, fed, unusable, hasCharges,
+            buffFrame ~= nil, glowing)
+        -- refeedNow, not refeedCooldowns: the throttle is part of the decision, and
+        -- reporting the pre-throttle value would credit re-feeds that never ran.
+        NotePaint(entry, wasShown, prevState == state, refeedNow)
     end
 
     local rules = RulesFor(entry, state)
@@ -561,19 +963,22 @@ local function PaintIcon(ic, entry, cfg)
 
     -- Cooldown numbers come from the engine, buff numbers from the mirror.
     local buffSweep = rules.sweep == "buff"
-    if ic.cd.wantsFont and ic.cd.SetCountdownFont then
-        pcall(ic.cd.SetCountdownFont, ic.cd, CountdownFont(cfg))
-    end
+    local tcfg = TextCfg(rules)
+    -- Before StyleCountdown: the countdown FontString does not exist while the
+    -- numbers are hidden, so styling first has nothing to take.
+    ic.cd:SetHideCountdownNumbers(buffSweep or not rules.timer)
+    StyleCountdown(ic, tcfg, cfg)
     ic.cd:SetDrawSwipe(rules.sweep == "cd")
     pcall(ic.cd.SetSwipeColor, ic.cd, unpack(ColorOf(rules, "sweepColor", SWEEP_COLOR_DEFAULT)))
     ic.radialTex:SetColorTexture(unpack(ColorOf(rules, "wedgeColor", WEDGE_COLOR_DEFAULT)))
 
     -- Font settings follow the addon's own picker, falling back to the frame
     -- font so an unset profile still draws.
-    ApplyTextStyle(ic.durText, TextCfg(rules), ic)
-    ic.cd:SetHideCountdownNumbers(buffSweep or not rules.timer)
+    ApplyTextStyle(ic.durText, tcfg, ic)
 
-    local live = false
+    -- A held unusable counts as live: without it the strip could sit on the
+    -- suppressed value until some unrelated event happened to repaint.
+    local live = unusablePending
     local bar = buffSweep and buffFrame and buffFrame.Bar or nil
 
     if forced and buffSweep and not bar then
@@ -775,6 +1180,17 @@ function ICON.Layout()
     local parent = ns.EH_Parent
     if not parent then return end
 
+    -- INSTRUMENTATION, remove before release. Cleared once per session, so each
+    -- run is one dungeon rather than the previous run's rows filling the cap. The
+    -- disk copy written at reload is untouched by this; only the fresh session is.
+    if not logsCleared then
+        logsCleared = true
+        InfallDB.flashLog = nil
+        InfallDB.flashLog2 = nil
+    end
+    paintSerial = paintSerial + 1
+    flashThisPass = 0
+
     -- Visibility comes from the context alphas, not the frame's shown state.
     -- Zero hides outright, so an invisible strip costs no paint pass.
     MigrateContainers()
@@ -803,11 +1219,28 @@ function ICON.Layout()
         end
     end
 
+    -- INSTRUMENTATION, remove before release. Three or more icons swapping
+    -- saturation in one pass is the shape worth seeing live, and the throttle
+    -- keeps a repeating cause from filling chat during a pull.
+    FlushCounters()   -- INSTRUMENTATION, once per pass rather than per icon
+    -- Reports the DEFECT, not state changes. A pull ending flips a dozen icons to
+    -- ready at once and that is legitimate, so counting those told you nothing.
+    -- This counts pointless re-feeds, which the event gate should have stopped.
+    if hitsThisPass >= 3 and GetTime() - lastBurstAt > 10 then
+        lastBurstAt = GetTime()
+        print(string.format("|cff00ff00[Infall]|r wasted re-feed: %d icons, pass %d, from %s",
+            hitsThisPass, paintSerial, passEvents))
+    end
+    hitsThisPass = 0
+
     refeedCooldowns = false
 end
 
 -- Force geometry on the next pass. Sliders call this directly, not debounced.
 function ICON.Relayout()
+    -- The drawn set can change here, so stale ids stop being sampled every event.
+    -- Each surviving icon re-registers on its next paint.
+    wipe(trackedSpells)
     wipe(lastSignature)
     refeedCooldowns = true
     ICON.Layout()
@@ -832,6 +1265,41 @@ local function StartTickIfNeeded()
     end
 end
 
+-- Cooldown, charge and aura events fire while the engine is still reconciling, so
+-- a value read inside the handler can disagree with what the game settles on one
+-- frame later. Painting straight from the event renders that disagreement for a
+-- frame. Reading on the next frame instead gets the settled answer, and several
+-- events arriving together collapse into a single pass.
+--
+-- Only the event path is deferred. Sliders and ICON.Refresh call Layout/Relayout
+-- directly and stay synchronous, so nothing in the settings panel gains lag.
+local function RunDeferredPaint(self)
+    self:Hide()
+    -- INSTRUMENTATION: name the events that drove this pass, sorted so the same
+    -- combination always produces the same key.
+    local seen = {}
+    for k in pairs(pendingEvents) do seen[#seen + 1] = k end
+    table.sort(seen)
+    passEvents = #seen > 0 and table.concat(seen, "+") or "?"
+    wipe(pendingEvents)
+    if deferRelayout then
+        deferRelayout = false
+        deferRefeed = false
+        ICON.Relayout()
+    else
+        refeedCooldowns = deferRefeed
+        deferRefeed = false
+        ICON.Layout()
+    end
+    StartTickIfNeeded()
+end
+
+-- Showing an already shown frame is a no-op, which is what coalesces the pass.
+local function QueuePaint(relayout)
+    if relayout then deferRelayout = true end
+    if deferFrame then deferFrame:Show() end
+end
+
 function ICON.Refresh()
     local on = CONFIG.iconsEnabled and CONFIG.iconContainers and #CONFIG.iconContainers > 0
     if not on then
@@ -840,6 +1308,11 @@ function ICON.Refresh()
         if eventFrame then
             eventFrame:UnregisterAllEvents()
             eventFrame:SetScript("OnUpdate", nil)
+        end
+        -- A queued pass would otherwise paint the strip back after it was disabled.
+        if deferFrame then
+            deferFrame:Hide()
+            deferRelayout = false
         end
         return
     end
@@ -858,17 +1331,24 @@ function ICON.Refresh()
             return
         end
         eventFrame = CreateFrame("Frame")
+        -- Created here, beside the event frame, so neither is ever built in combat.
+        deferFrame = CreateFrame("Frame")
+        deferFrame:Hide()
+        deferFrame:SetScript("OnUpdate", RunDeferredPaint)
         eventFrame:SetScript("OnEvent", function(_, event)
+            pendingEvents[event] = true   -- INSTRUMENTATION
+            if REFEED_EVENTS[event] then
+                deferRefeed = true
+                -- Sampled HERE, synchronously inside the event, because isOnGCD is
+                -- only trustworthy while responding to it. The paint is a frame
+                -- later and must never read it itself.
+                SampleTrackedSpells()
+            end
             -- Sizes are multiples of a physical pixel, so a resolution or scale
             -- change invalidates geometry that no other event would touch.
-            if event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED"
-                or event == "PLAYER_REGEN_ENABLED" then
-                ICON.Relayout()
-            else
-                refeedCooldowns = true
-                ICON.Layout()
-            end
-            StartTickIfNeeded()
+            QueuePaint(event == "UI_SCALE_CHANGED"
+                or event == "DISPLAY_SIZE_CHANGED"
+                or event == "PLAYER_REGEN_ENABLED")
         end)
     end
 

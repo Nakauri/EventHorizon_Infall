@@ -121,6 +121,10 @@ ns.CONFIG = {
     smoothBars = false,
     showPastBars = true,
     forceViewersAlways = true,
+    -- Off by default and read as opt-in, never as "on unless disabled". Pairing a
+    -- row to the wrong Cooldown Manager entry lights an icon on someone else's
+    -- aura, and a wrong guess is worse than an empty pairing the player fills in.
+    autoPairBuffs = false,
     stackIndicators = false,
     -- ApplyProfile skips nil keys, so a toggle with no default sticks at its last
     -- value for any profile seeded before it existed.
@@ -238,6 +242,7 @@ end
 -- so read only when it is already built. Never call an accessor.
 
 local orderCache = {}
+local unknownOrderCache = {}
 
 local function CleanProvider()
     local settings = CooldownViewerSettings
@@ -297,22 +302,43 @@ end
 
 -- The player's real order, or nil if neither source can answer.
 -- Callers fall back to GetCooldownViewerCategorySet, which is static defaults.
-function ns.OrderedCooldownIDs(category)
+--
+-- allowUnknown includes entries the player has not learned. Those are the
+-- greyed rows in the Cooldown Manager, and a multi variant spell parks one
+-- there whenever the variant naming the entry is not the talented one. The
+-- live viewer never draws them, so that request answers from the provider or
+-- not at all; a viewer answer would look complete while missing exactly them.
+function ns.OrderedCooldownIDs(category, allowUnknown)
+    local cache = allowUnknown and unknownOrderCache or orderCache
     local dp = CleanProvider()
     if dp then
-        local ok, ids = pcall(dp.GetOrderedCooldownIDsForCategory, dp, category)
+        local ok, ids = pcall(dp.GetOrderedCooldownIDsForCategory, dp, category, allowUnknown)
         if ok and type(ids) == "table" then
-            orderCache[category] = ids
+            cache[category] = ids
             return ids
         end
     end
+    if allowUnknown then return cache[category] end
     local live = ViewerCooldownIDs(category)
     if live then
-        orderCache[category] = live
+        cache[category] = live
         return live
     end
-    return orderCache[category]
+    return cache[category]
 end
+
+-- Identity sets expire with the build. The order caches are deliberately NOT
+-- wiped: they are the last known good answer, and emptying them on the events
+-- that leave the provider dirty produced phantom rows on a talent swap.
+local cooldownCacheWatcher = CreateFrame("Frame")
+cooldownCacheWatcher:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+cooldownCacheWatcher:RegisterEvent("TRAIT_CONFIG_UPDATED")
+cooldownCacheWatcher:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")
+cooldownCacheWatcher:SetScript("OnEvent", function()
+    if ns.AuraCompat and ns.AuraCompat.ClearIdentityCache then
+        ns.AuraCompat.ClearIdentityCache()
+    end
+end)
 
 -- Custom row and custom icon keys share one keyspace: the key indexes buffMappings,
 -- extraCasts, stackMappings, cooldownColors and customIcons. Generate across both.
@@ -402,4 +428,72 @@ end
 function ns.SnapPx(value, onePx)
     if value == 0 or not onePx or onePx <= 0 then return value end
     return math.floor(value / onePx + 0.5) * onePx
+end
+
+-- Talent tests, cached. Callers sit in per-frame paths and this is a C call, so
+-- it resolves once per talent event and reads a table after that. Talents cannot
+-- change in combat, so there is no in-combat refresh to miss.
+--
+-- ResourceBar keeps its own copy on purpose: it is a shipping file with its own
+-- fallback order and nothing to gain from the move.
+local talentKnown = {}
+
+function ns.IsTalentKnown(talentSpellID)
+    if not talentSpellID then return true end
+    local cached = talentKnown[talentSpellID]
+    if cached ~= nil then return cached end
+
+    local known = false
+    if C_SpellBook and C_SpellBook.IsSpellKnown then
+        local ok, v = pcall(C_SpellBook.IsSpellKnown, talentSpellID)
+        if ok and v then known = true end
+    end
+    if not known and IsPlayerSpell then
+        local ok, v = pcall(IsPlayerSpell, talentSpellID)
+        if ok and v then known = true end
+    end
+    talentKnown[talentSpellID] = known
+    return known
+end
+
+local talentWatcher = CreateFrame("Frame")
+talentWatcher:RegisterEvent("PLAYER_LOGIN")
+talentWatcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+talentWatcher:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+talentWatcher:RegisterEvent("TRAIT_CONFIG_UPDATED")
+talentWatcher:RegisterEvent("PLAYER_TALENT_UPDATE")
+talentWatcher:SetScript("OnEvent", function()
+    wipe(talentKnown)
+    if ns.RefreshStackIndicatorGates then ns.RefreshStackIndicatorGates() end
+end)
+
+-- Fonts shipped with the addon. Listed directly in the picker so they work with no
+-- library present, and also registered with LibSharedMedia when it exists so other
+-- addons can reach them. Both used to arrive with Details and Plater; turning those
+-- off took them out of every picker that reads shared media.
+ns.BUNDLED_FONTS = {
+    { name = "Accidental Presidency",
+      path = [[Interface\AddOns\EventHorizon_Infall\fonts\Accidental Presidency.ttf]] },
+    { name = "Expressway",
+      path = [[Interface\AddOns\EventHorizon_Infall\fonts\Expressway.ttf]] },
+}
+
+local function RegisterBundledFonts()
+    local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
+    if not LSM then return false end
+    for _, f in ipairs(ns.BUNDLED_FONTS) do
+        LSM:Register("font", f.name, f.path)
+    end
+    return true
+end
+
+-- LibSharedMedia arrives from whichever addon embeds it and load order is not
+-- guaranteed, so try now and again once everything has loaded.
+if not RegisterBundledFonts() then
+    local fontWatcher = CreateFrame("Frame")
+    fontWatcher:RegisterEvent("PLAYER_LOGIN")
+    fontWatcher:SetScript("OnEvent", function(self)
+        self:UnregisterAllEvents()
+        RegisterBundledFonts()
+    end)
 end

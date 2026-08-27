@@ -16,7 +16,7 @@ local TOGGLE_KEYS = {
     "hideEssentialCD", "hideUtilityCD", "hideBuffIconCD", "hideBuffBarCD",
     "buffLayerAbove", "hideIcons", "clickthrough",
     "showVariantNames", "smoothBars", "showPastBars",
-    "forceViewersAlways", "stackIndicators",
+    "forceViewersAlways", "autoPairBuffs", "stackIndicators",
     "showCooldownDuration", "estimateRuneCooldowns",
     "iconsEnabled", "iconIgnoreGCD", "iconGlow", "castSpark", "castSparkMatchCast",
 }
@@ -71,8 +71,228 @@ local function DebouncedApplyAndSave(extraFn)
 end
 
 
+-- Search order is load bearing. Only a Tracked Bars entry (3) carries a .Bar,
+-- and a .Bar is the only thing an icon wedge can mirror. Tracked Buffs (2) has
+-- none, and a self mapping resolves to the ability's own cooldown frame, which
+-- has none either. Reorder this and every wedge silently stops drawing.
+-- Utility is deliberately absent: it would match every entry against itself.
+local BUFF_SEARCH_CATEGORIES = { 3, 2 }
+
+-- nil from OrderedCooldownIDs means the layout could not be read, which is not
+-- the same as an empty category. Static defaults still answer, but they miss
+-- anything the player dragged, so the caller is told the read is not trustworthy.
+local function CategoryEntryIDs(category, allowUnknown)
+    local ids = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(category, allowUnknown)
+    if type(ids) == "table" then return ids, true end
+    local ok, set = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category,
+        allowUnknown and true or false)
+    return (ok and set) or {}, false
+end
+
+-- Indexed by every spell id the entry can present, not just its base. A buff
+-- whose entry names a variant the player has not talented is still the buff
+-- the ability applies, and the base alone never matches it. Unlearned entries
+-- are included for the same reason: that is where those variants sit.
+-- Maps a spell id to EVERY entry that can present it, in category order. Only
+-- one of them is ever fed, and which one is not knowable from config, so lane
+-- resolution walks the list and takes the first with a live aura.
+local function BuffEntryBySpell(categories)
+    local bySpell, trusted = {}, true
+    for _, cat in ipairs(categories) do
+        local ids, ok = CategoryEntryIDs(cat, true)
+        if not ok then trusted = false end
+        for _, bcdID in ipairs(ids) do
+            local identity = ns.AuraCompat and ns.AuraCompat.IdentityIDsForCooldown(bcdID)
+            if identity then
+                for _, sid in ipairs(identity) do
+                    local list = bySpell[sid]
+                    if not list then
+                        bySpell[sid] = { bcdID }
+                    else
+                        local seen = false
+                        for _, existing in ipairs(list) do
+                            if existing == bcdID then seen = true break end
+                        end
+                        if not seen then list[#list + 1] = bcdID end
+                    end
+                end
+            end
+        end
+    end
+    return bySpell, trusted
+end
+
+-- Every entry id that could carry this cooldown's aura, in category order.
+local function BuffEntriesFor(bySpell, cooldownID)
+    local identity = ns.AuraCompat and ns.AuraCompat.IdentityIDsForCooldown(cooldownID)
+    if not identity then return nil end
+    local out, seen = {}, {}
+    for _, sid in ipairs(identity) do
+        local list = bySpell[sid]
+        if list then
+            for _, bcdID in ipairs(list) do
+                if not seen[bcdID] then
+                    seen[bcdID] = true
+                    out[#out + 1] = bcdID
+                end
+            end
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+-- Which unit carries the aura, asked of the BUFF and not the ability: a harmful
+-- ability can grant a buff that sits on the player. Falls back to the ability
+-- only when the buff entry cannot be read.
+local function MappingUnitFor(buffCooldownID, abilitySpellID)
+    local sid
+    if buffCooldownID then
+        local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCooldownID)
+        if ok and info then
+            sid = info.overrideTooltipSpellID or info.overrideSpellID or info.spellID
+        end
+    end
+    sid = sid or abilitySpellID
+    if sid and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(sid) then
+        return "target"
+    end
+    return nil
+end
+
+-- A row cleared by hand stays cleared. Clearing the last slot leaves an empty
+-- table, auto pairing reads empty as never paired, and the unpair handler's own
+-- LoadEssentialCooldowns refilled it before the panel redrew, so the clear could
+-- never stick while the toggle was on. Pairing a row again drops the mark, and
+-- turning the toggle on wipes them all, which is the explicit "fill these in".
+-- Only ever holds true or nil, so presence is the answer.
+local function PairingCleared(cooldownID)
+    local marks = CONFIG.pairingCleared
+    return cooldownID ~= nil and marks ~= nil and marks[cooldownID] ~= nil
+end
+
+local function SetPairingCleared(cooldownID, cleared)
+    if not cooldownID then return end
+    CONFIG.pairingCleared = CONFIG.pairingCleared or {}
+    CONFIG.pairingCleared[cooldownID] = cleared and true or nil
+end
+
+-- Custom timers: a length the player enters, started by casting the row's own
+-- ability, for a buff the Cooldown Manager cannot time for us.
+
+local customBuffApplied
+
+StaticPopupDialogs["EVENTHORIZON_CUSTOM_BUFF_SECONDS"] = {
+    text = "How many seconds does it last?",
+    button1 = OKAY,
+    button2 = CANCEL,
+    hasEditBox = 1,
+    editBoxWidth = 120,
+    maxLetters = 12,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    -- dialog:GetEditBox(), never dialog.editBox. The field is not there on this
+    -- client, so the old form handed back nil and the entered value was lost
+    -- with no error anywhere.
+    OnShow = function(dialog, data)
+        local eb = dialog:GetEditBox()
+        if eb then
+            eb:SetText((data and data.prefill) and tostring(data.prefill) or "")
+            eb:HighlightText()
+            eb:SetFocus()
+        end
+    end,
+    OnAccept = function(dialog, data)
+        local eb = dialog:GetEditBox()
+        if ns.ApplyCustomBuffSeconds then
+            ns.ApplyCustomBuffSeconds(data, eb and eb:GetText())
+        end
+    end,
+    EditBoxOnEnterPressed = function(editBox, data)
+        if ns.ApplyCustomBuffSeconds then
+            ns.ApplyCustomBuffSeconds(data, editBox:GetText())
+        end
+        editBox:GetParent():Hide()
+    end,
+    EditBoxOnEscapePressed = function(editBox) editBox:GetParent():Hide() end,
+}
+
+-- data travels as StaticPopup_Show's fourth argument, prefill included, so the
+-- popup can seed itself in OnShow without us reaching into a pooled frame.
+local function PromptSeconds(ctx, prefill)
+    ctx.prefill = prefill
+    StaticPopup_Show("EVENTHORIZON_CUSTOM_BUFF_SECONDS", nil, nil, ctx)
+end
+
+function ns.ApplyCustomBuffSeconds(ctx, text)
+    if type(ctx) ~= "table" or not ctx.cooldownID then return end
+    local seconds = tonumber(tostring(text or ""):match("^%s*([%d%.]+)%s*$"))
+    if not seconds or seconds <= 0 then return end
+
+    CONFIG.buffMappings = CONFIG.buffMappings or {}
+    local m = CONFIG.buffMappings[ctx.cooldownID] or {}
+    -- Never leave a hole. Every reader walks these with ipairs, which stops at
+    -- the first gap, so writing slot 2 into an empty list would store an entry
+    -- that nothing ever sees.
+    local slotIndex = math.min(ctx.slotIndex or 1, #m + 1)
+    local existing = m[slotIndex]
+    m[slotIndex] = {
+        customDuration = seconds,
+        color = existing and existing.color or nil,
+        unit = existing and existing.unit or nil,
+    }
+    CONFIG.buffMappings[ctx.cooldownID] = m
+    SetPairingCleared(ctx.cooldownID, false)
+    ns.SaveCurrentProfile()
+    if customBuffApplied then customBuffApplied() end
+end
+
+function ns.RemoveCustomBuff(cooldownID, slotIndex)
+    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+    if not m or not m[slotIndex] then return end
+    table.remove(m, slotIndex)
+    if next(m) == nil then SetPairingCleared(cooldownID, true) end
+    ns.SaveCurrentProfile()
+    if customBuffApplied then customBuffApplied() end
+end
+
+-- Right click on an empty buff slot. Same context menu shape the icon strip uses
+-- for its own per row choices, rather than a third pattern.
+function ns.OpenCustomBuffMenu(anchor, cooldownID, slotIndex, onApplied)
+    customBuffApplied = onApplied
+    local function setTimer(prefill)
+        PromptSeconds({ cooldownID = cooldownID, slotIndex = slotIndex }, prefill)
+    end
+
+    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+    local existing = m and m[slotIndex]
+    local isCustom = existing and existing.customDuration ~= nil
+
+    if MenuUtil and MenuUtil.CreateContextMenu then
+        MenuUtil.CreateContextMenu(anchor, function(_, root)
+            root:CreateTitle("Buff " .. slotIndex)
+            if isCustom then
+                root:CreateButton("Change length...", function()
+                    setTimer(existing.customDuration)
+                end)
+                root:CreateButton("Remove", function()
+                    ns.RemoveCustomBuff(cooldownID, slotIndex)
+                end)
+            else
+                root:CreateButton("Custom timer...", function() setTimer() end)
+            end
+        end)
+    else
+        setTimer(existing and existing.customDuration)
+    end
+end
+
 function ns.AutoPopulateSelfBuffMappings()
     if InCombatLockdown() then return end
+    -- Opt-in. A nil is a profile written before the toggle existed, and those
+    -- must stay unpaired too, so this is never `~= false`.
+    if not CONFIG.autoPairBuffs then return end
     if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then return end
     if not C_CooldownViewer.GetCooldownViewerCooldownInfo then return end
 
@@ -81,46 +301,59 @@ function ns.AutoPopulateSelfBuffMappings()
     local cooldownIDs = {}
     local seenID = {}
     for _, cat in ipairs({ 0, 1 }) do
-        local success, result = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, cat, false)
-        if success and result then
-            for _, id in ipairs(result) do
-                if not seenID[id] then
-                    seenID[id] = true
-                    cooldownIDs[#cooldownIDs + 1] = id
-                end
+        for _, id in ipairs(CategoryEntryIDs(cat)) do
+            if not seenID[id] then
+                seenID[id] = true
+                cooldownIDs[#cooldownIDs + 1] = id
             end
         end
     end
 
     CONFIG.buffMappings = CONFIG.buffMappings or {}
+    local buffCdBySpell = BuffEntryBySpell(BUFF_SEARCH_CATEGORIES)
     local created = false
 
     for _, cooldownID in ipairs(cooldownIDs) do
-        if CONFIG.buffMappings[cooldownID] == nil then
-            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-            if infoOk and cdInfo and cdInfo.hasAura then
-                local mapping = { buffCooldownIDs = { cooldownID } }
-                if cdInfo.spellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
-                    mapping.unit = "target"
+        local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+        local info = infoOk and cdInfo or nil
+        local existing = CONFIG.buffMappings[cooldownID]
+
+        -- Clearing the last slot leaves an empty table, not nil. Treating that as
+        -- mapped is how a row you cleared by hand became permanently unpairable.
+        if type(existing) == "table" and next(existing) == nil then existing = nil end
+
+        if existing == nil and not PairingCleared(cooldownID) then
+            -- The row's own entry goes last, never first: it is the fallback for
+            -- a spell with no separate buff entry, and a self mapping resolves to
+            -- a frame with no Bar, so it can never drive a wedge.
+            local buffCdIDs = BuffEntriesFor(buffCdBySpell, cooldownID)
+            if info and info.hasAura then
+                buffCdIDs = buffCdIDs or {}
+                local seen = false
+                for _, id in ipairs(buffCdIDs) do
+                    if id == cooldownID then seen = true break end
                 end
-                CONFIG.buffMappings[cooldownID] = { mapping }
+                if not seen then buffCdIDs[#buffCdIDs + 1] = cooldownID end
+            end
+            if buffCdIDs and #buffCdIDs > 0 then
+                CONFIG.buffMappings[cooldownID] = {
+                    { buffCooldownIDs = buffCdIDs,
+                      unit = MappingUnitFor(buffCdIDs[1], info and info.spellID) },
+                }
                 created = true
             end
-        else
+        elseif type(existing) == "table" then
             -- Patch existing self-mappings missing unit field
-            local existing = CONFIG.buffMappings[cooldownID]
-            if type(existing) == "table" then
-                for _, mapData in ipairs(existing) do
-                    if mapData.unit == nil and mapData.buffCooldownIDs then
-                        for _, bcdID in ipairs(mapData.buffCooldownIDs) do
-                            if bcdID == cooldownID then
-                                local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-                                if infoOk and cdInfo and cdInfo.spellID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
-                                    mapData.unit = "target"
-                                    created = true
-                                end
-                                break
+            for _, mapData in ipairs(existing) do
+                if mapData.unit == nil and mapData.buffCooldownIDs then
+                    for _, bcdID in ipairs(mapData.buffCooldownIDs) do
+                        if bcdID == cooldownID then
+                            local u = MappingUnitFor(bcdID, info and info.spellID)
+                            if u then
+                                mapData.unit = u
+                                created = true
                             end
+                            break
                         end
                     end
                 end
@@ -128,38 +361,69 @@ function ns.AutoPopulateSelfBuffMappings()
         end
     end
 
-    -- Cross-category buff pairing: match unmapped Category 0 abilities to
-    -- Category 1/2/3 entries with the same spellID
-    local buffCdBySpell = {}
-    for _, cat in ipairs({2, 3, 1}) do
-        local catOk, catIds = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(cat, false)
-        end)
-        if catOk and catIds then
-            for _, bcdID in ipairs(catIds) do
-                local bInfoOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, bcdID)
-                if bInfoOk and bInfo and bInfo.spellID and not buffCdBySpell[bInfo.spellID] then
-                    buffCdBySpell[bInfo.spellID] = bcdID
-                end
-            end
-        end
+    if created then
+        ns.SaveCurrentProfile()
     end
-    for _, cooldownID in ipairs(cooldownIDs) do
-        if CONFIG.buffMappings[cooldownID] == nil then
-            local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-            if infoOk and cdInfo and cdInfo.spellID and buffCdBySpell[cdInfo.spellID] then
-                local mapping = { buffCooldownIDs = { buffCdBySpell[cdInfo.spellID] } }
-                if C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(cdInfo.spellID) then
-                    mapping.unit = "target"
+end
+
+-- A self mapping cannot drive a wedge. Swap it for the Tracked Bars entry when
+-- one exists, keeping the colour and unit already on the mapping.
+function ns.RepairSelfBuffPairings(announce)
+    if InCombatLockdown() then return 0 end
+    if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then return 0 end
+    if not CONFIG.buffMappings then return 0 end
+
+    local barBySpell, trusted = BuffEntryBySpell({ 3 })
+    local fixed = 0
+
+    for cooldownID, maps in pairs(CONFIG.buffMappings) do
+        if type(cooldownID) == "number" and type(maps) == "table" then
+            local barIDs = BuffEntriesFor(barBySpell, cooldownID)
+            local barID = barIDs and barIDs[1] or nil
+            if barID and barID ~= cooldownID then
+                for _, mapData in ipairs(maps) do
+                    local list = mapData.buffCooldownIDs
+                    if type(list) == "table" and #list == 1 and list[1] == cooldownID then
+                        -- The whole list. Writing one id can pin the mapping to
+                        -- an unlearned entry the game never feeds.
+                        for i = 1, #barIDs do list[i] = barIDs[i] end
+                        fixed = fixed + 1
+                    end
                 end
-                CONFIG.buffMappings[cooldownID] = { mapping }
-                created = true
             end
         end
     end
 
-    if created then
+    if fixed > 0 then
         ns.SaveCurrentProfile()
+        if ns.ApplyLayoutToAllBars then ns.ApplyLayoutToAllBars() end
+        if ns.RefreshIcons then ns.RefreshIcons() end
+    end
+    if announce then
+        print("|cff00ff00[Infall]|r Buff pairings repaired: " .. fixed)
+    end
+    return fixed, trusted
+end
+
+-- Once per spec profile. A self mapping is not evidence of a choice, it is what
+-- every earlier build wrote for any ability with an aura.
+function ns.RepairSelfBuffPairingsOnce()
+    -- Automatic only while the player has asked for automatic pairing. Repointing
+    -- a pairing someone made by hand is the same unrequested write as creating
+    -- one. `/infall repair` still runs it on demand.
+    if not CONFIG.autoPairBuffs then return end
+    local key = ns.GetSpecKey and ns.GetSpecKey()
+    if not key then return end
+    InfallDB.pairingRepair = InfallDB.pairingRepair or {}
+    if InfallDB.pairingRepair[key] then return end
+
+    -- Never burn the stamp on a layout that could not be read, or the one run
+    -- this profile gets is the run that had no data.
+    local fixed, trusted = ns.RepairSelfBuffPairings(false)
+    if not trusted then return end
+    InfallDB.pairingRepair[key] = true
+    if fixed > 0 then
+        print("|cff00ff00[Infall]|r Repaired " .. fixed .. " buff pairings that could not draw a wedge.")
     end
 end
 
@@ -170,6 +434,101 @@ function ns.GetSpecKey()
     local specIndex = GetSpecialization()
     local specID = specIndex and GetSpecializationInfo(specIndex)
     return name .. "-" .. realm .. "-" .. (specID or 0)
+end
+
+-- Everything the icon strip owns. Buff pairings are deliberately absent: they are
+-- shared with the timeline, so carrying them would rewrite the target spec's bars.
+local ICON_COPY_KEYS = { "iconList", "iconStates", "iconContainers", "customIcons" }
+local ICON_COPY_TOGGLES = { "iconsEnabled", "iconGlow", "iconIgnoreGCD", "hideIcons" }
+
+-- Spec profiles are keyed `Name-Realm-specID`, and InfallDB is account wide, so
+-- every character's profiles are visible here.
+--
+-- Another CLASS is still not offered: the rows are cooldownIDs and a mage's mean
+-- nothing to a hunter. Another character of the SAME class is, because the same
+-- spec on an alt has the identical cooldownIDs. The class comes from the spec id
+-- itself, sixth return of GetSpecializationInfoByID, so a profile belonging to a
+-- character who is not logged in is still classified correctly.
+function ns.IconCopySources()
+    local out = {}
+    local mine = ns.GetSpecKey and ns.GetSpecKey()
+    if not mine or not InfallDB.profiles then return out end
+    local prefix = mine:match("^(.*)%-%d+$")
+    if not prefix then return out end
+    local _, myClass = UnitClass("player")
+
+    for key, profile in pairs(InfallDB.profiles) do
+        if key ~= mine and type(profile) == "table" then
+            local specID = tonumber(key:match("%-(%d+)$"))
+            local rows = profile.iconList and #profile.iconList or 0
+            if specID and specID > 0 and rows > 0 then
+                local ok, specName, specClass = pcall(function()
+                    local _, n, _, _, _, c = GetSpecializationInfoByID(specID)
+                    return n, c
+                end)
+                local sameChar = key:find(prefix, 1, true) == 1
+                local sameClass = specClass and myClass and specClass == myClass
+                if ok and (sameChar or sameClass) then
+                    local label
+                    if sameChar then
+                        label = string.format("%s (%d icons)",
+                            specName or ("spec " .. specID), rows)
+                    else
+                        label = string.format("%s, %s (%d icons)",
+                            key:match("^([^%-]+)") or "?",
+                            specName or ("spec " .. specID), rows)
+                    end
+                    out[#out + 1] = { key = key, rows = rows, label = label }
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.label < b.label end)
+    return out
+end
+
+-- Replaces the current spec's icons outright. Callers confirm first.
+function ns.CopyIconsFromProfile(srcKey)
+    if InCombatLockdown() then return false, "combat" end
+    local src = InfallDB.profiles and InfallDB.profiles[srcKey]
+    if type(src) ~= "table" then return false, "missing" end
+
+    for _, key in ipairs(ICON_COPY_KEYS) do
+        CONFIG[key] = src[key] and DeepCopy(src[key]) or {}
+    end
+    if src.toggles then
+        for _, key in ipairs(ICON_COPY_TOGGLES) do
+            if src.toggles[key] ~= nil then CONFIG[key] = src.toggles[key] end
+        end
+    end
+
+    -- Pairings for the rows that just arrived, and only those. The table is shared
+    -- with the timeline, so copying it whole would rewrite this spec's bars. An
+    -- existing pairing is never overwritten, and an emptied one is a cleared
+    -- pairing, not an absent one, so it is left cleared.
+    local paired = 0
+    if type(src.pairings) == "table" then
+        CONFIG.buffMappings = CONFIG.buffMappings or {}
+        for _, entry in ipairs(CONFIG.iconList or {}) do
+            local id = entry.cooldownID or entry.key
+            local incoming = id and src.pairings[id]
+            if type(incoming) == "table" and next(incoming) ~= nil
+                and CONFIG.buffMappings[id] == nil then
+                CONFIG.buffMappings[id] = DeepCopy(incoming)
+                paired = paired + 1
+            end
+        end
+    end
+
+    -- Custom row keys index the shared keyspace, so an incoming row can land on a
+    -- key a bar row already holds.
+    if ns.MigrateCustomKeyCollisions then ns.MigrateCustomKeyCollisions() end
+
+    ns.SaveCurrentProfile()
+    if ns.ApplyLayoutToAllBars then ns.ApplyLayoutToAllBars() end
+    if ns.Icons and ns.Icons.Relayout then ns.Icons.Relayout() end
+    if ns.RefreshIcons then ns.RefreshIcons() end
+    return true, #(CONFIG.iconList or {}), paired
 end
 
 -- No pet handling: the Cooldown Manager scans player and target only, so an aura
@@ -197,6 +556,7 @@ function ns.SeedProfileFromClassConfig(specKey)
         display = {},
         colors = {},
         pairings = {},
+        pairingCleared = {},
         extraCasts = {},
         stackMappings = {},
         hiddenCooldownIDs = {},
@@ -308,11 +668,13 @@ function ns.ApplyProfile(profile)
     end
 
     CONFIG.buffMappings = profile.pairings and DeepCopy(profile.pairings) or {}
+    CONFIG.pairingCleared = profile.pairingCleared and DeepCopy(profile.pairingCleared) or {}
 
-    -- Merge class config defaults for cooldownIDs the profile doesn't cover
+    -- Merge class config defaults for cooldownIDs the profile doesn't cover. A row
+    -- the player cleared is covered, even though it holds nothing.
     if ns.classConfigDefaults and ns.classConfigDefaults.pairings then
         for cdID, defaultMappings in pairs(ns.classConfigDefaults.pairings) do
-            if not CONFIG.buffMappings[cdID] then
+            if not CONFIG.buffMappings[cdID] and not PairingCleared(cdID) then
                 CONFIG.buffMappings[cdID] = DeepCopy(defaultMappings)
             end
         end
@@ -436,6 +798,7 @@ function ns.SaveCurrentProfile()
     end
 
     profile.pairings = DeepCopy(CONFIG.buffMappings or {})
+    profile.pairingCleared = DeepCopy(CONFIG.pairingCleared or {})
     profile.extraCasts = DeepCopy(CONFIG.extraCasts or {})
     profile.stackMappings = DeepCopy(CONFIG.stackMappings or {})
     profile.hiddenCooldownIDs = DeepCopy(CONFIG.hiddenCooldownIDs or {})
@@ -519,6 +882,12 @@ local function GetFontOptions()
         {text = "Morpheus", value = "Fonts\\MORPHEUS.TTF"},
         {text = "Skurri", value = "Fonts\\SKURRI.TTF"},
     }
+
+    -- Shipped with the addon, so they are offered whether or not LibSharedMedia is
+    -- present. The dedupe below stops a second copy appearing when it is.
+    for _, f in ipairs(ns.BUNDLED_FONTS or {}) do
+        fonts[#fonts + 1] = {text = f.name, value = f.path}
+    end
 
     -- Try LibSharedMedia-3.0
     local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
@@ -1272,6 +1641,12 @@ local spellPickerCache
 local spellPickerCacheDirty = true
 local spellPickerCurrentOpts
 
+-- Separate list for `source = "talents"`. The spellbook list is everything the
+-- player knows, which is the wrong set for a condition: it omits the talents
+-- they are not currently running, and those are exactly the ones worth gating on.
+local talentPickerCache
+local talentPickerCacheDirty = true
+
 -- Common consumables / class buffs not always in the player's spellbook.
 -- Used so name search in the picker can find things like Healthstone or Phial of Tepid Versatility.
 local PICKER_COMMON_SPELLS = {
@@ -1409,6 +1784,57 @@ local function BuildSpellPickerCache()
     return list
 end
 
+-- Every talent in the active spec's trees, taken or not. Entries, never nodes:
+-- a choice node offers several and only one of them is the talent you mean.
+local function BuildTalentPickerCache()
+    local list = {}
+    local seen = {}
+
+    local configID = C_ClassTalents and C_ClassTalents.GetActiveConfigID
+        and C_ClassTalents.GetActiveConfigID()
+    local cfgOk, cfg = false, nil
+    if configID and C_Traits and C_Traits.GetConfigInfo then
+        cfgOk, cfg = pcall(C_Traits.GetConfigInfo, configID)
+    end
+
+    if cfgOk and cfg and cfg.treeIDs then
+        for _, treeID in ipairs(cfg.treeIDs) do
+            local nOk, nodes = pcall(C_Traits.GetTreeNodes, treeID)
+            if nOk and nodes then
+                for _, nodeID in ipairs(nodes) do
+                    local iOk, node = pcall(C_Traits.GetNodeInfo, configID, nodeID)
+                    if iOk and node and node.entryIDs then
+                        for _, entryID in ipairs(node.entryIDs) do
+                            local eOk, entry = pcall(C_Traits.GetEntryInfo, configID, entryID)
+                            local defID = eOk and entry and entry.definitionID
+                            local dOk, def = false, nil
+                            if defID then dOk, def = pcall(C_Traits.GetDefinitionInfo, defID) end
+                            local spellID = dOk and def and (def.spellID or def.overriddenSpellID)
+                            if spellID and not seen[spellID] then
+                                local name = C_Spell.GetSpellName(spellID)
+                                if name and name ~= "" then
+                                    seen[spellID] = true
+                                    list[#list + 1] = {
+                                        spellID = spellID,
+                                        name = name,
+                                        nameLower = name:lower(),
+                                        icon = C_Spell.GetSpellTexture(spellID) or 134400,
+                                        tab = "Talent",
+                                    }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return a.name < b.name end)
+    talentPickerCache = list
+    talentPickerCacheDirty = false
+end
+
 local spellPickerInvalidator
 local function EnsureSpellPickerInvalidator()
     if spellPickerInvalidator then return end
@@ -1416,8 +1842,11 @@ local function EnsureSpellPickerInvalidator()
     spellPickerInvalidator:RegisterEvent("SPELLS_CHANGED")
     spellPickerInvalidator:RegisterEvent("LEARNED_SPELL_IN_SKILL_LINE")
     spellPickerInvalidator:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    spellPickerInvalidator:RegisterEvent("TRAIT_CONFIG_UPDATED")
+    spellPickerInvalidator:RegisterEvent("PLAYER_TALENT_UPDATE")
     spellPickerInvalidator:SetScript("OnEvent", function()
         spellPickerCacheDirty = true
+        talentPickerCacheDirty = true
     end)
 end
 
@@ -1502,7 +1931,13 @@ local function BuildSpellPickerFrame()
             searchHint:Hide()
         end
 
-        if spellPickerCacheDirty or not spellPickerCache then
+        local useTalents = spellPickerCurrentOpts
+            and spellPickerCurrentOpts.source == "talents"
+        if useTalents then
+            if talentPickerCacheDirty or not talentPickerCache then
+                BuildTalentPickerCache()
+            end
+        elseif spellPickerCacheDirty or not spellPickerCache then
             BuildSpellPickerCache()
         end
 
@@ -1540,7 +1975,7 @@ local function BuildSpellPickerFrame()
             seenIDs[typedID] = true
         end
 
-        for _, e in ipairs(spellPickerCache) do
+        for _, e in ipairs((useTalents and talentPickerCache) or spellPickerCache) do
             if not seenIDs[e.spellID] and (query == "" or e.nameLower:find(query, 1, true)) then
                 results[#results + 1] = e
                 seenIDs[e.spellID] = true
@@ -1847,9 +2282,10 @@ local function BuildColoursTab(contentArea, tabFrames)
 
     -- Channel Colours
     AddColourHeader("Channel Colours")
-    AddColourDescription("Colour for the chain window at the tail of a Disintegrate channel, showing when it's safe to clip and recast.")
+    AddColourDescription("Colour for the clip window at the tail of a channel, marking the final tick where it is safe to clip. Drawn on Disintegrate and Rapid Fire.")
 
-    local disintChainSwatch = CreateColorSwatch(colourContent, "Disintegrate Chain Window", DeepCopy(CONFIG.disintegrateChainColor), function(c)
+    -- Label only. The saved key stays disintegrateChainColor so no profile moves.
+    local disintChainSwatch = CreateColorSwatch(colourContent, "Channel Clip Window", DeepCopy(CONFIG.disintegrateChainColor), function(c)
         CONFIG.disintegrateChainColor = c
         DebouncedApplyAndSave()
     end)
@@ -2393,6 +2829,78 @@ local function BuildStacksTab(contentArea, tabFrames)
             end)
             upBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+            -- Optional talent gate. Sits on this row because the card height is a
+            -- fixed 100 with a hardcoded advance below; a fourth row would move
+            -- geometry that nothing here measures.
+            local talentBtn = CreateFrame("Button", nil, rf, "UIPanelButtonTemplate")
+            talentBtn:SetSize(118, 20)
+            talentBtn:SetPoint("RIGHT", upBtn, "LEFT", -8, 0)
+
+            -- Long talent names are common, so the label is pinned to both edges
+            -- and left unwrapped, which truncates rather than spilling past the
+            -- button. The full name lives in the tooltip.
+            local talentFS = talentBtn:GetFontString()
+            talentFS:SetWordWrap(false)
+            talentFS:ClearAllPoints()
+            talentFS:SetPoint("LEFT", talentBtn, "LEFT", 6, 0)
+            talentFS:SetPoint("RIGHT", talentBtn, "RIGHT", -6, 0)
+            talentFS:SetJustifyH("CENTER")
+
+            local gateID = entry.requireTalent
+            local gateName = gateID and C_Spell.GetSpellName(gateID)
+            local gateKnown = gateID and ns.IsTalentKnown and ns.IsTalentKnown(gateID)
+            if gateID then
+                talentBtn:SetText(gateName or ("ID " .. gateID))
+                -- Three states worth telling apart: no condition, condition met,
+                -- condition failing. The last one is why a row is not drawing, so
+                -- it gets its own colour rather than sharing grey with "unset".
+                if gateKnown then
+                    talentFS:SetTextColor(1, 0.82, 0)
+                else
+                    talentFS:SetTextColor(0.8, 0.45, 0.45)
+                end
+            else
+                talentBtn:SetText("Always shown")
+                talentFS:SetTextColor(0.5, 0.5, 0.5)
+            end
+
+            talentBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            talentBtn:SetScript("OnClick", function(self, button)
+                if button == "RightButton" then
+                    entry.requireTalent = nil
+                    ns.SaveCurrentProfile()
+                    if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                    RebuildSIListUI()
+                    return
+                end
+                if not ns.OpenSpellPicker then return end
+                ns.OpenSpellPicker({
+                    title = "Show Only If Talent Known",
+                    anchor = self,
+                    source = "talents",
+                    onSelect = function(pickedID)
+                        entry.requireTalent = pickedID
+                        ns.SaveCurrentProfile()
+                        if ns.RebuildStackIndicators then ns.RebuildStackIndicators() end
+                        RebuildSIListUI()
+                    end,
+                })
+            end)
+            talentBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                if gateID then
+                    GameTooltip:SetText(gateName or ("Spell " .. gateID))
+                    GameTooltip:AddLine(gateKnown
+                        and "Talented, so this row is drawing."
+                        or "Not talented, so this row is hidden.", 0.7, 0.7, 0.7, true)
+                    GameTooltip:AddLine("Click to change it, right click to clear.", 0.7, 0.7, 0.7, true)
+                else
+                    GameTooltip:SetText("Always shown")
+                    GameTooltip:AddLine("This row draws on every build. Click to tie it to a talent instead, and it will only draw while that talent is taken.", 0.7, 0.7, 0.7, true)
+                end
+                GameTooltip:Show()
+            end)
+            talentBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
             -- Row 2: Max Stacks + Overflow + OV Colour
             local maxLabel = rf:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -2785,11 +3293,11 @@ local function BuildStacksTab(contentArea, tabFrames)
         local seen = {}
         local buffIDs = {}
 
-        local ok2, cat2 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(2, false)
-        end)
-        if ok2 and cat2 then
-            for _, id in ipairs(cat2) do
+        -- Through CategoryEntryIDs, so an entry dragged into a buff section from
+        -- somewhere else is offered. The raw accessor reports static defaults and
+        -- could only ever list an entry under the section Blizzard shipped it in.
+        for _, cat in ipairs({ 2, 3 }) do
+            for _, id in ipairs(CategoryEntryIDs(cat)) do
                 if not seen[id] then
                     seen[id] = true
                     buffIDs[#buffIDs + 1] = id
@@ -2797,29 +3305,13 @@ local function BuildStacksTab(contentArea, tabFrames)
             end
         end
 
-        local ok3, cat3 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(3, false)
-        end)
-        if ok3 and cat3 then
-            for _, id in ipairs(cat3) do
-                if not seen[id] then
+        -- Essential is included only for entries that carry an aura of their own.
+        for _, id in ipairs(CategoryEntryIDs(0)) do
+            if not seen[id] then
+                local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
+                if infoOk and cdInfo and cdInfo.hasAura then
                     seen[id] = true
                     buffIDs[#buffIDs + 1] = id
-                end
-            end
-        end
-
-        local ok0, cat0 = pcall(function()
-            return C_CooldownViewer.GetCooldownViewerCategorySet(0, false)
-        end)
-        if ok0 and cat0 then
-            for _, id in ipairs(cat0) do
-                if not seen[id] then
-                    local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
-                    if infoOk and cdInfo and cdInfo.hasAura then
-                        seen[id] = true
-                        buffIDs[#buffIDs + 1] = id
-                    end
                 end
             end
         end
@@ -3152,7 +3644,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.7")
+    versionText:SetText("v1.3.9")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -3555,9 +4047,9 @@ local function BuildSettings()
         local cast2Slot, cast2ColorBtn = row.cast2Slot, row.cast2ColorBtn
         local stackSlot, stackColorBtn = row.stackSlot, row.stackColorBtn
 
-        buff1Slot.icon:Hide(); buff1Slot.pairedCooldownID = nil; buff1Slot.pairedColor = nil; buff1ColorBtn:Hide()
-        buff2Slot.icon:Hide(); buff2Slot.pairedCooldownID = nil; buff2Slot.pairedColor = nil; buff2ColorBtn:Hide()
-        buff3Slot.icon:Hide(); buff3Slot.pairedCooldownID = nil; buff3Slot.pairedColor = nil; buff3ColorBtn:Hide()
+        buff1Slot.icon:Hide(); buff1Slot.pairedCooldownID = nil; buff1Slot.customEntry = nil; buff1Slot.pairedColor = nil; buff1ColorBtn:Hide()
+        buff2Slot.icon:Hide(); buff2Slot.pairedCooldownID = nil; buff2Slot.customEntry = nil; buff2Slot.pairedColor = nil; buff2ColorBtn:Hide()
+        buff3Slot.icon:Hide(); buff3Slot.pairedCooldownID = nil; buff3Slot.customEntry = nil; buff3Slot.pairedColor = nil; buff3ColorBtn:Hide()
         cast1Slot.icon:Hide(); cast1Slot.pairedSpellID = nil; cast1Slot.pairedColor = nil; cast1ColorBtn:Hide()
         cast2Slot.icon:Hide(); cast2Slot.pairedSpellID = nil; cast2Slot.pairedColor = nil; cast2ColorBtn:Hide()
         stackSlot.icon:Hide(); stackSlot.pairedCooldownID = nil; stackSlot.pairedColor = nil; stackColorBtn:Hide()
@@ -3575,6 +4067,21 @@ local function BuildSettings()
         -- Populate buff slots from mappings
         local mappings = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
         local function applyBuffSlot(slot, colorBtn, m)
+            -- A custom entry has no buffCooldownIDs to look art up from, so it
+            -- carries its own. Without this branch the slot rendered empty and
+            -- there was no colour control, which read as nothing having been set.
+            if m and m.customDuration then
+                slot.icon:SetTexture(136243)
+                slot.icon:Show()
+                slot.pairedCooldownID = nil
+                slot.customEntry = m
+                slot.pairedColor = m.color
+                local cc = m.color or (m.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
+                colorBtn.tex:SetColorTexture(cc[1], cc[2], cc[3], cc[4] or 1)
+                colorBtn:Show()
+                colorBtn.procDot:SetShown(false)
+                return
+            end
             if not (m and m.buffCooldownIDs and m.buffCooldownIDs[1]) then return end
             local bID = m.buffCooldownIDs[1]
             local infoOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, bID)
@@ -3630,6 +4137,15 @@ local function BuildSettings()
         -- Slot tooltips
         local function buffSlotTooltip(self, slotName)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            local ce = self.customEntry
+            if ce then
+                GameTooltip:SetText(slotName .. ": custom timer", 1, 1, 1)
+                GameTooltip:AddLine(ce.customDuration
+                    .. "s, started by casting this ability", 0.7, 0.7, 0.7, true)
+                GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                GameTooltip:Show()
+                return
+            end
             if self.pairedCooldownID then
                 local bOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, self.pairedCooldownID)
                 local bSpellID = bOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
@@ -3643,6 +4159,7 @@ local function BuildSettings()
                     GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                 else
                     GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
                 end
             end
             GameTooltip:Show()
@@ -3657,15 +4174,23 @@ local function BuildSettings()
         local function PairBuff(slot, colorBtn, slotIndex)
             return function(self, button)
                 if button == "RightButton" and self.pairedCooldownID then
-                    self.pairedCooldownID = nil; self.pairedColor = nil
+                    self.pairedCooldownID = nil; self.customEntry = nil; self.pairedColor = nil
                     slot.icon:Hide(); colorBtn:Hide(); colorBtn.procDot:Hide()
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if m then
                         if slotIndex == 1 then table.remove(m, 1)
                         elseif slotIndex == 2 and #m >= 2 then table.remove(m, 2)
                         elseif slotIndex == 3 and #m >= 3 then table.remove(m, 3) end
+                        if next(m) == nil then SetPairingCleared(cooldownID, true) end
                     end
                     ns.SaveCurrentProfile(); LoadEssentialCooldowns(); RefreshCooldownRows()
+                    return
+                end
+                if button == "RightButton" then
+                    ns.OpenCustomBuffMenu(self, cooldownID, slotIndex, function()
+                        LoadEssentialCooldowns(); RefreshCooldownRows()
+                        statusText:SetText("|cff00ff00Custom buff set.|r")
+                    end)
                     return
                 end
                 if selectedType == "cast" then
@@ -3702,6 +4227,7 @@ local function BuildSettings()
                 local mapping = { buffCooldownIDs = {buffCdID}, color = defaultColor }
                 if pairUnit then mapping.unit = pairUnit end
                 CONFIG.buffMappings[cooldownID][slotIndex] = mapping
+                SetPairingCleared(cooldownID, false)
                 ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
                 statusText:SetText("")
             end
@@ -3875,7 +4401,7 @@ local function BuildSettings()
         stackSlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
         stackSlot:SetScript("OnClick", function(self, button)
             if button == "RightButton" and self.pairedCooldownID then
-                self.pairedCooldownID = nil; self.pairedColor = nil
+                self.pairedCooldownID = nil; self.customEntry = nil; self.pairedColor = nil
                 stackSlot.icon:Hide(); stackColorBtn:Hide()
                 if CONFIG.stackMappings then CONFIG.stackMappings[cooldownID] = nil end
                 ns.SaveCurrentProfile(); LoadEssentialCooldowns()
@@ -3946,8 +4472,12 @@ local function BuildSettings()
         -- Use data provider if available, fall back to category set
         local foundSource = false
         do
+            -- An empty table is an ANSWER, the category is genuinely empty. Only nil
+            -- means the layout could not be read. Testing #displayed > 0 here treated
+            -- empty as unknown, so emptying a category fell through to static
+            -- defaults and the list repopulated with what the player just removed.
             local displayed = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
-            if displayed and #displayed > 0 then
+            if displayed then
                 cooldownIDs = displayed
                 foundSource = true
             end
@@ -4123,14 +4653,17 @@ local function BuildSettings()
 
                 row.buff1Slot.icon:Hide()
                 row.buff1Slot.pairedCooldownID = nil
+                row.buff1Slot.customEntry = nil
                 row.buff1Slot.pairedColor = nil
                 row.buff1ColorBtn:Hide()
                 row.buff2Slot.icon:Hide()
                 row.buff2Slot.pairedCooldownID = nil
+                row.buff2Slot.customEntry = nil
                 row.buff2Slot.pairedColor = nil
                 row.buff2ColorBtn:Hide()
                 row.buff3Slot.icon:Hide()
                 row.buff3Slot.pairedCooldownID = nil
+                row.buff3Slot.customEntry = nil
                 row.buff3Slot.pairedColor = nil
                 row.buff3ColorBtn:Hide()
                 row.cast1Slot.icon:Hide()
@@ -4230,11 +4763,19 @@ local function BuildSettings()
                         GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
                         GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
                     else
+                        if self.customEntry then
+                            local ce = self.customEntry
+                            GameTooltip:SetText("Buff 1: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
+                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:Show()
+                            return
+                        end
                         GameTooltip:SetText("Buff 1 Slot (empty)", 0.6, 0.6, 0.6)
                         if selectedBuff then
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4253,11 +4794,19 @@ local function BuildSettings()
                         GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
                         GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
                     else
+                        if self.customEntry then
+                            local ce = self.customEntry
+                            GameTooltip:SetText("Buff 2: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
+                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:Show()
+                            return
+                        end
                         GameTooltip:SetText("Buff 2 Slot (empty)", 0.6, 0.6, 0.6)
                         if selectedBuff then
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4276,11 +4825,19 @@ local function BuildSettings()
                         GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
                         GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
                     else
+                        if self.customEntry then
+                            local ce = self.customEntry
+                            GameTooltip:SetText("Buff 3: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
+                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:Show()
+                            return
+                        end
                         GameTooltip:SetText("Buff 3 Slot (empty)", 0.6, 0.6, 0.6)
                         if selectedBuff then
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
+                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4297,6 +4854,27 @@ local function BuildSettings()
                         CONFIG.buffMappings[spellID] = nil
                         ns.SaveCurrentProfile()
                     end
+                end
+                -- Custom entries carry their own art and have no buffCooldownIDs
+                -- to resolve it from, so they are drawn before the paired paths.
+                local function ApplyCustomSlot(slot, colorBtn, m)
+                    if not (m and m.customDuration) then return false end
+                    slot.icon:SetTexture(136243)
+                    slot.icon:Show()
+                    slot.pairedCooldownID = nil
+                    slot.customEntry = m
+                    slot.pairedColor = m.color
+                    local cc = m.color or (m.unit == "target" and CONFIG.debuffColor)
+                        or CONFIG.buffColor
+                    colorBtn.tex:SetColorTexture(cc[1], cc[2], cc[3], cc[4] or 1)
+                    colorBtn:Show()
+                    colorBtn.procDot:SetShown(false)
+                    return true
+                end
+                if mappings then
+                    ApplyCustomSlot(buff1Slot, buff1ColorBtn, mappings[1])
+                    ApplyCustomSlot(buff2Slot, buff2ColorBtn, mappings[2])
+                    ApplyCustomSlot(buff3Slot, buff3ColorBtn, mappings[3])
                 end
                 if mappings then
                     -- First mapping -> Buff 1 slot
@@ -4354,6 +4932,7 @@ local function BuildSettings()
                         if button == "RightButton" and self.pairedCooldownID then
                             -- Unpair
                             self.pairedCooldownID = nil
+                            self.customEntry = nil
                             self.pairedColor = nil
                             slot.icon:Hide()
                             colorBtn:Hide()
@@ -4367,10 +4946,19 @@ local function BuildSettings()
                                 elseif slotIndex == 3 and #m >= 3 then
                                     table.remove(m, 3)
                                 end
+                                if next(m) == nil then SetPairingCleared(cooldownID, true) end
                             end
                             ns.SaveCurrentProfile()
                             LoadEssentialCooldowns()
                             RefreshCooldownRows()
+                            return
+                        end
+                        -- Right click: declare a custom timer for this slot.
+                        if button == "RightButton" then
+                            ns.OpenCustomBuffMenu(self, cooldownID, slotIndex, function()
+                                LoadEssentialCooldowns()
+                                RefreshCooldownRows()
+                            end)
                             return
                         end
                         if selectedType == "cast" then
@@ -4424,6 +5012,7 @@ local function BuildSettings()
                             }
                             if pairUnit then mapping.unit = pairUnit end
                             CONFIG.buffMappings[cooldownID][slotIndex] = mapping
+                            SetPairingCleared(cooldownID, false)
                             ns.SaveCurrentProfile()
                             LoadEssentialCooldowns()
                             CancelSelection()
@@ -5140,10 +5729,14 @@ local function BuildSettings()
         -- The DataProvider reports the player's real layout; GetCooldownViewerCategorySet
         -- reports the static default category. An empty section is valid and means
         -- everything was moved out of it, so only an unreadable one falls back.
+        -- Unlearned entries are included on purpose. A multi variant spell parks
+        -- its entry under the variant that is not talented, so the Cooldown
+        -- Manager greys it out even though the player has the ability and the
+        -- aura. Excluding it here is what made those buffs impossible to pair.
         local dpIds = {}
         if ns.OrderedCooldownIDs then
             for _, sec in ipairs(sections) do
-                local dpResult = ns.OrderedCooldownIDs(sec.cat)
+                local dpResult = ns.OrderedCooldownIDs(sec.cat, true)
                 if type(dpResult) == "table" then dpIds[sec.cat] = dpResult end
             end
         end
@@ -5154,7 +5747,7 @@ local function BuildSettings()
             local catIds = dpIds[sec.cat]
             if not catIds then
                 local catOk, catResult = pcall(function()
-                    return C_CooldownViewer.GetCooldownViewerCategorySet(sec.cat, false)
+                    return C_CooldownViewer.GetCooldownViewerCategorySet(sec.cat, true)
                 end)
                 if catOk and catResult then catIds = catResult end
             end
@@ -5217,9 +5810,38 @@ local function BuildSettings()
                         btn.highlight:SetPoint("TOPLEFT", -2, 2)
                         btn.highlight:SetPoint("BOTTOMRIGHT", 2, -2)
                         btn.highlight:SetColorTexture(1, 1, 0, 0.6)
+                        -- Shown only on a spell whose bar would be estimated, so the
+                        -- mark means "this one is measured", not "this one is broken".
+                        btn.estimateDot = btn:CreateTexture(nil, "OVERLAY", nil, 2)
+                        btn.estimateDot:SetSize(8, 8)
+                        btn.estimateDot:SetPoint("BOTTOMRIGHT", 1, -1)
+                        btn.estimateDot:Hide()
+                        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
                         buffPoolCache[btnIdx] = btn
                         buffPoolCacheCount = math.max(buffPoolCacheCount, btnIdx)
                     end
+
+                    -- Matched on the entry, not on one spell id field: the aura is
+                    -- often measured on a different entry than the one being paired.
+                    local learnState, learnDur, learnKey = "unlearned", nil, nil
+                    if ns.AuraCompat then
+                        learnState, learnDur, learnKey =
+                            ns.AuraCompat.GetLearnStateForCooldown(buffCdID)
+                    end
+                    -- Marked only once the fallback has actually had to run for this
+                    -- spell. A measured duration the game never makes us use is not
+                    -- something the player needs to decide about.
+                    local estimatable = (learnState == "learned") and learnKey ~= nil
+                        and ns.AuraCompat.IsEstimateUsed(learnKey)
+                    local function RefreshEstimateDot()
+                        if not estimatable then btn.estimateDot:Hide() return end
+                        local on = ns.AuraCompat.IsEstimateAllowed(learnKey)
+                        btn.estimateDot:SetColorTexture(
+                            on and 0.2 or 0.6, on and 0.9 or 0.6, on and 0.3 or 0.6, 1)
+                        btn.estimateDot:Show()
+                    end
+                    btn.RefreshEstimateDot = RefreshEstimateDot
+                    RefreshEstimateDot()
 
                     btn:Show()
                     btn:SetSize(iconSz, iconSz)
@@ -5236,15 +5858,28 @@ local function BuildSettings()
                         if spellID then
                             GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
                         end
-                        -- Estimated section only: show what has been learned.
-                        if secCat == 2 and ns.AuraCompat then
-                            local state, dur = ns.AuraCompat.GetLearnState(spellID)
-                            if state == "permanent" then
-                                GameTooltip:AddLine("Permanent buff, drawn as a full bar.", 0.5, 0.9, 0.5, true)
-                            elseif state == "learned" then
-                                GameTooltip:AddLine(string.format("Estimated at %.1fs. Will not follow refreshes or haste.", dur), 1, 0.82, 0, true)
+                        if ns.AuraCompat then
+                            local state, dur = learnState, learnDur
+                            if secCat == 2 then
+                                -- Icons never carry timing, so the estimate is the whole story.
+                                if state == "permanent" then
+                                    GameTooltip:AddLine("Permanent buff, drawn as a full bar.", 0.5, 0.9, 0.5, true)
+                                elseif state == "learned" then
+                                    GameTooltip:AddLine(string.format("Estimated at %.1fs. Will not follow refreshes or haste.", dur), 1, 0.82, 0, true)
+                                else
+                                    GameTooltip:AddLine("Length not measured. It can only be measured while the buff is up outside combat and outside instances, which is not possible for every buff.", 1, 0.5, 0.5, true)
+                                end
+                            elseif secCat == 3 and estimatable then
+                                -- Only entries the game has actually left empty. The rest
+                                -- carry real timing and need no notice at all.
+                                GameTooltip:AddLine(string.format("The game does not feed this bar, so it is estimated at %.1fs.", dur), 1, 0.82, 0, true)
+                            end
+                        end
+                        if estimatable then
+                            if ns.AuraCompat.IsEstimateAllowed(learnKey) then
+                                GameTooltip:AddLine("Estimated bar: ON. Right click to switch it off for this buff.", 0.5, 0.9, 0.5, true)
                             else
-                                GameTooltip:AddLine("Not learned yet. Gain this buff out of combat once, or move it to Tracked Bars for exact timing.", 1, 0.5, 0.5, true)
+                                GameTooltip:AddLine("Estimated bar: OFF. This buff draws nothing unless the game supplies real timing. Right click to switch it on.", 0.6, 0.6, 0.6, true)
                             end
                         end
                         GameTooltip:AddLine("Click to select, then click a Buff or Stack slot above.", 0.5, 0.8, 0.5, true)
@@ -5254,7 +5889,15 @@ local function BuildSettings()
                         GameTooltip:Hide()
                     end)
 
-                    btn:SetScript("OnClick", function(self)
+                    btn:SetScript("OnClick", function(self, button)
+                        if button == "RightButton" then
+                            if not estimatable then return end
+                            ns.AuraCompat.SetEstimateAllowed(learnKey,
+                                not ns.AuraCompat.IsEstimateAllowed(learnKey))
+                            RefreshEstimateDot()
+                            self:GetScript("OnEnter")(self)
+                            return
+                        end
                         if selectedBuff == buffCdID then
                             CancelSelection()
                             statusText:SetText("")
@@ -6042,6 +6685,20 @@ local function BuildSettings()
         end)
     AddTogWidget(forceAlwaysCheck)
 
+    local autoPairCheck = CreateCheckbox(togContent, "Pair Buffs Automatically",
+        "Off by default. Pair rows by hand on the Bars and Icons tabs. Turn this on to have empty pairings filled in from the Cooldown Manager instead, preferring a Tracked Bars entry, which is a guess and can light a row on the wrong aura.",
+        CONFIG.autoPairBuffs == true, function(v)
+            CONFIG.autoPairBuffs = v
+            if v and not InCombatLockdown() then
+                -- Switching it on is the explicit "fill my empty rows", so it
+                -- forgets which rows were cleared by hand. Nothing else does.
+                CONFIG.pairingCleared = {}
+                if ns.AutoPopulateSelfBuffMappings then ns.AutoPopulateSelfBuffMappings() end
+            end
+            ns.SaveCurrentProfile()
+        end)
+    AddTogWidget(autoPairCheck)
+
     local hideEssentialCheck = CreateCheckbox(togContent, "Hide Essential CDs",
         "Hide Blizzard's Essential Cooldown viewer (rotational abilities).",
         CONFIG.hideEssentialCD, function(v)
@@ -6168,6 +6825,7 @@ local function BuildSettings()
         pastBarsCheck:SetChecked(CONFIG.showPastBars ~= false)
         variantNamesCheck:SetChecked(CONFIG.showVariantNames or false)
         forceAlwaysCheck:SetChecked(CONFIG.forceViewersAlways ~= false)
+        autoPairCheck:SetChecked(CONFIG.autoPairBuffs == true)
         hideEssentialCheck:SetChecked(CONFIG.hideEssentialCD)
         hideUtilityCheck:SetChecked(CONFIG.hideUtilityCD)
         hideBuffIconCheck:SetChecked(CONFIG.hideBuffIconCD)
@@ -6209,6 +6867,148 @@ local function BuildSettings()
     profY = profY + profileAutoHint:GetStringHeight() + 12
 
     -- Load Profile section
+    local copyHeader = CreateSectionHeader(profContent, "Copy Icons From Another Spec")
+    copyHeader:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    profY = profY + 22
+
+    local copyHint = profContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    copyHint:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    copyHint:SetWidth(460)
+    copyHint:SetJustifyH("LEFT")
+    copyHint:SetSpacing(2)
+    copyHint:SetText("Replaces this spec's icons with another spec's, buff pairings included. Rows this spec cannot use hide themselves.")
+    profY = profY + copyHint:GetStringHeight() + 8
+
+    local copySelectBtn = CreateFrame("Button", nil, profContent, "UIPanelButtonTemplate")
+    copySelectBtn:SetSize(240, 24)
+    copySelectBtn:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
+    copySelectBtn:SetText("Select a source...")
+    copySelectBtn.selectedValue = nil
+
+    local copyMenuFrame = CreateFrame("Frame", nil, copySelectBtn, "BackdropTemplate")
+    copyMenuFrame:SetPoint("TOPLEFT", copySelectBtn, "BOTTOMLEFT", 0, -2)
+    copyMenuFrame:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8x8",
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
+        edgeSize = 1,
+        insets = {left = 1, right = 1, top = 1, bottom = 1},
+    })
+    copyMenuFrame:SetBackdropColor(0.1, 0.1, 0.1, 0.95)
+    copyMenuFrame:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+    copyMenuFrame:SetFrameStrata("DIALOG")
+    copyMenuFrame:Hide()
+
+    local copyBtnCache = {}
+    local copyIconsBtn
+
+    local function RefreshCopyDropdown()
+        for _, b in ipairs(copyBtnCache) do b:Hide() end
+
+        local sources = ns.IconCopySources and ns.IconCopySources() or {}
+        local menuHeight = 4
+        for i, src in ipairs(sources) do
+            local optBtn = copyBtnCache[i]
+            if not optBtn then
+                optBtn = CreateFrame("Button", nil, copyMenuFrame)
+                optBtn:SetSize(236, 20)
+                optBtn:SetNormalFontObject("GameFontHighlightSmall")
+                optBtn:SetHighlightFontObject("GameFontNormalSmall")
+                local hl = optBtn:CreateTexture(nil, "HIGHLIGHT")
+                hl:SetAllPoints()
+                hl:SetColorTexture(0.3, 0.3, 0.5, 0.4)
+                copyBtnCache[i] = optBtn
+            end
+
+            optBtn:Show()
+            optBtn:ClearAllPoints()
+            optBtn:SetPoint("TOPLEFT", 2, -(2 + (i - 1) * 20))
+            optBtn:SetText(src.label)
+            optBtn:GetFontString():SetJustifyH("LEFT")
+            optBtn:GetFontString():SetPoint("LEFT", 4, 0)
+            optBtn:SetScript("OnClick", function()
+                copySelectBtn:SetText(src.label)
+                copySelectBtn.selectedValue = src.key
+                copyMenuFrame:Hide()
+                if copyIconsBtn then
+                    copyIconsBtn:SetText("Copy")
+                    copyIconsBtn.armed = nil
+                end
+            end)
+
+            menuHeight = menuHeight + 20
+        end
+
+        if #sources == 0 then menuHeight = 24 end
+        copyMenuFrame:SetSize(240, menuHeight)
+    end
+
+    copySelectBtn:SetScript("OnClick", function()
+        if copyMenuFrame:IsShown() then
+            copyMenuFrame:Hide()
+        else
+            RefreshCopyDropdown()
+            copyMenuFrame:Show()
+        end
+    end)
+
+    copyMenuFrame:SetScript("OnShow", function()
+        copyMenuFrame:SetScript("OnUpdate", function()
+            if not copyMenuFrame:IsMouseOver() and not copySelectBtn:IsMouseOver() then
+                if IsMouseButtonDown("LeftButton") then
+                    copyMenuFrame:Hide()
+                end
+            end
+        end)
+    end)
+    copyMenuFrame:SetScript("OnHide", function()
+        copyMenuFrame:SetScript("OnUpdate", nil)
+    end)
+
+    copyIconsBtn = CreateFrame("Button", nil, profContent, "UIPanelButtonTemplate")
+    copyIconsBtn:SetSize(110, 24)
+    copyIconsBtn:SetText("Copy")
+    copyIconsBtn:SetPoint("LEFT", copySelectBtn, "RIGHT", 8, 0)
+    copyIconsBtn:SetScript("OnClick", function(self)
+        local key = copySelectBtn.selectedValue
+        if not key then
+            print("|cff00ff00[Infall]|r Pick a source to copy from first.")
+            return
+        end
+        if InCombatLockdown() then
+            print("|cff00ff00[Infall]|r Not in combat.")
+            return
+        end
+
+        -- Second click confirms. This replaces what is already here, and there is
+        -- no undo short of a saved named profile.
+        local existing = #(CONFIG.iconList or {})
+        if existing > 0 and not self.armed then
+            self.armed = true
+            self:SetText("Replace " .. existing .. "?")
+            return
+        end
+
+        local ok, result, paired = ns.CopyIconsFromProfile(key)
+        self.armed = nil
+        self:SetText("Copy")
+        if not ok then
+            print("|cff00ff00[Infall]|r Could not copy icons: " .. tostring(result))
+            return
+        end
+        if refreshSettingsUI then refreshSettingsUI() end
+        print("|cff00ff00[Infall]|r Copied " .. tostring(result) .. " icons and "
+            .. tostring(paired) .. " buff pairings. Rows this spec cannot use are hidden, delete them on the Icons tab.")
+    end)
+    copyIconsBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Copy Icons")
+        GameTooltip:AddLine("Click twice to confirm. Other characters of the same class are listed too. A pairing this spec already has is never replaced.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    copyIconsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    profY = profY + 34
+
     local loadHeader = CreateSectionHeader(profContent, "Load Profile")
     loadHeader:SetPoint("TOPLEFT", profContent, "TOPLEFT", 10, -profY)
     profY = profY + 22
@@ -6668,17 +7468,33 @@ local function BuildSettings()
     Settings.RegisterAddOnCategory(category)
     ns.settingsCategoryID = category:GetID()
 
-    -- Make settings panel movable
+    -- Make settings panel movable. StopMovingOrSizing is protected on this frame,
+    -- so calling it in combat is refused and leaves the panel on the cursor. The
+    -- stop is deferred to combat end instead of being made and blocked.
     local panel = SettingsPanel
     if panel then
         panel:SetMovable(true)
         panel:SetClampedToScreen(true)
         panel:RegisterForDrag("LeftButton")
+
+        local function StopPanelMove()
+            if not panel.infallMoving then return end
+            if InCombatLockdown() then return end
+            panel.infallMoving = nil
+            panel:StopMovingOrSizing()
+        end
+
         panel:HookScript("OnDragStart", function(self)
             if InCombatLockdown() then return end
+            self.infallMoving = true
             self:StartMoving()
         end)
-        panel:HookScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+        panel:HookScript("OnDragStop", StopPanelMove)
+        panel:HookScript("OnHide", StopPanelMove)
+
+        local combatWatch = CreateFrame("Frame")
+        combatWatch:RegisterEvent("PLAYER_REGEN_ENABLED")
+        combatWatch:SetScript("OnEvent", StopPanelMove)
     end
 
     SelectTab(1)

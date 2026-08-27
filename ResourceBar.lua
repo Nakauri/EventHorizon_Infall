@@ -149,7 +149,8 @@ local function CreateResourceBarFrames()
 
     resourcePipFrame = CreateFrame("Frame", nil, resourceRowFrame)
 
-    local bs = 1
+    -- Placeholder only: the rebuild below re-derives this in real pixels.
+    local bs = ns.OnePxForFrame(resourcePipFrame)
     local bTop = resourcePipFrame:CreateTexture(nil, "BACKGROUND")
     bTop:SetPoint("TOPLEFT") bTop:SetPoint("TOPRIGHT")
     bTop:SetHeight(bs)
@@ -618,7 +619,10 @@ RebuildResourceBar = function()
     local barColor = rb.barColor or GetAutoColor()
     resourceBar:SetStatusBarColor(barColor[1], barColor[2], barColor[3], barColor[4] or 1)
 
-    local bs = rb.borderSize or 1
+    -- Border thickness counts real pixels, not UI units. A UI unit is bigger than
+    -- a pixel on any high resolution display, so the bar inside sat short of its
+    -- own frame by the difference on every edge.
+    local bs = (rb.borderSize or 1) * ns.OnePxForFrame(resourcePipFrame)
     local bc = rb.borderColor or CONFIG.bordercolor or {0, 0, 0, 1}
     local bTop, bBot, bLeft, bRight = unpack(resourcePipFrame._borders)
     for _, border in ipairs(resourcePipFrame._borders) do

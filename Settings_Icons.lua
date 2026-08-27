@@ -900,6 +900,18 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         for _, e in ipairs(CONFIG.iconList or {}) do
             if e == entry then return e end
         end
+        -- ApplyProfile rebuilds iconList with DeepCopy, so an open window's entry
+        -- stops being the live table. Returning nil here does not fail loudly: it
+        -- reads as the general scope, and every write from that window silently
+        -- lands on the shared settings instead of the icon. Repoint by identity.
+        local id = entry.cooldownID or entry.key
+        if id == nil then return nil end
+        for _, e in ipairs(CONFIG.iconList or {}) do
+            if (e.cooldownID or e.key) == id
+                and (e.container or "TOP") == (entry.container or "TOP") then
+                return e
+            end
+        end
         return nil
     end
 
@@ -1273,18 +1285,28 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
     -- The data provider reflects where the player actually put things.
     -- GetCooldownViewerCategorySet reports STATIC DEFAULTS, so anything dragged
     -- to another section, potions especially, never showed up.
-    local function CategoryIDs(cat)
-        local shown = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(cat)
-        if shown and #shown > 0 then return shown end
-        local ok, set = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, cat, false)
+    -- An empty table is an answer, not a failure: only nil means unreadable.
+    -- Falling back on empty repopulates the pool from static defaults with the
+    -- entries the player just moved out of that section.
+    -- allowUnknown is for the buff categories only. A multi variant spell parks
+    -- its buff entry under the variant that is not talented, so the Cooldown
+    -- Manager greys it out while the player still has the ability and the aura.
+    -- Ability categories stay learned only, or the pool fills with spells the
+    -- player does not have.
+    local function CategoryIDs(cat, allowUnknown)
+        local shown = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(cat, allowUnknown)
+        if type(shown) == "table" then return shown end
+        local ok, set = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, cat,
+            allowUnknown and true or false)
         return (ok and set) or {}
     end
 
     local function PoolIDs()
         local seen, ids = {}, {}
-        local cats = (activePool == 1) and { 0, 1 } or { 2, 3 }
+        local isBuffPool = activePool ~= 1
+        local cats = isBuffPool and { 2, 3 } or { 0, 1 }
         for _, cat in ipairs(cats) do
-            for _, id in ipairs(CategoryIDs(cat)) do
+            for _, id in ipairs(CategoryIDs(cat, isBuffPool)) do
                 if not seen[id] then seen[id] = true ids[#ids + 1] = id end
             end
         end

@@ -2,7 +2,7 @@
 ## Title: EventHorizon Infall
 ## Notes: Event Horizon for Midnight, cooldown timeline bars driven by CDM
 ## Author: Infall
-## Version: 1.3.7
+## Version: 1.3.9
 ## IconTexture: Interface\Icons\Spell_animamaw_orb
 ## SavedVariables: InfallDB
 

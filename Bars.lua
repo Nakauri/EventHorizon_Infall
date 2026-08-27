@@ -295,6 +295,47 @@ end
 
 local channelRetryPending = false
 
+-- Channels whose final tick interval is a clip window, shaded on the cast
+-- segment. The fraction is always 1/intervals, so only the interval count
+-- differs per spell.
+--
+-- A MISSILE channel fires at both ends, so its interval count is one less than
+-- its shot count. Getting that fencepost wrong is how this ships one tick out.
+--
+-- Shot and interval counts are talent dependent but never haste dependent:
+-- haste shortens the channel without changing how many shots it contains, so
+-- one fraction stays correct across gear.
+local CHANNEL_CLIP = {
+    -- Disintegrate. Azure Celerity shortens the interval only, which adds one.
+    [356995] = { intervals = 3, modSpell = 1219723, modIntervals = 4 },
+
+    -- Rapid Fire. 7 shots base, so 6 intervals. Quick Draw adds 3 shots and
+    -- leaves the channel length alone. The clip point is SimC's
+    -- `interrupt_if=talent.unload&ticks_remain<2`, which is this last interval.
+    [257044] = { missiles = 7, addMissiles = { [459794] = 3 } },
+}
+
+local function ChannelClipFraction(spellID)
+    local def = CHANNEL_CLIP[spellID]
+    if not def then return nil end
+
+    local intervals
+    if def.missiles then
+        local shots = def.missiles
+        for talentID, extra in pairs(def.addMissiles or {}) do
+            if ns.IsTalentKnown(talentID) then shots = shots + extra end
+        end
+        intervals = shots - 1
+    elseif def.modSpell and ns.IsTalentKnown(def.modSpell) then
+        intervals = def.modIntervals
+    else
+        intervals = def.intervals
+    end
+
+    if not intervals or intervals < 1 then return nil end
+    return 1 / intervals
+end
+
 local function UpdateCastBar(event, isRetry)
     local name, text, texture, startTimeMS, endTimeMS, isTradeSkill, castID, notInterruptible, spellID
     local isChannel
@@ -370,7 +411,7 @@ local function UpdateCastBar(event, isRetry)
                 local startSec = startTimeMS / 1000
                 local durSec = (endTimeMS - startTimeMS) / 1000
                 activeCast.isChannel = isChannel
-                if isEmpowered or activeCast.isDisintegrate then
+                if isEmpowered or activeCast.hasClipWindow then
                     activeCast.startTimeSec = startSec
                 end
                 if C_DurationUtil and durSec > 0 then
@@ -467,12 +508,12 @@ local function UpdateCastBar(event, isRetry)
                 targetRow.castTex:SetVertexColor(unpack(color))
                 targetRow.castTex:Show()
 
-                -- Disintegrate chain window: coloured tail segment
-                if spellID == 356995 then
-                    activeCast.isDisintegrate = true
+                -- Clip window: coloured tail segment on the final tick interval
+                local clipFraction = ChannelClipFraction(spellID)
+                if clipFraction then
+                    activeCast.hasClipWindow = true
                     activeCast.startTimeSec = startSec
-                    local maxTicks = C_SpellBook.IsSpellKnown(1219723) and 5 or 4
-                    activeCast.chainWindowFraction = 1 / (maxTicks - 1)
+                    activeCast.chainWindowFraction = clipFraction
 
                     if not targetRow.chainWindowTex then
                         local tex = targetRow.castFrame:CreateTexture(nil, "ARTWORK", nil, 1)
@@ -612,7 +653,7 @@ local function UpdateActiveCastBar()
             end
         else
             -- Non-empowered cast/channel
-            if activeCast.isDisintegrate and row.chainWindowTex then
+            if activeCast.hasClipWindow and row.chainWindowTex then
                 -- Disintegrate: split into main segment + chain window tail
                 local elapsed = GetTime() - activeCast.startTimeSec
                 local totalDur = remaining + elapsed
@@ -1108,7 +1149,11 @@ end
 ns.ApplyBuffLayer = ApplyBuffLayer
 
 local function ApplyLayoutToAllBars()
-    EH_Parent:SetWidth(GetContainerWidth())
+    -- Snapped so the box ends on a whole pixel. The pip rows and the resource bar
+    -- lay out to a snapped copy of this width, and an unsnapped box left them
+    -- disagreeing by up to a pixel at the right edge. Timeline geometry reads
+    -- CONFIG.width, never the frame width, so nothing that encodes time moves.
+    EH_Parent:SetWidth(ns.SnapPx(GetContainerWidth(), ns.OnePxForFrame(EH_Parent)))
     
     ResizeContainer()
     
@@ -2022,6 +2067,23 @@ local viewerScanDirty = true
 local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
 local hookedAuraFrames = setmetatable({}, { __mode = "k" })
 
+-- Mirror push. The Cooldown Manager writes its own bar every frame while a row
+-- is active, so forwarding that write lands the value the moment it is produced
+-- instead of reading it back on our own clock one tick later. Set false to fall
+-- back to the read path alone.
+--
+-- VALUE ONLY. Our min max stays (0, CONFIG.future) because the lane width is the
+-- future window in pixels; taking theirs turns every lane into a percentage.
+local MIRROR_PUSH = true
+-- Only has to outlast one client frame. Short on purpose: a redundant read is
+-- harmless, holding a stale lane is not.
+local MIRROR_FRESH = 0.2
+local mirrorRowsByCdID = {}
+local hookedMirrorBars = setmetatable({}, { __mode = "k" })
+local mirrorInterp = nil
+local mirrorPushCount, mirrorPollCount = 0, 0
+local InstallMirrorBarHook, RegisterMirrorRow
+
 local function MarkBuffDirtyForCdID(cdID)
     for _, row in ipairs(cooldownBars) do
         if row.cooldownID == cdID then
@@ -2043,6 +2105,10 @@ InstallBuffFrameHooks = function(frame)
     if frame.SetAuraInstanceInfo then
         hooksecurefunc(frame, "SetAuraInstanceInfo", function(self)
             AC.NoteAuraStart(self)
+            -- Measured on application, not on the sweep: the sweep runs every two
+            -- seconds and a short buff can start and end between two of them, so
+            -- it never got measured at all. No-ops while auras are restricted.
+            AC.Learn(self)
             local cdID = cdmFrameToCdID[self]
             if not cdID then cdID = self.cooldownID end
             if cdID then
@@ -2066,6 +2132,7 @@ InstallBuffFrameHooks = function(frame)
             if cdID then MarkBuffDirtyForCdID(cdID) end
         end)
     end
+    if InstallMirrorBarHook then InstallMirrorBarHook(frame) end
 end
 
 ScanViewerFrames = function()
@@ -2325,6 +2392,30 @@ UpdateChargeState = function(row)
     end
 end
 
+-- Pre-allocated buff entry tables (reused per UpdateBuffState call)
+local _primaryBuffEntry = {}
+local _overlayBuffEntry = {}
+local _thirdBuffEntry = {}
+
+-- One row per buff lane. Values are literal field names; never a secret key.
+local BUFF_LANES = {
+    { entry = _primaryBuffEntry, bar = "buffBar",        timer = "buff",
+      dur = "activeBuffDuration",        mirror = "_auraMirrorCdID",
+      color = "resolvedBuffColor",       tracked = "trackedBuffAuraInstanceID",
+      totemSlot = "_totemSlot",          totemFed = "_totemCooldownFed",
+      push = "_mirrorPushAt" },
+    { entry = _overlayBuffEntry, bar = "buffBarOverlay", timer = "overlay",
+      dur = "activeBuffOverlayDuration", mirror = "_auraMirrorCdIDOverlay",
+      color = "resolvedOverlayColor",    tracked = "trackedOverlayAuraInstanceID",
+      totemSlot = "_overlayTotemSlot",   totemFed = "_overlayTotemFed",
+      push = "_mirrorPushAtOverlay" },
+    { entry = _thirdBuffEntry,   bar = "buffBarThird",   timer = "third",
+      dur = "activeBuffThirdDuration",   mirror = "_auraMirrorCdIDThird",
+      color = "resolvedThirdColor",      tracked = "trackedThirdAuraInstanceID",
+      totemSlot = "_thirdTotemSlot",     totemFed = "_thirdTotemFed",
+      push = "_mirrorPushAtThird" },
+}
+
 local function ResolveBuffColor(buffEntry)
     if buffEntry.hasCustomColor then
         return buffEntry.color
@@ -2337,27 +2428,89 @@ end
 
 
 -- Pre-allocated buff entry tables (reused per UpdateBuffState call)
-local _primaryBuffEntry = {}
-local _overlayBuffEntry = {}
-local _thirdBuffEntry = {}
 
 -- One row per buff lane. Values are literal field names; never a secret key.
-local BUFF_LANES = {
-    { entry = _primaryBuffEntry, bar = "buffBar",        timer = "buff",
-      dur = "activeBuffDuration",        mirror = "_auraMirrorCdID",
-      color = "resolvedBuffColor",       tracked = "trackedBuffAuraInstanceID",
-      totemSlot = "_totemSlot",          totemFed = "_totemCooldownFed" },
-    { entry = _overlayBuffEntry, bar = "buffBarOverlay", timer = "overlay",
-      dur = "activeBuffOverlayDuration", mirror = "_auraMirrorCdIDOverlay",
-      color = "resolvedOverlayColor",    tracked = "trackedOverlayAuraInstanceID",
-      totemSlot = "_overlayTotemSlot",   totemFed = "_overlayTotemFed" },
-    { entry = _thirdBuffEntry,   bar = "buffBarThird",   timer = "third",
-      dur = "activeBuffThirdDuration",   mirror = "_auraMirrorCdIDThird",
-      color = "resolvedThirdColor",      tracked = "trackedThirdAuraInstanceID",
-      totemSlot = "_thirdTotemSlot",     totemFed = "_thirdTotemFed" },
-}
 
 local _buffLanes = {}
+
+-- A row registers itself against the buff cooldownID it mirrors. The list is
+-- append only; the lane test below is what keeps a stale entry harmless, so
+-- there is no bookkeeping at the twelve sites that clear a mirror id.
+RegisterMirrorRow = function(cdID, row)
+    if not MIRROR_PUSH or not cdID or not row then return end
+    local list = mirrorRowsByCdID[cdID]
+    if not list then
+        list = {}
+        mirrorRowsByCdID[cdID] = list
+    end
+    for i = 1, #list do
+        if list[i] == row then return end
+    end
+    list[#list + 1] = row
+end
+
+-- Runs inside Blizzard's own call stack, so it must be incapable of erroring:
+-- table lookups, a secret accepting SetValue, and one comparison against a
+-- literal zero that Blizzard pushes as a plain number. No arithmetic on v, ever.
+InstallMirrorBarHook = function(frame)
+    if not MIRROR_PUSH then return end
+    -- Bare read, matching FillBuffLaneBar: callers only ever pass a live pooled
+    -- frame, either from an out of combat walk or from the SetCooldownID hook.
+    local bar = frame.Bar
+    if not bar or not bar.SetValue or hookedMirrorBars[bar] then return end
+    hookedMirrorBars[bar] = true
+
+    hooksecurefunc(bar, "SetValue", function(_, v)
+        local cdID = cdmFrameToCdID[frame]
+        if not cdID then return end
+        local list = mirrorRowsByCdID[cdID]
+        if not list then return end
+        local now = GetTime()
+        for i = 1, #list do
+            local row = list[i]
+            for l = 1, 3 do
+                local lane = BUFF_LANES[l]
+                -- The identity re-check: a pooled frame can be reassigned, and
+                -- only the row that currently mirrors THIS id may be written.
+                if row[lane.mirror] == cdID and row[lane.tracked] then
+                    local b = row[lane.bar]
+                    if b then
+                        b:SetValue(v, mirrorInterp)
+                        row[lane.push] = now
+                        mirrorPushCount = mirrorPushCount + 1
+                    end
+                end
+            end
+        end
+    end)
+
+    if bar.SetMinMaxValues then
+        hooksecurefunc(bar, "SetMinMaxValues", function(_, _, mx)
+            -- Their inactive push is a literal SetMinMaxValues(0, 0), so this
+            -- is a non-secret comparison and the only clean "row went dead"
+            -- edge available. Never mirror their scale onto our lane.
+            if issecretvalue and issecretvalue(mx) then return end
+            if mx ~= 0 then return end
+            local cdID = cdmFrameToCdID[frame]
+            if not cdID then return end
+            local list = mirrorRowsByCdID[cdID]
+            if not list then return end
+            for i = 1, #list do
+                local row = list[i]
+                for l = 1, 3 do
+                    if row[BUFF_LANES[l].mirror] == cdID then
+                        row[BUFF_LANES[l].push] = nil
+                        row._buffDirty = true
+                    end
+                end
+            end
+        end)
+    end
+end
+
+ns.MirrorStats = function()
+    return mirrorPushCount, mirrorPollCount, MIRROR_PUSH
+end
 
 -- Callers must test the lane is unclaimed first; these wipe the shared entry table.
 local function FillAuraLane(laneIdx, frame, mapData, unitHint, secretAuraSpellId)
@@ -2382,6 +2535,88 @@ local function FillTotemLane(laneIdx, frame, mapData, totemSlot)
     e.totemSlot = totemSlot
     return e
 end
+
+-- Lanes 2 and 3 were byte-identical copies of each other, so every buff lane
+-- change had to be made twice and the third one was where it got missed. Lane 1
+-- is NOT a copy: it also carries the pandemic pulse, the variant name and the
+-- potion window, so it stays written out rather than growing flags in here.
+local function UpdateSecondaryLane(row, buffEntry, lane)
+    local bar = row[lane.bar]
+    if not bar then return end
+
+    if not buffEntry then
+        bar:Hide()
+        row[lane.dur] = nil
+        row[lane.color] = nil
+        row[lane.tracked] = nil
+        row[lane.mirror] = nil
+        row[lane.totemSlot] = nil
+        row[lane.totemFed] = false
+        FeedHiddenCooldown(row, lane.timer, nil)
+        return
+    end
+
+    local resolvedColor = ResolveBuffColor(buffEntry)
+    row[lane.color] = resolvedColor
+    bar:SetStatusBarColor(unpack(resolvedColor))
+
+    local hidden = row["hidden_" .. lane.timer]
+    local lastPtr = "lastPtr_" .. lane.timer
+
+    if buffEntry.totemSlot then
+        if not row[lane.totemFed] then
+            -- Bound first: passing the call through directly would forward any
+            -- extra return values as further arguments.
+            local totemDurObj = GetTotemDuration(buffEntry.totemSlot)
+            FeedHiddenCooldownRaw(row, lane.timer, totemDurObj)
+            row[lane.totemFed] = true
+        end
+        row[lane.dur] = nil
+        row[lane.totemSlot] = buffEntry.totemSlot
+        if hidden:IsShown() then bar:Show() else bar:Hide() end
+        row[lane.tracked] = nil
+        return
+    end
+
+    row[lane.totemSlot] = nil
+    -- A custom lane carries its own ids and length, so there is nothing for the
+    -- resolver to read off a frame it does not have.
+    local kind, payload
+    if buffEntry.timerDurObj then
+        kind, payload = "durobj", buffEntry.timerDurObj
+    else
+        kind, payload = AC.ResolveFill(buffEntry.frame, buffEntry.unit)
+    end
+    if kind == "permanent" then
+        row[lane.dur] = nil
+        row[lane.mirror] = nil
+        bar:SetValue(CONFIG.future)
+        bar:Show()
+        row[lane.tracked] = buffEntry.frame and buffEntry.frame.auraInstanceID or nil
+        if hidden and row[lastPtr] ~= true then
+            hidden:SetCooldown(GetTime(), 86400)
+            row[lastPtr] = true
+        end
+    elseif kind then
+        row[lane.dur] = (kind == "durobj") and payload or nil
+        local newMirror = (kind == "mirror") and buffEntry.frame.cooldownID or nil
+        if row[lane.mirror] ~= newMirror then row[lane.push] = nil end
+        row[lane.mirror] = newMirror
+        if newMirror then RegisterMirrorRow(newMirror, row) end
+        FeedHiddenCooldown(row, lane.timer, row[lane.dur])
+        row[lane.tracked] = buffEntry.frame and buffEntry.frame.auraInstanceID or nil
+        if not bar:IsShown() then bar:SetValue(0) end
+        bar:Show()
+    else
+        bar:Hide()
+        row[lane.dur] = nil
+        row[lane.color] = nil
+        row[lane.tracked] = nil
+        row[lane.mirror] = nil
+        FeedHiddenCooldown(row, lane.timer, nil)
+    end
+end
+
 
 UpdateBuffState = function(row, buffViewerFrames)
     if row.isExtras and row.extrasType ~= "custom" then return end
@@ -2464,6 +2699,61 @@ UpdateBuffState = function(row, buffViewerFrames)
         end
     end
 
+    -- Unfed frame pass, for frames the game leaves without an auraInstanceID
+    -- while the buff is up. The read decides presence, so a down aura resolves
+    -- to nothing. Needs a frame to exist: an unlearned entry has none.
+    if row.cooldownID and mappings and AC.AuraFill then
+        for mapIdx, mapData in ipairs(mappings) do
+            if mapIdx <= 3 and not _buffLanes[mapIdx] and mapData.buffCooldownIDs then
+                for _, mappedID in ipairs(mapData.buffCooldownIDs) do
+                    local buffFrame = buffViewerFrames[mappedID]
+                    if buffFrame and not buffFrame.auraInstanceID
+                        and AC.AuraFill(buffFrame, mapData.unit) then
+                        _buffLanes[mapIdx] = FillAuraLane(mapIdx, buffFrame, mapData,
+                            mapData.unit or "player", nil)
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Custom timer pass. Produced as a plain DurationObject so it travels the
+    -- same path every other lane uses, which is what lets it work in all three.
+    local customStarts = row._customTimerStart
+    if mappings and customStarts then
+        local now = GetTime()
+        for mapIdx, mapData in ipairs(mappings) do
+            if mapIdx <= 3 and not _buffLanes[mapIdx] and mapData.customDuration then
+                local startedAt = customStarts[mapIdx]
+                if startedAt and (now - startedAt) < mapData.customDuration then
+                    -- Cached on the start stamp. FeedHiddenCooldown skips a
+                    -- re-feed by pointer identity, so a new object each pass
+                    -- re-feeds forever and OnCooldownDone never fires.
+                    row._customTimerObj = row._customTimerObj or {}
+                    local cached = row._customTimerObj[mapIdx]
+                    local durObj
+                    if cached and cached.at == startedAt
+                        and cached.dur == mapData.customDuration then
+                        durObj = cached.obj
+                    else
+                        durObj = C_DurationUtil.CreateDuration()
+                        durObj:SetTimeFromStart(startedAt, mapData.customDuration)
+                        row._customTimerObj[mapIdx] =
+                            { at = startedAt, dur = mapData.customDuration, obj = durObj }
+                    end
+                    local e = BUFF_LANES[mapIdx].entry
+                    wipe(e)
+                    e.timerDurObj = durObj
+                    e.color = mapData.color or CONFIG.buffColor
+                    e.hasCustomColor = mapData.color ~= nil
+                    e.unit = mapData.unit
+                    _buffLanes[mapIdx] = e
+                end
+            end
+        end
+    end
+
     -- Glow-gated: suppress buff bar but preserve secretAuraSpellId for variant text.
     local primaryBuff, overlayBuff, thirdBuff = _buffLanes[1], _buffLanes[2], _buffLanes[3]
 
@@ -2482,7 +2772,10 @@ UpdateBuffState = function(row, buffViewerFrames)
 
     -- A live potion window is checked first: a resolved lane on a potion row
     -- gives an empty mirror, which would hide the window's bar.
+    -- A timer the player set for this row beats the automatic potion window,
+    -- which would otherwise own the lane for its full 30s and discard it.
     local potionWindowLive = row._potionWindowExpiry and GetTime() < row._potionWindowExpiry
+        and not (primaryBuff and primaryBuff.timerDurObj)
     if potionWindowLive then
         -- Owned by the window. Reapplying it each tick makes the bar strobe.
     elseif primaryBuff then
@@ -2516,7 +2809,15 @@ UpdateBuffState = function(row, buffViewerFrames)
             row.secretAuraSpellId = nil
         else
             row._totemSlot = nil
-            local fillKind, fillPayload, resolvedUnit = AC.ResolveFill(primaryBuff.frame, primaryBuff.unit)
+            -- A frameless or user declared lane carries its own ids and length, so
+            -- there is nothing for the resolver to read off a frame it does not have.
+            local fillKind, fillPayload, resolvedUnit
+            if primaryBuff.timerDurObj then
+                fillKind, fillPayload = "durobj", primaryBuff.timerDurObj
+            else
+                fillKind, fillPayload, resolvedUnit =
+                    AC.ResolveFill(primaryBuff.frame, primaryBuff.unit)
+            end
             if resolvedUnit and resolvedUnit ~= primaryBuff.unit then
                 primaryBuff.unit = resolvedUnit
             end
@@ -2531,7 +2832,8 @@ UpdateBuffState = function(row, buffViewerFrames)
                 end
                 row.buffBar:SetValue(CONFIG.future)
                 row.buffBar:Show()
-                row.trackedBuffAuraInstanceID = primaryBuff.frame.auraInstanceID
+                row.trackedBuffAuraInstanceID = primaryBuff.frame
+                    and primaryBuff.frame.auraInstanceID or nil
                 row.secretAuraSpellId = primaryBuff.secretAuraSpellId
                 if row.hidden_buff and row.lastPtr_buff ~= true then
                     row.hidden_buff:SetCooldown(GetTime(), 86400)
@@ -2539,10 +2841,16 @@ UpdateBuffState = function(row, buffViewerFrames)
                 end
             elseif fillKind then
                 row.activeBuffDuration = (fillKind == "durobj") and fillPayload or nil
-                row._auraMirrorCdID = (fillKind == "mirror") and primaryBuff.frame.cooldownID or nil
+                local newMirror = (fillKind == "mirror") and primaryBuff.frame.cooldownID or nil
+                -- Freshness belongs to the source. Keeping it across a source
+                -- change lets the lane hold the previous aura's value.
+                if row._auraMirrorCdID ~= newMirror then row._mirrorPushAt = nil end
+                row._auraMirrorCdID = newMirror
+                if newMirror then RegisterMirrorRow(newMirror, row) end
 
                 if primaryBuff.unit == "target" and CONFIG.pandemicPulse then
-                    row.cachedPandemicIcon = primaryBuff.frame.PandemicIcon
+                    row.cachedPandemicIcon = primaryBuff.frame
+                        and primaryBuff.frame.PandemicIcon or nil
                 else
                     row.cachedPandemicIcon = nil
                 end
@@ -2556,7 +2864,8 @@ UpdateBuffState = function(row, buffViewerFrames)
                 end
                 row.buffBar:Show()
                 FeedHiddenCooldown(row, "buff", row.activeBuffDuration)
-                row.trackedBuffAuraInstanceID = primaryBuff.frame.auraInstanceID
+                row.trackedBuffAuraInstanceID = primaryBuff.frame
+                    and primaryBuff.frame.auraInstanceID or nil
                 row.secretAuraSpellId = primaryBuff.secretAuraSpellId
             else
                 row.buffBar:Hide()
@@ -2593,137 +2902,8 @@ UpdateBuffState = function(row, buffViewerFrames)
         FeedHiddenCooldown(row, "buff", nil)
     end
 
-    -- Overlay lane → buffBarOverlay
-    if overlayBuff and row.buffBarOverlay then
-        local resolvedOverlayColor = ResolveBuffColor(overlayBuff)
-        row.resolvedOverlayColor = resolvedOverlayColor
-        row.buffBarOverlay:SetStatusBarColor(unpack(resolvedOverlayColor))
-
-        if overlayBuff.totemSlot then
-            if not row._overlayTotemFed then
-                local totemDurObj = GetTotemDuration(overlayBuff.totemSlot)
-                if totemDurObj then
-                    FeedHiddenCooldownRaw(row, "overlay", totemDurObj)
-                else
-                    FeedHiddenCooldownRaw(row, "overlay", nil)
-                end
-                row._overlayTotemFed = true
-            end
-            row.activeBuffOverlayDuration = nil
-            row._overlayTotemSlot = overlayBuff.totemSlot
-            if row.hidden_overlay:IsShown() then
-                row.buffBarOverlay:Show()
-            else
-                row.buffBarOverlay:Hide()
-            end
-            row.trackedOverlayAuraInstanceID = nil
-        else
-            row._overlayTotemSlot = nil
-            local kind2, payload2 = AC.ResolveFill(overlayBuff.frame, overlayBuff.unit)
-            if kind2 == "permanent" then
-                row.activeBuffOverlayDuration = nil
-                row._auraMirrorCdIDOverlay = nil
-                row.buffBarOverlay:SetValue(CONFIG.future)
-                row.buffBarOverlay:Show()
-                row.trackedOverlayAuraInstanceID = overlayBuff.frame.auraInstanceID
-                if row.hidden_overlay and row.lastPtr_overlay ~= true then
-                    row.hidden_overlay:SetCooldown(GetTime(), 86400)
-                    row.lastPtr_overlay = true
-                end
-            elseif kind2 then
-                row.activeBuffOverlayDuration = (kind2 == "durobj") and payload2 or nil
-                row._auraMirrorCdIDOverlay = (kind2 == "mirror") and overlayBuff.frame.cooldownID or nil
-                FeedHiddenCooldown(row, "overlay", row.activeBuffOverlayDuration)
-                row.trackedOverlayAuraInstanceID = overlayBuff.frame.auraInstanceID
-                if not row.buffBarOverlay:IsShown() then
-                    row.buffBarOverlay:SetValue(0)
-                end
-                row.buffBarOverlay:Show()
-            else
-                row.buffBarOverlay:Hide()
-                row.activeBuffOverlayDuration = nil
-                row.resolvedOverlayColor = nil
-                row.trackedOverlayAuraInstanceID = nil
-                row._auraMirrorCdIDOverlay = nil
-                FeedHiddenCooldown(row, "overlay", nil)
-            end
-        end
-    elseif row.buffBarOverlay then
-        row.buffBarOverlay:Hide()
-        row.activeBuffOverlayDuration = nil
-        row.resolvedOverlayColor = nil
-        row.trackedOverlayAuraInstanceID = nil
-        row._auraMirrorCdIDOverlay = nil
-        row._overlayTotemSlot = nil
-        row._overlayTotemFed = false
-        FeedHiddenCooldown(row, "overlay", nil)
-    end
-
-    -- Third lane → buffBarThird
-    if thirdBuff and row.buffBarThird then
-        local resolvedThirdColor = ResolveBuffColor(thirdBuff)
-        row.resolvedThirdColor = resolvedThirdColor
-        row.buffBarThird:SetStatusBarColor(unpack(resolvedThirdColor))
-
-        if thirdBuff.totemSlot then
-            if not row._thirdTotemFed then
-                local totemDurObj = GetTotemDuration(thirdBuff.totemSlot)
-                if totemDurObj then
-                    FeedHiddenCooldownRaw(row, "third", totemDurObj)
-                else
-                    FeedHiddenCooldownRaw(row, "third", nil)
-                end
-                row._thirdTotemFed = true
-            end
-            row.activeBuffThirdDuration = nil
-            row._thirdTotemSlot = thirdBuff.totemSlot
-            if row.hidden_third:IsShown() then
-                row.buffBarThird:Show()
-            else
-                row.buffBarThird:Hide()
-            end
-            row.trackedThirdAuraInstanceID = nil
-        else
-            row._thirdTotemSlot = nil
-            local kind3, payload3 = AC.ResolveFill(thirdBuff.frame, thirdBuff.unit)
-            if kind3 == "permanent" then
-                row.activeBuffThirdDuration = nil
-                row._auraMirrorCdIDThird = nil
-                row.buffBarThird:SetValue(CONFIG.future)
-                row.buffBarThird:Show()
-                row.trackedThirdAuraInstanceID = thirdBuff.frame.auraInstanceID
-                if row.hidden_third and row.lastPtr_third ~= true then
-                    row.hidden_third:SetCooldown(GetTime(), 86400)
-                    row.lastPtr_third = true
-                end
-            elseif kind3 then
-                row.activeBuffThirdDuration = (kind3 == "durobj") and payload3 or nil
-                row._auraMirrorCdIDThird = (kind3 == "mirror") and thirdBuff.frame.cooldownID or nil
-                FeedHiddenCooldown(row, "third", row.activeBuffThirdDuration)
-                row.trackedThirdAuraInstanceID = thirdBuff.frame.auraInstanceID
-                if not row.buffBarThird:IsShown() then
-                    row.buffBarThird:SetValue(0)
-                end
-                row.buffBarThird:Show()
-            else
-                row.buffBarThird:Hide()
-                row.activeBuffThirdDuration = nil
-                row.resolvedThirdColor = nil
-                row.trackedThirdAuraInstanceID = nil
-                row._auraMirrorCdIDThird = nil
-                FeedHiddenCooldown(row, "third", nil)
-            end
-        end
-    elseif row.buffBarThird then
-        row.buffBarThird:Hide()
-        row.activeBuffThirdDuration = nil
-        row.resolvedThirdColor = nil
-        row.trackedThirdAuraInstanceID = nil
-        row._auraMirrorCdIDThird = nil
-        row._thirdTotemSlot = nil
-        row._thirdTotemFed = false
-        FeedHiddenCooldown(row, "third", nil)
-    end
+    UpdateSecondaryLane(row, overlayBuff, BUFF_LANES[2])
+    UpdateSecondaryLane(row, thirdBuff, BUFF_LANES[3])
 
 
 end
@@ -2878,8 +3058,10 @@ end
 
 local function UpdateBuffPastSlide(row, isActive, slideKey, clipKey, colorKey)
     local slide = row[slideKey]
-    if isActive and not slide then
-        row[slideKey] = SpawnPastSlide(row, row[clipKey], row[colorKey] or CONFIG.buffColor, row.cdBar.fullHeight or CONFIG.height, 0)
+    -- Waits for a colour. The repaint below only runs while one exists, so a
+    -- slide spawned on a nil-colour tick keeps the default for its whole life.
+    if isActive and not slide and row[colorKey] then
+        row[slideKey] = SpawnPastSlide(row, row[clipKey], row[colorKey], row.cdBar.fullHeight or CONFIG.height, 0)
     elseif not isActive and slide then
         DetachPastSlide(slide)
         row[slideKey] = nil
@@ -2927,11 +3109,25 @@ local function FillBuffLaneBar(row, lane, interp)
     end
 
     if row[lane.mirror] and row[lane.tracked] then
+        -- A fresh push already wrote this lane with the value the read would
+        -- return. If pushes stop, the read resumes on the next frame by itself.
+        local pushAt = row[lane.push]
+        if pushAt and (GetTime() - pushAt) < MIRROR_FRESH then return end
+
         local mf = ResolveBuffFrame(row[lane.mirror])
         local mbar = mf and mf.Bar
         local ok, val = false, nil
         if mbar then ok, val = pcall(mbar.GetValue, mbar) end
-        if ok then bar:SetValue(val, interp) else bar:Hide() end
+        if ok then
+            bar:SetValue(val, interp)
+            mirrorPollCount = mirrorPollCount + 1
+        else
+            -- A failed read is unknown, not ended. Hiding here painted a
+            -- conclusion the next resolve usually reversed, and only
+            -- UpdateBuffState can show a lane again, so one bad frame cost up
+            -- to a full dirty cycle of blank bar.
+            row._buffDirty = true
+        end
         return
     end
 
@@ -2979,6 +3175,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
     if updateTimer >= 0.033 then
         local interp = GetInterpolation()
+        -- The push runs on Blizzard's frame, between our ticks, so it reads the
+        -- last resolved value rather than recomputing inside their call stack.
+        mirrorInterp = interp
 
         for _, row in ipairs(cooldownBars) do
             -- Cooldown bar fill
@@ -3093,10 +3292,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
                 -- Bottom lane
                 if bottomTexShown and not row.activeChargeSlide then
-                    local barH = row.cdBar.fullHeight or CONFIG.height
                     row.activeChargeSlide = SpawnPastSlide(row,
                         row.pastCdClip, GetCooldownColor(row),
-                        laneH, barH - laneH)
+                        laneH, -ChargeBottomY(row, laneH, row.maxCharges))
                     row._chargeSpawnTime = GetTime()
                 elseif row.activeChargeSlide and not row.activeChargeSlide.detachTime and not bottomTexShown then
                     row.activeChargeSlide.tex:SetAlpha(row.activeChargeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
@@ -3173,7 +3371,9 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             UpdateBuffPastSlide(row, row.buffBarOverlay and row.buffBarOverlay:IsShown(), "activeOverlaySlide", "pastOverlayClip", "resolvedOverlayColor")
             UpdateBuffPastSlide(row, row.buffBarThird and row.buffBarThird:IsShown(), "activeThirdSlide", "pastThirdClip", "resolvedThirdColor")
 
-            -- Pandemic polling
+            -- Pandemic polling. cachedPandemicIcon is the game's own PandemicIcon,
+            -- which exists only during the window, so its shown state is the
+            -- answer and involves no secret value.
             if row.cachedPandemicIcon and CONFIG.pandemicPulse then
                 local panOk, panShown = pcall(row.cachedPandemicIcon.IsShown, row.cachedPandemicIcon)
                 if panOk and panShown then
@@ -3221,6 +3421,10 @@ local function ResetBarState(bar)
     bar.activeBuffDuration = nil
     bar._spellCategoryID = nil
     bar._potionWindowExpiry = nil
+    -- Rows are pooled. A start time left on a recycled row belongs to whatever
+    -- spell used to live here and would draw a phantom bar for the new one.
+    bar._customTimerStart = nil
+    bar._customTimerObj = nil
     bar.activeBuffOverlayDuration = nil
     bar.activeBuffThirdDuration = nil
     bar.resolvedBuffColor = nil
@@ -3501,11 +3705,12 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             -- Over-wide lanes are correct; the wrappers clip them.
             slotPx = math.max(1, (bar.chargeDurationConstant / CONFIG.future) * futureWidth)
         elseif not chargeDurWarned[cooldownID] then
-            -- Without it the lane falls back to full width and drains like a cooldown.
+            -- Without it there is no width that reads as seconds, so the lane is
+            -- left blank rather than filled with a percentage.
             chargeDurWarned[cooldownID] = true
             print("|cff00ff00[Infall]|r No charge duration for "
                 .. (bar.spellName or ("cooldown " .. tostring(cooldownID)))
-                .. ": charge lane will draw full width. Clear restrictions and /reload to fix.")
+                .. ": charge lane will stay empty. Clear restrictions and /reload to fix.")
         end
         bar._chargeSlotPx = slotPx
         -- No duration means no width that reads as seconds: draw nothing
@@ -3856,6 +4061,7 @@ LoadEssentialCooldowns = function()
     end
 
     if ns.AutoPopulateSelfBuffMappings then ns.AutoPopulateSelfBuffMappings() end
+    if ns.RepairSelfBuffPairingsOnce then ns.RepairSelfBuffPairingsOnce() end
 
     if #sortedSpellIDs == 0 then return end
     
@@ -4654,6 +4860,26 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         end
 
 
+        -- Custom timers are armed by the row's own cast.
+        for _, row in ipairs(cooldownBars) do
+            if row.cooldownID and RowMatchesCastSpell(row, spellID) then
+                local m = CONFIG.buffMappings and CONFIG.buffMappings[row.cooldownID]
+                if m then
+                    local now = GetTime()
+                    for mapIdx, mapData in ipairs(m) do
+                        if mapIdx <= 3 and mapData.customDuration then
+                            row._customTimerStart = row._customTimerStart or {}
+                            row._customTimerStart[mapIdx] = now
+                            -- In combat only dirty rows update, and nothing else
+                            -- dirties a row whose buff the game does not track.
+                            row._buffDirty = true
+                            ScheduleDeferredUpdate(mapData.customDuration)
+                        end
+                    end
+                end
+            end
+        end
+
         -- Combat potion. Only a fresh cast arms the window, so a reload mid-buff
         -- shows nothing until the next use.
         local potionWindow = (not issecretvalue(spellID)) and POTION_BUFF_DURATIONS[spellID]
@@ -5222,6 +5448,9 @@ SlashCmdList["INFALL"] = function(msg)
             ApplyBuffLayer(row)
         end
         
+    elseif msg == "repair" then
+        if ns.RepairSelfBuffPairings then ns.RepairSelfBuffPairings(true) end
+
     elseif msg == "icons" then
         CONFIG.hideIcons = not CONFIG.hideIcons
         if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
@@ -5518,7 +5747,9 @@ local siPipPool = {}
 local function CreateSIPip(parent, index, indicatorConfig, settings)
     local maxStacks = indicatorConfig.maxStacks or 3
     local hasOverflow = indicatorConfig.overflowMax and indicatorConfig.overflowMax > maxStacks
-    local bs = settings.borderSize
+    -- Real pixels, not UI units. Matches the timeline markers, which were the same
+    -- bug: a UI unit is wider than a pixel on any high resolution display.
+    local bs = (settings.borderSize or 0) * ns.OnePxForFrame(pip)
 
     local pip = table.remove(siPipPool)
     if pip then
@@ -5947,9 +6178,17 @@ UpdateAllSIPips = function()
     for _, rowData in ipairs(indicatorRows) do
         local config = list[rowData.configIndex]
         if config then
+            -- Resolved first and on its own. hideWhenEmpty below compares the
+            -- count, and that comparison throws while the count is secret, so it
+            -- falls through to Show inside an instance. Folding the gate into it
+            -- would inherit that.
+            local gated = config.requireTalent ~= nil
+                and not ns.IsTalentKnown(config.requireTalent)
             local applications = 0
 
-            if config.indicatorType == "power" and config.powerType then
+            if gated then
+                -- Nothing to read: the row is not drawing.
+            elseif config.indicatorType == "power" and config.powerType then
                 local ok, power = pcall(UnitPower, "player", config.powerType)
                 if ok then applications = power end
             elseif config.cooldownID then
@@ -5964,7 +6203,9 @@ UpdateAllSIPips = function()
 
             -- Hide when empty
             local wasShown = rowData.frame:IsShown()
-            if config.hideWhenEmpty then
+            if gated then
+                rowData.frame:Hide()
+            elseif config.hideWhenEmpty then
                 local hideOk, isEmpty = pcall(function() return applications == 0 end)
                 if hideOk and isEmpty then
                     rowData.frame:Hide()
@@ -5994,6 +6235,13 @@ UpdateAllSIPips = function()
     if layoutDirty then
         SyncStackLayout()
     end
+end
+
+-- Talents changed, so re-evaluate the gates now rather than waiting for the
+-- next poll, and repaint the panel so its live tint follows.
+ns.RefreshStackIndicatorGates = function()
+    if siIsBuilt and CONFIG.stackIndicators then UpdateAllSIPips() end
+    if ns.RefreshStacksTab then ns.RefreshStacksTab() end
 end
 
 local function WipeSIIndicators()
