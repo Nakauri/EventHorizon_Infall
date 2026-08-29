@@ -900,10 +900,7 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         for _, e in ipairs(CONFIG.iconList or {}) do
             if e == entry then return e end
         end
-        -- ApplyProfile rebuilds iconList with DeepCopy, so an open window's entry
-        -- stops being the live table. Returning nil here does not fail loudly: it
-        -- reads as the general scope, and every write from that window silently
-        -- lands on the shared settings instead of the icon. Repoint by identity.
+        -- Repoint by identity: ApplyProfile DeepCopies iconList, so an open entry goes stale.
         local id = entry.cooldownID or entry.key
         if id == nil then return nil end
         for _, e in ipairs(CONFIG.iconList or {}) do
@@ -1283,16 +1280,6 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
     local gridCache, gridCount = {}, 0
 
     -- The data provider reflects where the player actually put things.
-    -- GetCooldownViewerCategorySet reports STATIC DEFAULTS, so anything dragged
-    -- to another section, potions especially, never showed up.
-    -- An empty table is an answer, not a failure: only nil means unreadable.
-    -- Falling back on empty repopulates the pool from static defaults with the
-    -- entries the player just moved out of that section.
-    -- allowUnknown is for the buff categories only. A multi variant spell parks
-    -- its buff entry under the variant that is not talented, so the Cooldown
-    -- Manager greys it out while the player still has the ability and the aura.
-    -- Ability categories stay learned only, or the pool fills with spells the
-    -- player does not have.
     local function CategoryIDs(cat, allowUnknown)
         local shown = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(cat, allowUnknown)
         if type(shown) == "table" then return shown end

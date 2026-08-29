@@ -22,6 +22,7 @@ local activeCast
 -- activeCast is row-matched only.
 local sparkCast
 local HideCastSpark
+local queueWindowSeconds = 0
 local cachedGcdDurObj
 local lastFedGcdDurObj
 local shownSetupHint = false
@@ -29,32 +30,35 @@ local SyncStackContainerLayout
 local deferredGen = {}
 local specChangeToken = 0
 local specChangePending = false
-local SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeThirdSlide", "activeDepletedSlide", "activeChargeSlide"}
-local PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay", "lastPtr_third"}
-local HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay", "hidden_third"}
+local K = {
+    SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeThirdSlide", "activeDepletedSlide", "activeChargeSlide"},
+    PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay", "lastPtr_third"},
+    HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay", "hidden_third"},
 
--- Combat potion aura. No readable timing exists for it under aura restrictions,
--- so the window is self-timed from the cast and outranks lane resolution.
-local POTION_BUFF_DURATION = 30
-local ArmPotionWindow
+    -- Combat potion aura. No readable timing exists for it under aura restrictions,
+    -- so the window is self-timed from the cast and outranks lane resolution.
+    POTION_BUFF_DURATION = 30,
 
--- Category 4 only. GetLastCategoryCooldownSource is secret in combat;
--- CooldownViewerCooldown is not. An id missing here draws no aura bar.
-local POTION_BUFF_DURATIONS = {
-    [1236616] = 30,   -- Light's Potential
-    [1236998] = 30,   -- Draught of Rampant Abandon
-    [1236994] = 30,   -- Potion of Recklessness
-    [1238443] = 30,   -- Potion of Zealotry
+    -- Category 4 only. GetLastCategoryCooldownSource is secret in combat;
+    -- CooldownViewerCooldown is not. An id missing here draws no aura bar.
+    POTION_BUFF_DURATIONS = {
+        [1236616] = 30,   -- Light's Potential
+        [1236998] = 30,   -- Draught of Rampant Abandon
+        [1236994] = 30,   -- Potion of Recklessness
+        [1238443] = 30,   -- Potion of Zealotry
+    },
+
+    SPELL_CATEGORY_COMBAT_POTION = 4,
 }
 
-local SPELL_CATEGORY_COMBAT_POTION = 4
+local ArmPotionWindow
 
 local function CombatPotionRowInfo(cooldownID)
     if not cooldownID or issecretvalue(cooldownID) then return nil end
     local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
     if not ok or not info then return nil end
     if info.spellID or info.equipSlot then return nil end
-    if info.spellCategoryID ~= SPELL_CATEGORY_COMBAT_POTION then return nil end
+    if info.spellCategoryID ~= K.SPELL_CATEGORY_COMBAT_POTION then return nil end
     return info
 end
 
@@ -242,6 +246,7 @@ end
 local function GetNowPixelOffset()
     return (CONFIG.past / GetTotalSpan()) * CONFIG.width
 end
+ns.GetNowPixelOffset = GetNowPixelOffset
 
 local function GetFutureWidth()
     return CONFIG.width - GetNowPixelOffset()
@@ -298,13 +303,6 @@ local channelRetryPending = false
 -- Channels whose final tick interval is a clip window, shaded on the cast
 -- segment. The fraction is always 1/intervals, so only the interval count
 -- differs per spell.
---
--- A MISSILE channel fires at both ends, so its interval count is one less than
--- its shot count. Getting that fencepost wrong is how this ships one tick out.
---
--- Shot and interval counts are talent dependent but never haste dependent:
--- haste shortens the channel without changing how many shots it contains, so
--- one fraction stays correct across gear.
 local CHANNEL_CLIP = {
     -- Disintegrate. Azure Celerity shortens the interval only, which adds one.
     [356995] = { intervals = 3, modSpell = 1219723, modIntervals = 4 },
@@ -538,6 +536,17 @@ local function UpdateCastBar(event, isRetry)
 end
 
 -- One line at the cast's end, crossing every lane, moving toward the now line.
+
+-- Named rather than a closure: this is pcall'd per pip per frame.
+local function IsZero(v) return v == 0 end
+
+-- The engine re-snaps a texture after layout, which moves a 1px rule off its anchor.
+function ns.NoPixelSnap(tex)
+    if not tex then return end
+    tex:SetSnapToPixelGrid(false)
+    tex:SetTexelSnappingBias(0)
+end
+
 local castSparkFrame, castSparkTex
 
 HideCastSpark = function()
@@ -545,7 +554,9 @@ HideCastSpark = function()
 end
 
 local function UpdateCastSpark()
-    if not CONFIG.castSpark or not sparkCast then
+    local wantCast = CONFIG.castSpark and sparkCast
+    local wantQueue = CONFIG.queueSpark and sparkCast and queueWindowSeconds > 0
+    if not wantCast and not wantQueue then
         HideCastSpark()
         return
     end
@@ -566,7 +577,14 @@ local function UpdateCastSpark()
         castSparkFrame = CreateFrame("Frame", nil, EH_Parent)
         castSparkFrame:SetFrameLevel(EH_Parent:GetFrameLevel() + 20)
         castSparkTex = castSparkFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+        castSparkFrame.queueTex = castSparkFrame:CreateTexture(nil, "OVERLAY", nil, 6)
+        castSparkFrame.queueFill = castSparkFrame:CreateTexture(nil, "OVERLAY", nil, 4)
+        ns.NoPixelSnap(castSparkTex)
+        ns.NoPixelSnap(castSparkFrame.queueTex)
+        ns.NoPixelSnap(castSparkFrame.queueFill)
     end
+    local castQueueTex = castSparkFrame.queueTex
+    local castQueueFill = castSparkFrame.queueFill
 
     -- Padded like a row: GetBarOffset is the icon column only.
     castSparkFrame:ClearAllPoints()
@@ -575,19 +593,54 @@ local function UpdateCastSpark()
     castSparkFrame:SetPoint("BOTTOMRIGHT", EH_Parent, "BOTTOMRIGHT",
         -CONFIG.paddingRight, CONFIG.paddingBottom)
 
-    local colour = CONFIG.castSparkColor
-    if CONFIG.castSparkMatchCast then
-        colour = (CONFIG.castColors and CONFIG.castColors[sparkCast.spellID])
-            or CONFIG.castColor or colour
-    end
-    castSparkTex:SetColorTexture(unpack(colour))
-
     -- Left edge on the cast's end, matching the GCD spark's anchor.
     local x = GetBarOffset() + TimeToPixel(remaining)
-    castSparkTex:ClearAllPoints()
-    castSparkTex:SetPoint("TOPLEFT", castSparkFrame, "TOPLEFT", x, 0)
-    castSparkTex:SetPoint("BOTTOMLEFT", castSparkFrame, "BOTTOMLEFT", x, 0)
-    castSparkTex:SetWidth(CONFIG.castSparkWidth or 1)
+
+    if wantCast then
+        local colour = CONFIG.castSparkColor
+        if CONFIG.castSparkMatchCast then
+            colour = (CONFIG.castColors and CONFIG.castColors[sparkCast.spellID])
+                or CONFIG.castColor or colour
+        end
+        castSparkTex:SetColorTexture(unpack(colour))
+        castSparkTex:ClearAllPoints()
+        castSparkTex:SetPoint("TOPLEFT", castSparkFrame, "TOPLEFT", x, 0)
+        castSparkTex:SetPoint("BOTTOMLEFT", castSparkFrame, "BOTTOMLEFT", x, 0)
+        castSparkTex:SetWidth(CONFIG.castSparkWidth or 1)
+        castSparkTex:Show()
+    else
+        castSparkTex:Hide()
+    end
+
+    -- Only the later of the cast and the GCD draws the window.
+    local gcdLeft = 0
+    if gcdActive and cachedGcdDurObj then
+        local gOk, gLeft = pcall(cachedGcdDurObj.GetRemainingDuration, cachedGcdDurObj)
+        if gOk and type(gLeft) == "number" then gcdLeft = gLeft end
+    end
+
+    if wantQueue and castQueueTex and remaining > queueWindowSeconds
+        and remaining >= gcdLeft then
+        local qx = x - (TimeToPixel(queueWindowSeconds) - TimeToPixel(0))
+        castQueueTex:SetColorTexture(unpack(CONFIG.queueSparkColor or {1, 0.82, 0, 0.8}))
+        castQueueTex:ClearAllPoints()
+        castQueueTex:SetPoint("TOPLEFT", castSparkFrame, "TOPLEFT", qx, 0)
+        castQueueTex:SetPoint("BOTTOMLEFT", castSparkFrame, "BOTTOMLEFT", qx, 0)
+        castQueueTex:SetWidth(CONFIG.queueSparkWidth or 2)
+        castQueueTex:Show()
+        if castQueueFill then
+            castQueueFill:SetColorTexture(unpack(CONFIG.queueBarColor or {1, 0.82, 0, 0.12}))
+            castQueueFill:ClearAllPoints()
+            castQueueFill:SetPoint("TOPLEFT", castSparkFrame, "TOPLEFT", qx, 0)
+            castQueueFill:SetPoint("BOTTOMLEFT", castSparkFrame, "BOTTOMLEFT", qx, 0)
+            castQueueFill:SetWidth(math.max(x - qx, 1))
+            castQueueFill:Show()
+        end
+    else
+        if castQueueTex then castQueueTex:Hide() end
+        if castQueueFill then castQueueFill:Hide() end
+    end
+
     castSparkFrame:Show()
 end
 
@@ -968,6 +1021,7 @@ end
 local function ChargeBottomY(row, laneH, maxC)
     return -((math.max(2, maxC or 2) - 1) * ChargeLanePitch(row, laneH))
 end
+ns.ChargeLanePitch = ChargeLanePitch
 
 GetBarOffset = function()
     if CONFIG.hideIcons then
@@ -976,6 +1030,8 @@ GetBarOffset = function()
         return CONFIG.iconSize + (CONFIG.iconGap or 10)
     end
 end
+ns.GetBarOffset = GetBarOffset
+ns.TimeToPixel = TimeToPixel
 
 GetContainerWidth = function()
     local barOffset = GetBarOffset()
@@ -1084,6 +1140,18 @@ local function ApplyIconMode(row)
     row.gcdBar:SetStatusBarColor(unpack(CONFIG.gcdColor))
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
     row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 2, row:GetHeight())
+    if row.queueSpark then
+        row.queueSpark:SetColorTexture(unpack(CONFIG.queueSparkColor or {1, 0.82, 0, 0.8}))
+        row.queueSpark:SetSize(CONFIG.queueSparkWidth or 2, row:GetHeight())
+    end
+    if row.queueBar then
+        row.queueBar:SetColorTexture(unpack(CONFIG.queueBarColor or {1, 0.82, 0, 0.12}))
+        row.queueBar:SetHeight(row:GetHeight())
+    end
+    if row.pressSpark then
+        row.pressSpark:SetColorTexture(unpack(CONFIG.pressSparkColor or {0.4, 0.7, 1, 0.9}))
+        row.pressSpark:SetSize(CONFIG.pressSparkWidth or 2, row:GetHeight())
+    end
 
     if row.barTextOverlay then
         row.barTextOverlay:ClearAllPoints()
@@ -1149,10 +1217,7 @@ end
 ns.ApplyBuffLayer = ApplyBuffLayer
 
 local function ApplyLayoutToAllBars()
-    -- Snapped so the box ends on a whole pixel. The pip rows and the resource bar
-    -- lay out to a snapped copy of this width, and an unsnapped box left them
-    -- disagreeing by up to a pixel at the right edge. Timeline geometry reads
-    -- CONFIG.width, never the frame width, so nothing that encodes time moves.
+    -- Snapped so the box ends on a whole pixel. Timeline geometry reads CONFIG.width.
     EH_Parent:SetWidth(ns.SnapPx(GetContainerWidth(), ns.OnePxForFrame(EH_Parent)))
     
     ResizeContainer()
@@ -1332,7 +1397,7 @@ end
 
 ArmPotionWindow = function(row, windowSeconds)
     if not row or not row.buffBar then return end
-    local window = windowSeconds or POTION_BUFF_DURATION
+    local window = windowSeconds or K.POTION_BUFF_DURATION
     local now = GetTime()
     local durObj = C_DurationUtil.CreateDuration()
     durObj:SetTimeFromStart(now, window)
@@ -1353,6 +1418,7 @@ end
 local function FeedChargeIndicators(row, chargeInfo)
     if not chargeInfo then return end
     local cc = chargeInfo.currentCharges
+    if ns.ChargePast_Push then ns.ChargePast_Push(row, cc) end
     row.depletedIndicator:SetValue(cc)
     if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
     if row.middleClipIndicators then
@@ -1670,10 +1736,36 @@ local function CreateCooldownBar(spellID, index)
 
     -- GCD spark
     row.gcdSpark = row.gcdBar:CreateTexture(nil, "OVERLAY", nil, 5)
+    row.gcdSpark:SetSnapToPixelGrid(false)
+    row.gcdSpark:SetTexelSnappingBias(0)
     row.gcdSpark:SetSize(CONFIG.gcdSparkWidth or 2, CONFIG.height)
     row.gcdSpark:SetColorTexture(unpack(CONFIG.gcdSparkColor))
     row.gcdSpark:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
+
+    row.queueBar = row.gcdBar:CreateTexture(nil, "OVERLAY", nil, 4)
+    row.queueBar:SetSnapToPixelGrid(false)
+    row.queueBar:SetTexelSnappingBias(0)
+    row.queueBar:SetSize(1, CONFIG.height)
+    row.queueBar:SetColorTexture(unpack(CONFIG.queueBarColor or {1, 0.82, 0, 0.12}))
+    row.queueBar:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
+    row.queueBar:Hide()
+
+    row.queueSpark = row.gcdBar:CreateTexture(nil, "OVERLAY", nil, 6)
+    row.queueSpark:SetSnapToPixelGrid(false)
+    row.queueSpark:SetTexelSnappingBias(0)
+    row.queueSpark:SetSize(CONFIG.queueSparkWidth or 2, CONFIG.height)
+    row.queueSpark:SetColorTexture(unpack(CONFIG.queueSparkColor or {1, 0.82, 0, 0.8}))
+    row.queueSpark:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
+    row.queueSpark:Hide()
     row.gcdSpark:Hide()
+
+    row.pressSpark = row:CreateTexture(nil, "OVERLAY", nil, 6)
+    row.pressSpark:SetSnapToPixelGrid(false)
+    row.pressSpark:SetTexelSnappingBias(0)
+    row.pressSpark:SetSize(CONFIG.pressSparkWidth or 2, CONFIG.height)
+    row.pressSpark:SetColorTexture(unpack(CONFIG.pressSparkColor or {0.4, 0.7, 1, 0.9}))
+    row.pressSpark:SetPoint("LEFT", row, "LEFT", nowOffset, 0)
+    row.pressSpark:Hide()
 
     -- Now line
     row.nowLineFrame = CreateFrame("Frame", nil, row)
@@ -1778,6 +1870,9 @@ ResizeContainer = function()
                 end
             end
             if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
+                if ns.ChargePast_Build then
+                    ns.ChargePast_Build(row, row.maxCharges, lH)
+                end
                 local slotPx = row._chargeSlotPx or 0
                 for j = 1, row.maxCharges - 2 do
                     if row.middleClipIndicators and row.middleClipIndicators[j] then
@@ -1813,6 +1908,9 @@ ResizeContainer = function()
         row.buffBarThird:SetHeight(rowHeight)
         row.gcdBar:SetHeight(rowHeight)
         row.gcdSpark:SetHeight(rowHeight)
+        if row.queueSpark then row.queueSpark:SetHeight(rowHeight) end
+        if row.queueBar then row.queueBar:SetHeight(rowHeight) end
+        if row.pressSpark then row.pressSpark:SetHeight(rowHeight) end
         if row.nowLine then
             row.nowLine:SetHeight(rowHeight)
         end
@@ -1835,13 +1933,14 @@ end
 local linesOverlay = CreateFrame("Frame", nil, EH_Parent)
 linesOverlay:SetAllPoints(EH_Parent)
 linesOverlay:SetFrameLevel(EH_Parent:GetFrameLevel() + 50) -- above everything
+ns.linesOverlay = linesOverlay
 local frameTimeLines = {}
 
 CreateTimeLines = function()
     local lineDef = CONFIG.lines
     if not lineDef then
-        for _, line in ipairs(frameTimeLines) do
-            line:Hide()
+        for i = 1, #frameTimeLines do
+            if frameTimeLines[i] then frameTimeLines[i]:Hide() end
         end
         return
     end
@@ -1855,16 +1954,19 @@ CreateTimeLines = function()
     local barOffset = GetBarOffset()
     local onePx = ns.OnePxForFrame(linesOverlay)
 
-    for i, seconds in ipairs(lineDef) do
-        if seconds > 0 and seconds <= CONFIG.future then
-            local line = frameTimeLines[i]
-            if not line then
-                line = linesOverlay:CreateTexture(nil, "OVERLAY")
-                frameTimeLines[i] = line
-            end
-            -- Every pass: the scale can change under an existing line.
-            line:SetWidth(onePx)
-            
+    local count = #lineDef
+    for i = 1, count do
+        local seconds = lineDef[i]
+        local line = frameTimeLines[i]
+        if not line then
+            line = linesOverlay:CreateTexture(nil, "OVERLAY")
+            -- The engine snaps a texture to its own grid AFTER layout, which moves
+            -- a 1px rule off the position it was anchored to.
+            line:SetSnapToPixelGrid(false)
+            line:SetTexelSnappingBias(0)
+            frameTimeLines[i] = line
+        end
+        if type(seconds) == "number" and seconds > 0 and seconds <= CONFIG.future then
             local color
             if multiColor then
                 color = colorDef[i] or colorDef[#colorDef]
@@ -1872,21 +1974,29 @@ CreateTimeLines = function()
                 color = colorDef
             end
             line:SetColorTexture(unpack(color))
-            
+
             -- Use timeline coordinate system: seconds is a future offset
             local xOffset = CONFIG.paddingLeft + barOffset + TimeToPixel(seconds)
-            xOffset = math.floor(xOffset / onePx + 0.5) * onePx
+            -- Snapped as an absolute screen edge, so every line is pixel crisp.
+            local overlayLeft = linesOverlay:GetLeft()
+            if overlayLeft then
+                xOffset = math.floor((overlayLeft + xOffset) / onePx + 0.5) * onePx
+                    - overlayLeft
+            else
+                xOffset = math.floor(xOffset / onePx + 0.5) * onePx
+            end
+            -- Opposite corners, so both horizontal edges are pinned.
             line:ClearAllPoints()
-            line:SetPoint("TOP", linesOverlay, "TOPLEFT", xOffset, 0)
-            line:SetPoint("BOTTOM", linesOverlay, "BOTTOMLEFT", xOffset, 0)
+            line:SetPoint("TOPLEFT", linesOverlay, "TOPLEFT", xOffset, 0)
+            line:SetPoint("BOTTOMRIGHT", linesOverlay, "BOTTOMLEFT", xOffset + onePx, 0)
             line:Show()
-        elseif frameTimeLines[i] then
-            frameTimeLines[i]:Hide()
+        else
+            line:Hide()
         end
     end
-    
-    for i = (type(lineDef) == "table" and #lineDef or 1) + 1, #frameTimeLines do
-        frameTimeLines[i]:Hide()
+
+    for i = count + 1, #frameTimeLines do
+        if frameTimeLines[i] then frameTimeLines[i]:Hide() end
     end
 end
 
@@ -2067,10 +2177,7 @@ local viewerScanDirty = true
 local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
 local hookedAuraFrames = setmetatable({}, { __mode = "k" })
 
--- Mirror push. The Cooldown Manager writes its own bar every frame while a row
--- is active, so forwarding that write lands the value the moment it is produced
--- instead of reading it back on our own clock one tick later. Set false to fall
--- back to the read path alone.
+-- Mirror push: forward the CDM's own bar write instead of reading it back a tick later.
 --
 -- VALUE ONLY. Our min max stays (0, CONFIG.future) because the lane width is the
 -- future window in pixels; taking theirs turns every lane into a percentage.
@@ -2536,10 +2643,7 @@ local function FillTotemLane(laneIdx, frame, mapData, totemSlot)
     return e
 end
 
--- Lanes 2 and 3 were byte-identical copies of each other, so every buff lane
--- change had to be made twice and the third one was where it got missed. Lane 1
--- is NOT a copy: it also carries the pandemic pulse, the variant name and the
--- potion window, so it stays written out rather than growing flags in here.
+-- Shared by lanes 2 and 3. Lane 1 is separate: pandemic pulse, variant name, potion window.
 local function UpdateSecondaryLane(row, buffEntry, lane)
     local bar = row[lane.bar]
     if not bar then return end
@@ -2718,6 +2822,29 @@ UpdateBuffState = function(row, buffViewerFrames)
         end
     end
 
+    if mappings and ns.TierSpellIDForCooldown and AC.AuraFillBySpellID then
+        for mapIdx, mapData in ipairs(mappings) do
+            if mapIdx <= 3 and not _buffLanes[mapIdx] and mapData.buffCooldownIDs then
+                for _, mappedID in ipairs(mapData.buffCooldownIDs) do
+                    local tierSpell = ns.TierSpellIDForCooldown(mappedID)
+                    if tierSpell then
+                        local kind, durObj = AC.AuraFillBySpellID(tierSpell, mapData.unit)
+                        if kind == "durobj" and durObj then
+                            local e = BUFF_LANES[mapIdx].entry
+                            wipe(e)
+                            e.timerDurObj = durObj
+                            e.color = mapData.color or CONFIG.buffColor
+                            e.hasCustomColor = mapData.color ~= nil
+                            e.unit = mapData.unit
+                            _buffLanes[mapIdx] = e
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     -- Custom timer pass. Produced as a plain DurationObject so it travels the
     -- same path every other lane uses, which is what lets it work in all three.
     local customStarts = row._customTimerStart
@@ -2772,8 +2899,6 @@ UpdateBuffState = function(row, buffViewerFrames)
 
     -- A live potion window is checked first: a resolved lane on a potion row
     -- gives an empty mirror, which would hide the window's bar.
-    -- A timer the player set for this row beats the automatic potion window,
-    -- which would otherwise own the lane for its full 30s and discard it.
     local potionWindowLive = row._potionWindowExpiry and GetTime() < row._potionWindowExpiry
         and not (primaryBuff and primaryBuff.timerDurObj)
     if potionWindowLive then
@@ -2935,6 +3060,20 @@ UpdateStackText = function(row, buffViewerFrames)
         return
     end
     
+    local tierStackSpell = ns.TierSpellIDForCooldown
+        and ns.TierSpellIDForCooldown(stackMapping.buffCooldownID)
+    if tierStackSpell then
+        local apps = AC.ApplicationsBySpellID and AC.ApplicationsBySpellID(tierStackSpell)
+        if apps and apps > 0 then
+            row.stackText:SetText(apps)
+            row.stackText:SetTextColor(unpack(stackMapping.color or CONFIG.stackTextColor))
+            row.stackText:Show()
+        else
+            row.stackText:Hide()
+        end
+        return
+    end
+
     local buffFrame = buffViewerFrames[stackMapping.buffCooldownID]
     if buffFrame and buffFrame.auraInstanceID ~= nil then
         local unit = buffFrame.auraDataUnit or stackMapping.unit or "player"
@@ -3075,6 +3214,28 @@ local function UpdateBuffPastSlide(row, isActive, slideKey, clipKey, colorKey)
 end
 
 -- OnUpdate helpers (defined once to avoid per-frame closure allocation)
+
+-- Spell queue window in seconds, cached; the CVar is the only thing that moves it.
+local function ReadQueueWindow()
+    queueWindowSeconds = 0
+    if not C_Spell or not C_Spell.GetSpellQueueWindow then return end
+    local ok, ms = pcall(C_Spell.GetSpellQueueWindow)
+    if ok and type(ms) == "number" and ms > 0 then
+        queueWindowSeconds = ms / 1000
+    end
+end
+
+local queueWindowWatcher = CreateFrame("Frame")
+queueWindowWatcher:RegisterEvent("PLAYER_LOGIN")
+queueWindowWatcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+queueWindowWatcher:RegisterEvent("CVAR_UPDATE")
+queueWindowWatcher:SetScript("OnEvent", function(_, event, name)
+    if event ~= "CVAR_UPDATE" or name == "SpellQueueWindow" then
+        ReadQueueWindow()
+    end
+end)
+ReadQueueWindow()
+
 local function GcdBarAndSpark(durObj, gcdBar, gcdSpark, row, future, interp)
     local remaining = durObj:GetRemainingDuration()
     gcdBar:SetValue(remaining, interp)
@@ -3084,10 +3245,33 @@ local function GcdBarAndSpark(durObj, gcdBar, gcdSpark, row, future, interp)
         gcdSpark:ClearAllPoints()
         gcdSpark:SetPoint("LEFT", row, "LEFT", sparkXOffset, 0)
         gcdSpark:Show()
+
+        -- Stands down while a cast outlasts the GCD; the cast spark draws it there.
+        local qs, qb = row.queueSpark, row.queueBar
+        local castLeft = sparkCast and (sparkCast.endTime - GetTime()) or 0
+        if qs and CONFIG.queueSpark and queueWindowSeconds > 0
+            and remaining > queueWindowSeconds and castLeft <= remaining then
+            local qOffset = sparkXOffset - (TimeToPixel(queueWindowSeconds) - TimeToPixel(0))
+            qs:ClearAllPoints()
+            qs:SetPoint("LEFT", row, "LEFT", qOffset, 0)
+            qs:Show()
+            if qb then
+                qb:ClearAllPoints()
+                qb:SetPoint("LEFT", row, "LEFT", qOffset, 0)
+                qb:SetWidth(math.max(sparkXOffset - qOffset, 1))
+                qb:Show()
+            end
+        else
+            if qs then qs:Hide() end
+            if qb then qb:Hide() end
+        end
     else
         gcdSpark:Hide()
+        if row.queueSpark then row.queueSpark:Hide() end
+        if row.queueBar then row.queueBar:Hide() end
     end
 end
+
 
 local updateTimer = 0
 local buffPollTimer = 0
@@ -3122,10 +3306,7 @@ local function FillBuffLaneBar(row, lane, interp)
             bar:SetValue(val, interp)
             mirrorPollCount = mirrorPollCount + 1
         else
-            -- A failed read is unknown, not ended. Hiding here painted a
-            -- conclusion the next resolve usually reversed, and only
-            -- UpdateBuffState can show a lane again, so one bad frame cost up
-            -- to a full dirty cycle of blank bar.
+            -- A failed read is unknown, not ended, so mark dirty rather than hide.
             row._buffDirty = true
         end
         return
@@ -3303,33 +3484,8 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row._chargeSpawnTime = nil
                 end
 
-                -- Middle lane past slides
-                if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
-                    for j = 1, row.maxCharges - 2 do
-                        local ml = row.middleLanes[j]
-                        if ml then
-                            local mlActive = false
-                            if row.middleClipWrappers and row.middleClipWrappers[j] then
-                                local wrapH = row.middleClipWrappers[j]:GetHeight()
-                                if not issecretvalue(wrapH) then
-                                    mlActive = wrapH > 0.5
-                                else
-                                    mlActive = isRecharging
-                                end
-                            end
-                            if mlActive and not ml.activeSlide then
-                                ml.activeSlide = SpawnPastSlide(row,
-                                    row.pastCdClip, GetCooldownColor(row),
-                                    laneH, j * ChargeLanePitch(row, laneH))
-                                ml._slideSpawnTime = GetTime()
-                            elseif ml.activeSlide and not ml.activeSlide.detachTime and not mlActive then
-                                ml.activeSlide.tex:SetAlpha(ml.activeSlide.color[4] or GetCooldownColor(row)[4] or 0.5)
-                                DetachPastSlide(ml.activeSlide)
-                                ml.activeSlide = nil
-                                ml._slideSpawnTime = nil
-                            end
-                        end
-                    end
+                if ns.ChargePast_Update then
+                    ns.ChargePast_Update(row, GetCooldownColor(row))
                 end
 
                 -- Safety timeout
@@ -3394,11 +3550,37 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
             -- GCD rendering
             if gcdActive and cachedGcdDurObj then
                 local gcdOk = pcall(GcdBarAndSpark, cachedGcdDurObj, row.gcdBar, row.gcdSpark, row, CONFIG.future, interp)
-                if not gcdOk then row.gcdSpark:Hide() end
+                if not gcdOk then
+                    row.gcdSpark:Hide()
+                    if row.queueSpark then row.queueSpark:Hide() end
+                    if row.queueBar then row.queueBar:Hide() end
+                end
                 if not row.gcdBar:IsShown() then row.gcdBar:Show() end
             elseif row.gcdBar:IsShown() then
                 row.gcdBar:Hide()
                 row.gcdSpark:Hide()
+                if row.queueSpark then row.queueSpark:Hide() end
+                if row.queueBar then row.queueBar:Hide() end
+            end
+
+            if ns.UpdateDotTicks then ns.UpdateDotTicks(row) end
+
+            local ps = row.pressSpark
+            if ps then
+                if not CONFIG.pressSpark or not row._pressAt then
+                    ps:Hide()
+                else
+                    local age = GetTime() - row._pressAt
+                    if age < 0 or age > 0.4 then
+                        row._pressAt = nil
+                        ps:Hide()
+                    else
+                        local pressX = GetBarOffset() + TimeToPixel(-age)
+                        ps:ClearAllPoints()
+                        ps:SetPoint("LEFT", row, "LEFT", pressX, 0)
+                        ps:Show()
+                    end
+                end
             end
         end
 
@@ -3425,6 +3607,18 @@ local function ResetBarState(bar)
     -- spell used to live here and would draw a phantom bar for the new one.
     bar._customTimerStart = nil
     bar._customTimerObj = nil
+    bar._pressAt = nil
+    if bar.pressSpark then bar.pressSpark:Hide() end
+    bar._tickSpellResolved = nil
+    bar._tickSpellID = nil
+    bar._tickCastAt = nil
+    bar._tickStart = nil
+    bar._tickEnd = nil
+    if type(bar.tickMarks) == "table" then
+        for i = 1, #bar.tickMarks do
+            if bar.tickMarks[i] then bar.tickMarks[i]:Hide() end
+        end
+    end
     bar.activeBuffOverlayDuration = nil
     bar.activeBuffThirdDuration = nil
     bar.resolvedBuffColor = nil
@@ -3477,6 +3671,7 @@ local function ResetBarState(bar)
     HideCastOverlays(bar)
     if bar.depletedWrapper then bar.depletedWrapper:Hide() end
     if bar.notDepletedWrapper then bar.notDepletedWrapper:Hide() end
+    if ns.ChargePast_Reset then ns.ChargePast_Reset(bar) end
     if bar.middleLanes then
         for _, ml in ipairs(bar.middleLanes) do
             ml.depletedChargeBar:Hide()
@@ -3702,7 +3897,6 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             -- NEVER clamp. This width IS the charge duration on the timeline,
             -- which is what makes the fill read as seconds, and (maxC-1)*slotPx
             -- is how the lower lane shows cd+cd without touching a secret.
-            -- Over-wide lanes are correct; the wrappers clip them.
             slotPx = math.max(1, (bar.chargeDurationConstant / CONFIG.future) * futureWidth)
         elseif not chargeDurWarned[cooldownID] then
             -- Without it there is no width that reads as seconds, so the lane is
@@ -3862,6 +4056,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                     bar.middleClipWrappers[j] = CreateFrame("Frame", nil, bar)
                     bar.middleClipWrappers[j]:SetClipsChildren(true)
                 end
+                if ns.ChargePast_Build then ns.ChargePast_Build(bar, maxC, laneH) end
                 bar.middleClipWrappers[j]:SetFrameLevel(wrapperLevel)
                 bar.middleClipWrappers[j]:ClearAllPoints()
                 bar.middleClipWrappers[j]:SetPoint("TOPLEFT", bar, "TOPLEFT", nowOffset, 0)
@@ -4281,6 +4476,7 @@ EH_Parent:RegisterEvent("SPELL_UPDATE_USABLE")
 EH_Parent:RegisterEvent("SPELL_RANGE_CHECK_UPDATE")
 EH_Parent:RegisterEvent("PLAYER_TOTEM_UPDATE")
 
+EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_START", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_STOP", "player")
 EH_Parent:RegisterUnitEvent("UNIT_SPELLCAST_FAILED", "player")
@@ -4828,6 +5024,20 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
         UpdateBars()
 
+    elseif event == "UNIT_SPELLCAST_SENT" then
+        if CONFIG.pressSpark then
+            local _, _, _, sentSpellID = ...
+            if sentSpellID ~= nil and not issecretvalue(sentSpellID) then
+                local sentAt = GetTime()
+                for _, row in ipairs(cooldownBars) do
+                    if RowMatchesCastSpell(row, sentSpellID) then
+                        row._pressAt = sentAt
+                        break
+                    end
+                end
+            end
+        end
+
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
 
@@ -4860,9 +5070,10 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         end
 
 
-        -- Custom timers are armed by the row's own cast.
+        -- Custom timers and tick marks are armed by the row's own cast.
         for _, row in ipairs(cooldownBars) do
             if row.cooldownID and RowMatchesCastSpell(row, spellID) then
+                row._tickCastAt = GetTime()
                 local m = CONFIG.buffMappings and CONFIG.buffMappings[row.cooldownID]
                 if m then
                     local now = GetTime()
@@ -4882,7 +5093,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
         -- Combat potion. Only a fresh cast arms the window, so a reload mid-buff
         -- shows nothing until the next use.
-        local potionWindow = (not issecretvalue(spellID)) and POTION_BUFF_DURATIONS[spellID]
+        local potionWindow = (not issecretvalue(spellID)) and K.POTION_BUFF_DURATIONS[spellID]
         if potionWindow then
             for _, row in ipairs(cooldownBars) do
                 if not row.isExtras and row.cooldownID
@@ -4936,6 +5147,12 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "COOLDOWN_VIEWER_DATA_LOADED" then
         if specChangePending then return end
+        -- Deferred out of combat, like the other two reorder paths. Rows moving
+        -- under the player mid-pull is worse than an order that settles late.
+        if InCombatLockdown() then
+            ns._pendingReorder = true
+            return
+        end
         if #cooldownBars > 0 then
             C_Timer.After(0, SmartReorder)
         else
@@ -5086,7 +5303,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             for _, row in ipairs(cooldownBars) do
                 row.cachedPandemicIcon = nil
                 -- Detach active slides so they drift off naturally
-                for _, key in ipairs(SLIDE_KEYS) do
+                for _, key in ipairs(K.SLIDE_KEYS) do
                     if row[key] then DetachPastSlide(row[key]) end
                     row[key] = nil
                 end
@@ -5098,10 +5315,10 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                         ml.activeSlide = nil
                     end
                 end
-                for _, key in ipairs(PTR_KEYS) do
+                for _, key in ipairs(K.PTR_KEYS) do
                     row[key] = nil
                 end
-                for _, key in ipairs(HIDDEN_KEYS) do
+                for _, key in ipairs(K.HIDDEN_KEYS) do
                     if row[key] then row[key]:SetCooldown(0, 0) end
                 end
 
@@ -5124,6 +5341,15 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 end
 
 
+            end
+
+            if ns._pendingReorder then
+                ns._pendingReorder = nil
+                if #cooldownBars > 0 then
+                    C_Timer.After(0, SmartReorder)
+                else
+                    C_Timer.After(0, LoadEssentialCooldowns)
+                end
             end
 
             -- Re-apply ECM visibility after combat
@@ -5697,6 +5923,9 @@ end
 
 -- STACK INDICATORS
 
+-- do...end so its locals stay off the main chunk's 200 limit. Exports are on ns.
+do
+
 local SI_DEFAULTS = {
     position = "TOP",
     gap = 2,
@@ -6178,10 +6407,7 @@ UpdateAllSIPips = function()
     for _, rowData in ipairs(indicatorRows) do
         local config = list[rowData.configIndex]
         if config then
-            -- Resolved first and on its own. hideWhenEmpty below compares the
-            -- count, and that comparison throws while the count is secret, so it
-            -- falls through to Show inside an instance. Folding the gate into it
-            -- would inherit that.
+            -- Resolved on its own: the count comparison below throws while it is secret.
             local gated = config.requireTalent ~= nil
                 and not ns.IsTalentKnown(config.requireTalent)
             local applications = 0
@@ -6206,7 +6432,7 @@ UpdateAllSIPips = function()
             if gated then
                 rowData.frame:Hide()
             elseif config.hideWhenEmpty then
-                local hideOk, isEmpty = pcall(function() return applications == 0 end)
+                local hideOk, isEmpty = pcall(IsZero, applications)
                 if hideOk and isEmpty then
                     rowData.frame:Hide()
                 else
@@ -6428,3 +6654,4 @@ siEventFrame:SetScript("OnEvent", function(self, event)
         end)
     end
 end)
+end

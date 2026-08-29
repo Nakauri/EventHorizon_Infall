@@ -1,7 +1,4 @@
 -- EventHorizon Infall: CPU measurement.
--- /infall perf         report
--- /infall perf on|off  per-section timers
--- /infall perf reset   clear section totals
 
 local ns = EventHorizon_Infall
 local P = {}

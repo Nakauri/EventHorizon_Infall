@@ -15,11 +15,6 @@ local restrictedStamp = -1
 -- True while aura queries raise an error for addons. The probe is the call itself:
 -- C_Secrets.ShouldAurasBeSecret reports whether values are secret, not whether the
 -- call is refused, so it is trusted to answer YES and never NO.
---
--- Only the restricted answer is cached, and only for the frame it was taken on.
--- Caching a clear answer sends callers into a call that is refused for the rest of
--- that frame; caching a restricted one costs at most one frame of display. The
--- refused probe is also the expensive one, since it builds a real Lua error.
 function AC.AurasRestricted()
     local now = GetTime()
     if C_Secrets and C_Secrets.ShouldAurasBeSecret and C_Secrets.ShouldAurasBeSecret() then
@@ -129,9 +124,6 @@ function AC.GetLearnState(spellID)
 end
 
 -- Learn state for a cooldown ENTRY, matched across every id it can present.
--- Returns state, detail, and the id the state is stored under; per spell
--- settings must key on that id. A single field never matches, because the entry
--- paired and the frame measured are often different entries.
 function AC.GetLearnStateForFrame(frame)
     if not frame then return "unlearned", nil, nil end
     local fOk, cdID = pcall(function() return frame.cooldownID end)
@@ -243,6 +235,13 @@ function AC.IdentityIDsForCooldown(cdID)
     local cached = identityCache[cdID]
     if cached then return cached end
 
+    local tierSpell = ns.TierSpellIDForCooldown and ns.TierSpellIDForCooldown(cdID)
+    if tierSpell then
+        local tierList = { tierSpell }
+        identityCache[cdID] = tierList
+        return tierList
+    end
+
     local iOk, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
     if not iOk or not info then return nil end
 
@@ -337,23 +336,32 @@ function AC.AuraFill(frame, unit)
     return nil
 end
 
+-- Stack count by spell id, nil when the buff is down or secret.
+function AC.ApplicationsBySpellID(spellID)
+    if not spellID or not AuraReadable(spellID) then return nil end
+    local aura = ReadAura(nil, spellID)
+    if not aura then return nil end
+    local ok, apps = pcall(function() return aura.applications end)
+    if not ok or apps == nil or issecret(apps) then return nil end
+    return apps
+end
+
+-- True while that aura is on the player.
+function AC.HasAuraBySpellID(spellID)
+    if not spellID or not AuraReadable(spellID) then return false end
+    return ReadAura(nil, spellID) ~= nil
+end
+
 -- Fill resolution
 
--- Returns kind, payload, resolvedUnit:
---   "mirror",    StatusBar   read this widget's value each frame
---   "durobj",    DurObj      feed the DurationObject path
---   "permanent", nil         draw a full bar
---   nil                      no usable timing
+-- Returns kind, payload, resolvedUnit: "mirror" widget, "durobj" object, "permanent", or nil.
 
 function AC.ResolveFill(frame, unit)
     if not frame then return nil end
 
     local spellID = AC.GetConfigSpellID(frame)
 
-    -- Matched across every id the entry can present, never on one field. A
-    -- transform changes which id the aura was measured under, so a lookup fixed
-    -- to the live override loses the measurement the moment talents move. The
-    -- config id is always in that set, so this covers IsPermanent too.
+    -- Matched across every id the entry can present, never on one field.
     local learnState, learnDur, learnKey = AC.GetLearnStateForFrame(frame)
 
     if learnState == "permanent" then
@@ -373,10 +381,7 @@ function AC.ResolveFill(frame, unit)
         end
     end
 
-    -- A frame with no aura instance has nothing feeding its bar, so a mirror
-    -- would read an empty widget. The spell id read below covers that case, but
-    -- only where a frame exists at all: an entry the player has not learned is
-    -- given no frame, and nothing here can reach it.
+    -- No aura instance means nothing feeds the bar; the spell id read below covers it.
     local okIID, iid = pcall(function() return frame.auraInstanceID end)
     local okBar, bar = pcall(function() return frame.Bar end)
     local canMirror = (okBar and bar and bar.GetValue) and true or false
@@ -428,6 +433,39 @@ function AC.ReadApplications(frame)
         (uOk and unit) or "player", iid)
     if okD and d then return d.applications end
     return nil
+end
+
+local spellFillCache = {}
+
+function AC.AuraFillBySpellID(spellID, unit)
+    if not spellID or not AuraReadable(spellID) then
+        spellFillCache[spellID or 0] = nil
+        return nil
+    end
+    local aura = ReadAura(unit, spellID)
+    if not aura then
+        spellFillCache[spellID] = nil
+        return nil
+    end
+    local okD, dur = pcall(function() return aura.duration end)
+    local okE, exp = pcall(function() return aura.expirationTime end)
+    if not okD or not okE or issecret(dur) or issecret(exp)
+        or type(dur) ~= "number" or type(exp) ~= "number" then
+        spellFillCache[spellID] = nil
+        return nil
+    end
+    if dur == 0 or exp == 0 then
+        spellFillCache[spellID] = nil
+        return "permanent", nil
+    end
+    local c = spellFillCache[spellID]
+    if c and c.exp == exp and c.dur == dur and c.unit == unit then
+        return "durobj", c.durObj
+    end
+    local durObj = C_DurationUtil.CreateDuration()
+    durObj:SetTimeFromStart(exp - dur, dur)
+    spellFillCache[spellID] = { exp = exp, dur = dur, durObj = durObj, unit = unit }
+    return "durobj", durObj
 end
 
 -- Aura spell id for variant naming. May be secret; safe for GetSpellName.

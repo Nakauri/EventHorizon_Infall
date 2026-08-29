@@ -32,6 +32,21 @@ ns.CONFIG = {
     gcdSparkColor = {1, 1, 1, 0.6},
     gcdSparkWidth = 3,
 
+    -- Marks where the spell queue window opens. Off by default.
+    queueSpark = false,
+    queueSparkWidth = 2,
+    queueSparkColor = {1, 0.82, 0, 0.8},
+    queueBarColor = {1, 0.82, 0, 0.12},
+
+    pressSpark = false,
+    pressSparkWidth = 2,
+    pressSparkColor = {0.4, 0.7, 1, 0.9},
+
+    -- Notches on a buff bar at each of its periodic ticks. Off by default.
+    dotTicks = false,
+    dotTickWidth = 1,
+    dotTickColor = {1, 1, 1, 0.45},
+
     -- Off by default: it draws over every lane, so it is not something to inflict
     -- on a player who did not ask for it.
     castSpark = false,
@@ -184,6 +199,12 @@ ns.SPELL_CATEGORY_DISPLAY = {
 -- Order is equipped item, then the most recent source in the category, then the spell.
 function ns.ResolveCooldownDisplay(cooldownID, cdInfo)
     if not cooldownID then return nil, nil end
+
+    local tierSpell = ns.TierSpellIDForCooldown and ns.TierSpellIDForCooldown(cooldownID)
+    if tierSpell then
+        return C_Spell.GetSpellName(tierSpell), C_Spell.GetSpellTexture(tierSpell)
+    end
+
     if not cdInfo then
         local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
         cdInfo = ok and info or nil
@@ -301,13 +322,6 @@ local function ViewerCooldownIDs(category)
 end
 
 -- The player's real order, or nil if neither source can answer.
--- Callers fall back to GetCooldownViewerCategorySet, which is static defaults.
---
--- allowUnknown includes entries the player has not learned. Those are the
--- greyed rows in the Cooldown Manager, and a multi variant spell parks one
--- there whenever the variant naming the entry is not the talented one. The
--- live viewer never draws them, so that request answers from the provider or
--- not at all; a viewer answer would look complete while missing exactly them.
 function ns.OrderedCooldownIDs(category, allowUnknown)
     local cache = allowUnknown and unknownOrderCache or orderCache
     local dp = CleanProvider()
@@ -433,9 +447,6 @@ end
 -- Talent tests, cached. Callers sit in per-frame paths and this is a C call, so
 -- it resolves once per talent event and reads a table after that. Talents cannot
 -- change in combat, so there is no in-combat refresh to miss.
---
--- ResourceBar keeps its own copy on purpose: it is a shipping file with its own
--- fallback order and nothing to gain from the move.
 local talentKnown = {}
 
 function ns.IsTalentKnown(talentSpellID)
@@ -467,10 +478,7 @@ talentWatcher:SetScript("OnEvent", function()
     if ns.RefreshStackIndicatorGates then ns.RefreshStackIndicatorGates() end
 end)
 
--- Fonts shipped with the addon. Listed directly in the picker so they work with no
--- library present, and also registered with LibSharedMedia when it exists so other
--- addons can reach them. Both used to arrive with Details and Plater; turning those
--- off took them out of every picker that reads shared media.
+-- Fonts shipped with the addon, listed directly and registered with LibSharedMedia when present.
 ns.BUNDLED_FONTS = {
     { name = "Accidental Presidency",
       path = [[Interface\AddOns\EventHorizon_Infall\fonts\Accidental Presidency.ttf]] },
@@ -496,4 +504,50 @@ if not RegisterBundledFonts() then
         self:UnregisterAllEvents()
         RegisterBundledFonts()
     end)
+end
+
+local spellTip
+
+function ns.ShowSpellTooltip(spellID)
+    if not spellID or (issecretvalue and issecretvalue(spellID)) then
+        if spellTip then spellTip:Hide() end
+        return
+    end
+    if not spellTip then
+        spellTip = CreateFrame("GameTooltip", "EventHorizonInfallSpellTooltip",
+            UIParent, "GameTooltipTemplate")
+    end
+    spellTip:SetOwner(UIParent, "ANCHOR_NONE")
+    spellTip:ClearAllPoints()
+    local right = GameTooltip:GetRight()
+    local screen = UIParent:GetRight()
+    if right and screen and (right + 300) > screen then
+        spellTip:SetPoint("TOPRIGHT", GameTooltip, "TOPLEFT", -4, 0)
+    else
+        spellTip:SetPoint("TOPLEFT", GameTooltip, "TOPRIGHT", 4, 0)
+    end
+    if not pcall(spellTip.SetSpellByID, spellTip, spellID) then
+        spellTip:Hide()
+        return
+    end
+    spellTip:Show()
+end
+
+function ns.HideSpellTooltip()
+    if spellTip then spellTip:Hide() end
+end
+
+function ns.ShowSlotSpellTooltip(slot)
+    if not slot or slot.customEntry or not slot.pairedCooldownID then
+        ns.HideSpellTooltip()
+        return
+    end
+    local cdID = slot.pairedCooldownID
+    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
+    local sid = ok and info
+        and (info.overrideTooltipSpellID or info.overrideSpellID or info.spellID)
+    if not sid and ns.TierSpellIDForCooldown then
+        sid = ns.TierSpellIDForCooldown(cdID)
+    end
+    ns.ShowSpellTooltip(sid)
 end

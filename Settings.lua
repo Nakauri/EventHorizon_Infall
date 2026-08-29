@@ -19,12 +19,14 @@ local TOGGLE_KEYS = {
     "forceViewersAlways", "autoPairBuffs", "stackIndicators",
     "showCooldownDuration", "estimateRuneCooldowns",
     "iconsEnabled", "iconIgnoreGCD", "iconGlow", "castSpark", "castSparkMatchCast",
+    "queueSpark", "pressSpark", "dotTicks",
 }
 
 local DISPLAY_KEYS = {
     "width", "height", "spacing", "paddingTop", "paddingBottom",
     "paddingLeft", "paddingRight", "future", "past", "iconSize",
-    "iconGap", "hiddenIconWidth", "nowLineWidth", "gcdSparkWidth", "castSparkWidth", "scale",
+    "iconGap", "hiddenIconWidth", "nowLineWidth", "gcdSparkWidth", "castSparkWidth",
+    "queueSparkWidth", "pressSparkWidth", "dotTickWidth", "scale",
     "staticHeight", "staticFrames", "lines",
     "font", "fontSize", "fontFlags",
     "chargeTextAnchor", "chargeTextRelPoint", "chargeTextOffsetX", "chargeTextOffsetY",
@@ -39,7 +41,8 @@ local DISPLAY_KEYS = {
 
 local COLOR_KEYS = {
     "cooldownColor", "castColor", "buffColor", "debuffColor", "potionBuffColor",
-    "bgcolor", "bordercolor", "nowLineColor", "gcdColor", "gcdSparkColor", "castSparkColor", "linesColor",
+    "bgcolor", "bordercolor", "nowLineColor", "gcdColor", "gcdSparkColor", "castSparkColor",
+    "queueSparkColor", "queueBarColor", "pressSparkColor", "dotTickColor", "linesColor",
     "iconUsableColor", "iconNotEnoughManaColor", "iconNotUsableColor", "iconNotInRangeColor",
     "chargeTextColor", "stackTextColor",
     "variantTextColor",
@@ -71,11 +74,7 @@ local function DebouncedApplyAndSave(extraFn)
 end
 
 
--- Search order is load bearing. Only a Tracked Bars entry (3) carries a .Bar,
--- and a .Bar is the only thing an icon wedge can mirror. Tracked Buffs (2) has
--- none, and a self mapping resolves to the ability's own cooldown frame, which
--- has none either. Reorder this and every wedge silently stops drawing.
--- Utility is deliberately absent: it would match every entry against itself.
+-- Order is load bearing: only a Tracked Bars entry (3) carries the .Bar a wedge mirrors.
 local BUFF_SEARCH_CATEGORIES = { 3, 2 }
 
 -- nil from OrderedCooldownIDs means the layout could not be read, which is not
@@ -89,13 +88,7 @@ local function CategoryEntryIDs(category, allowUnknown)
     return (ok and set) or {}, false
 end
 
--- Indexed by every spell id the entry can present, not just its base. A buff
--- whose entry names a variant the player has not talented is still the buff
--- the ability applies, and the base alone never matches it. Unlearned entries
--- are included for the same reason: that is where those variants sit.
--- Maps a spell id to EVERY entry that can present it, in category order. Only
--- one of them is ever fed, and which one is not knowable from config, so lane
--- resolution walks the list and takes the first with a live aura.
+-- Maps a spell id to every entry that can present it, in category order.
 local function BuffEntryBySpell(categories)
     local bySpell, trusted = {}, true
     for _, cat in ipairs(categories) do
@@ -160,12 +153,7 @@ local function MappingUnitFor(buffCooldownID, abilitySpellID)
     return nil
 end
 
--- A row cleared by hand stays cleared. Clearing the last slot leaves an empty
--- table, auto pairing reads empty as never paired, and the unpair handler's own
--- LoadEssentialCooldowns refilled it before the panel redrew, so the clear could
--- never stick while the toggle was on. Pairing a row again drops the mark, and
--- turning the toggle on wipes them all, which is the explicit "fill these in".
--- Only ever holds true or nil, so presence is the answer.
+-- A row cleared by hand stays cleared. Holds true or nil, so presence is the answer.
 local function PairingCleared(cooldownID)
     local marks = CONFIG.pairingCleared
     return cooldownID ~= nil and marks ~= nil and marks[cooldownID] ~= nil
@@ -443,12 +431,6 @@ local ICON_COPY_TOGGLES = { "iconsEnabled", "iconGlow", "iconIgnoreGCD", "hideIc
 
 -- Spec profiles are keyed `Name-Realm-specID`, and InfallDB is account wide, so
 -- every character's profiles are visible here.
---
--- Another CLASS is still not offered: the rows are cooldownIDs and a mage's mean
--- nothing to a hunter. Another character of the SAME class is, because the same
--- spec on an alt has the identical cooldownIDs. The class comes from the spec id
--- itself, sixth return of GetSpecializationInfoByID, so a profile belonging to a
--- character who is not logged in is still classified correctly.
 function ns.IconCopySources()
     local out = {}
     local mine = ns.GetSpecKey and ns.GetSpecKey()
@@ -502,10 +484,7 @@ function ns.CopyIconsFromProfile(srcKey)
         end
     end
 
-    -- Pairings for the rows that just arrived, and only those. The table is shared
-    -- with the timeline, so copying it whole would rewrite this spec's bars. An
-    -- existing pairing is never overwritten, and an emptied one is a cleared
-    -- pairing, not an absent one, so it is left cleared.
+    -- Only the rows that just arrived. Never overwrites an existing or cleared pairing.
     local paired = 0
     if type(src.pairings) == "table" then
         CONFIG.buffMappings = CONFIG.buffMappings or {}
@@ -2218,6 +2197,30 @@ local function BuildColoursTab(contentArea, tabFrames)
     end)
     AddColourWidget(gcdSparkColourSwatch)
 
+    local queueSparkColourSwatch = CreateColorSwatch(colourContent, "Queue Window", DeepCopy(CONFIG.queueSparkColor), function(c)
+        CONFIG.queueSparkColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(queueSparkColourSwatch)
+
+    local queueBarColourSwatch = CreateColorSwatch(colourContent, "Queue Window Bar", DeepCopy(CONFIG.queueBarColor), function(c)
+        CONFIG.queueBarColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(queueBarColourSwatch)
+
+    local pressSparkColourSwatch = CreateColorSwatch(colourContent, "Keypress", DeepCopy(CONFIG.pressSparkColor), function(c)
+        CONFIG.pressSparkColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(pressSparkColourSwatch)
+
+    local dotTickColourSwatch = CreateColorSwatch(colourContent, "DoT Ticks", DeepCopy(CONFIG.dotTickColor), function(c)
+        CONFIG.dotTickColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(dotTickColourSwatch)
+
     local linesColourSwatch = CreateColorSwatch(colourContent, "Time Lines", DeepCopy(CONFIG.linesColor), function(c)
         CONFIG.linesColor = c
         DebouncedApplyAndSave()
@@ -2453,6 +2456,10 @@ local function BuildColoursTab(contentArea, tabFrames)
         if CONFIG.nowLineColor then nowLineColourSwatch:SetColor(DeepCopy(CONFIG.nowLineColor)) end
         if CONFIG.gcdColor then gcdColourSwatch:SetColor(DeepCopy(CONFIG.gcdColor)) end
         if CONFIG.gcdSparkColor then gcdSparkColourSwatch:SetColor(DeepCopy(CONFIG.gcdSparkColor)) end
+        if CONFIG.queueSparkColor then queueSparkColourSwatch:SetColor(DeepCopy(CONFIG.queueSparkColor)) end
+        if CONFIG.queueBarColor then queueBarColourSwatch:SetColor(DeepCopy(CONFIG.queueBarColor)) end
+        if CONFIG.pressSparkColor then pressSparkColourSwatch:SetColor(DeepCopy(CONFIG.pressSparkColor)) end
+        if CONFIG.dotTickColor then dotTickColourSwatch:SetColor(DeepCopy(CONFIG.dotTickColor)) end
         if CONFIG.linesColor then linesColourSwatch:SetColor(DeepCopy(CONFIG.linesColor)) end
         if CONFIG.iconUsableColor then iconUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconUsableColor)) end
         if CONFIG.iconNotEnoughManaColor then iconManaColourSwatch:SetColor(DeepCopy(CONFIG.iconNotEnoughManaColor)) end
@@ -3644,7 +3651,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.3.9")
+    versionText:SetText("v1.4.0")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -4144,6 +4151,7 @@ local function BuildSettings()
                     .. "s, started by casting this ability", 0.7, 0.7, 0.7, true)
                 GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
                 GameTooltip:Show()
+                ns.HideSpellTooltip()
                 return
             end
             if self.pairedCooldownID then
@@ -4153,6 +4161,9 @@ local function BuildSettings()
                 GameTooltip:SetText(slotName .. ": " .. bName, 1, 1, 1)
                 GameTooltip:AddLine("Left click: replace with selected buff", 0.5, 0.8, 0.5)
                 GameTooltip:AddLine("Right click: remove pairing", 1, 0.5, 0.5)
+                GameTooltip:Show()
+                ns.ShowSlotSpellTooltip(self)
+                return
             else
                 GameTooltip:SetText(slotName .. " Slot (empty)", 0.6, 0.6, 0.6)
                 if selectedBuff then
@@ -4163,13 +4174,18 @@ local function BuildSettings()
                 end
             end
             GameTooltip:Show()
+            ns.HideSpellTooltip()
+        end
+        local function buffSlotLeave()
+            GameTooltip:Hide()
+            ns.HideSpellTooltip()
         end
         buff1Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 1") end)
-        buff1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buff1Slot:SetScript("OnLeave", buffSlotLeave)
         buff2Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 2") end)
-        buff2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buff2Slot:SetScript("OnLeave", buffSlotLeave)
         buff3Slot:SetScript("OnEnter", function(self) buffSlotTooltip(self, "Buff 3") end)
-        buff3Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buff3Slot:SetScript("OnLeave", buffSlotLeave)
 
         local function PairBuff(slot, colorBtn, slotIndex)
             return function(self, button)
@@ -4293,11 +4309,16 @@ local function BuildSettings()
                 end
             end
             GameTooltip:Show()
+            ns.ShowSpellTooltip(self.pairedSpellID)
+        end
+        local function castSlotLeave()
+            GameTooltip:Hide()
+            ns.HideSpellTooltip()
         end
         cast1Slot:SetScript("OnEnter", function(self) castSlotTooltip(self, "Cast 1") end)
-        cast1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        cast1Slot:SetScript("OnLeave", castSlotLeave)
         cast2Slot:SetScript("OnEnter", function(self) castSlotTooltip(self, "Cast 2") end)
-        cast2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        cast2Slot:SetScript("OnLeave", castSlotLeave)
 
         local function PairCast(slot, colorBtn, castSlotIndex)
             return function(self, button)
@@ -4397,8 +4418,12 @@ local function BuildSettings()
                 end
             end
             GameTooltip:Show()
+            ns.ShowSlotSpellTooltip(self)
         end)
-        stackSlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        stackSlot:SetScript("OnLeave", function()
+            GameTooltip:Hide()
+            ns.HideSpellTooltip()
+        end)
         stackSlot:SetScript("OnClick", function(self, button)
             if button == "RightButton" and self.pairedCooldownID then
                 self.pairedCooldownID = nil; self.customEntry = nil; self.pairedColor = nil
@@ -4472,10 +4497,7 @@ local function BuildSettings()
         -- Use data provider if available, fall back to category set
         local foundSource = false
         do
-            -- An empty table is an ANSWER, the category is genuinely empty. Only nil
-            -- means the layout could not be read. Testing #displayed > 0 here treated
-            -- empty as unknown, so emptying a category fell through to static
-            -- defaults and the list repopulated with what the player just removed.
+            -- An empty table is an answer; only nil means the layout could not be read.
             local displayed = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(0)
             if displayed then
                 cooldownIDs = displayed
@@ -4768,6 +4790,7 @@ local function BuildSettings()
                             GameTooltip:SetText("Buff 1: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
                             GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
+                            ns.HideSpellTooltip()
                             return
                         end
                         GameTooltip:SetText("Buff 1 Slot (empty)", 0.6, 0.6, 0.6)
@@ -4779,8 +4802,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSlotSpellTooltip(self)
                 end)
-                buff1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                buff1Slot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 -- Tooltips for Buff 2
                 buff2Slot:SetScript("OnEnter", function(self)
@@ -4799,6 +4826,7 @@ local function BuildSettings()
                             GameTooltip:SetText("Buff 2: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
                             GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
+                            ns.HideSpellTooltip()
                             return
                         end
                         GameTooltip:SetText("Buff 2 Slot (empty)", 0.6, 0.6, 0.6)
@@ -4810,8 +4838,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSlotSpellTooltip(self)
                 end)
-                buff2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                buff2Slot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 -- Tooltips for Buff 3
                 buff3Slot:SetScript("OnEnter", function(self)
@@ -4830,6 +4862,7 @@ local function BuildSettings()
                             GameTooltip:SetText("Buff 3: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
                             GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
+                            ns.HideSpellTooltip()
                             return
                         end
                         GameTooltip:SetText("Buff 3 Slot (empty)", 0.6, 0.6, 0.6)
@@ -4841,8 +4874,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSlotSpellTooltip(self)
                 end)
-                buff3Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                buff3Slot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 -- Look up by CDM cooldownID first, fall back to spellID.
                 local mappings = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
@@ -5150,8 +5187,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSpellTooltip(self.pairedSpellID)
                 end)
-                cast1Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                cast1Slot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 -- Tooltips for Cast 2
                 cast2Slot:SetScript("OnEnter", function(self)
@@ -5171,8 +5212,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSpellTooltip(self.pairedSpellID)
                 end)
-                cast2Slot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                cast2Slot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 -- Tooltips for Stack
                 stackSlot:SetScript("OnEnter", function(self)
@@ -5195,8 +5240,12 @@ local function BuildSettings()
                         end
                     end
                     GameTooltip:Show()
+                    ns.ShowSlotSpellTooltip(self)
                 end)
-                stackSlot:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                stackSlot:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                    ns.HideSpellTooltip()
+                end)
 
                 local extraCasts = CONFIG.extraCasts and (CONFIG.extraCasts[cooldownID] or (spellID and spellID ~= cooldownID and CONFIG.extraCasts[spellID]))
                 if extraCasts and spellID and spellID ~= cooldownID and CONFIG.extraCasts[spellID] and not CONFIG.extraCasts[cooldownID] then
@@ -5729,10 +5778,6 @@ local function BuildSettings()
         -- The DataProvider reports the player's real layout; GetCooldownViewerCategorySet
         -- reports the static default category. An empty section is valid and means
         -- everything was moved out of it, so only an unreadable one falls back.
-        -- Unlearned entries are included on purpose. A multi variant spell parks
-        -- its entry under the variant that is not talented, so the Cooldown
-        -- Manager greys it out even though the player has the ability and the
-        -- aura. Excluding it here is what made those buffs impossible to pair.
         local dpIds = {}
         if ns.OrderedCooldownIDs then
             for _, sec in ipairs(sections) do
@@ -5759,6 +5804,19 @@ local function BuildSettings()
                         totalCount = totalCount + 1
                     end
                 end
+            end
+        end
+
+        if ns.TierSetAuras then
+            local tierAuras = ns.TierSetAuras()
+            if #tierAuras > 0 then
+                local tierIDs = {}
+                for _, auraID in ipairs(tierAuras) do
+                    tierIDs[#tierIDs + 1] = ns.TierCooldownIDForSpell(auraID)
+                    totalCount = totalCount + 1
+                end
+                sections[#sections + 1] =
+                    { label = "Tier Set Bonuses", ids = tierIDs, tier = true }
             end
         end
 
@@ -5791,11 +5849,16 @@ local function BuildSettings()
                     btnIdx = btnIdx + 1
                     local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
                     local spellID = infoOk and cdInfo and (cdInfo.overrideTooltipSpellID or cdInfo.overrideSpellID or cdInfo.spellID)
+                    local tierSpell = ns.TierSpellIDForCooldown
+                        and ns.TierSpellIDForCooldown(buffCdID)
+                    if tierSpell then spellID = tierSpell end
                     local rName, rIcon = ns.ResolveCooldownDisplay(buffCdID, cdInfo)
                     local tex = rIcon or 134400
                     local spellName = rName or ("ID:" .. buffCdID)
                     local secLabel = sec.label
                     local secCat = sec.cat
+                    local tierPieces = tierSpell and ns.TierSetAuraPieces
+                        and ns.TierSetAuraPieces(tierSpell)
 
                     local col = (i - 1) % cols
                     local rowIdx = math.floor((i - 1) / cols)
@@ -5854,7 +5917,11 @@ local function BuildSettings()
                         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                         GameTooltip:SetText(spellName, 1, 1, 1)
                         GameTooltip:AddLine(secLabel, 0.5, 0.8, 1.0)
-                        GameTooltip:AddLine("CooldownID: " .. buffCdID, 0.7, 0.7, 0.7)
+                        if tierPieces then
+                            GameTooltip:AddLine(tierPieces .. " piece set bonus", 0.7, 0.7, 0.7)
+                        else
+                            GameTooltip:AddLine("CooldownID: " .. buffCdID, 0.7, 0.7, 0.7)
+                        end
                         if spellID then
                             GameTooltip:AddLine("SpellID: " .. spellID, 0.7, 0.7, 0.7)
                         end
@@ -5884,9 +5951,11 @@ local function BuildSettings()
                         end
                         GameTooltip:AddLine("Click to select, then click a Buff or Stack slot above.", 0.5, 0.8, 0.5, true)
                         GameTooltip:Show()
+                        ns.ShowSpellTooltip(spellID)
                     end)
                     btn:SetScript("OnLeave", function()
                         GameTooltip:Hide()
+                        ns.HideSpellTooltip()
                     end)
 
                     btn:SetScript("OnClick", function(self, button)
@@ -6030,8 +6099,12 @@ local function BuildSettings()
                 GameTooltip:AddLine("SpellID: " .. castSID, 0.7, 0.7, 0.7)
                 GameTooltip:AddLine("Click to select, then click a Cast slot above.", 0.5, 0.8, 0.5, true)
                 GameTooltip:Show()
+                ns.ShowSpellTooltip(castSID)
             end)
-            btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            btn:SetScript("OnLeave", function()
+                GameTooltip:Hide()
+                ns.HideSpellTooltip()
+            end)
 
             btn:SetScript("OnClick", function(self)
                 if selectedCast == castSID then
@@ -6319,6 +6392,50 @@ local function BuildSettings()
     AddDispHeader("Cast Spark")
     AddDispDescription("Draws a line at the end of a cast, crossing every lane and travelling toward the now line, so you can read where the cast lands against everything else on the timeline.")
 
+    AddDispDescription("Marks where the spell queue window opens, a fixed distance behind the global cooldown's leading edge. Press an ability after this line and the game stores the press and fires it the instant the global cooldown ends, instead of throwing it away.")
+
+    local queueSparkCheck = CreateCheckbox(dispContent, "Enable Queue Window Spark",
+        "Off by default. Follows your SpellQueueWindow setting, so it moves if you change it. Marks the window on the GCD and on any cast.",
+        CONFIG.queueSpark, function(v)
+        CONFIG.queueSpark = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(queueSparkCheck)
+
+    local queueSparkWidthSlider = CreateSlider(dispContent, "Queue Window Spark Width", 1, 6, 1, CONFIG.queueSparkWidth, function(v)
+        CONFIG.queueSparkWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(queueSparkWidthSlider)
+
+    local pressSparkCheck = CreateCheckbox(dispContent, "Enable Keypress Spark",
+        "Off by default. Marks where a keypress was accepted, on the row of the spell you pressed. A press the game refused draws nothing, which means you were too early.",
+        CONFIG.pressSpark, function(v)
+        CONFIG.pressSpark = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pressSparkCheck)
+
+    local pressSparkWidthSlider = CreateSlider(dispContent, "Keypress Spark Width", 1, 6, 1, CONFIG.pressSparkWidth, function(v)
+        CONFIG.pressSparkWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pressSparkWidthSlider)
+
+    local dotTicksCheck = CreateCheckbox(dispContent, "Enable DoT Tick Marks",
+        "Off by default. Notches along the top of a buff bar at each periodic tick. Only drawn for spells with a known tick rate.",
+        CONFIG.dotTicks, function(v)
+        CONFIG.dotTicks = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(dotTicksCheck)
+
+    local dotTickWidthSlider = CreateSlider(dispContent, "DoT Tick Width", 1, 6, 1, CONFIG.dotTickWidth, function(v)
+        CONFIG.dotTickWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(dotTickWidthSlider)
+
     local castSparkCheck = CreateCheckbox(dispContent, "Enable Cast Spark",
         "Off by default. Channels and empowered casts use it too.", CONFIG.castSpark, function(v)
         CONFIG.castSpark = v
@@ -6394,25 +6511,44 @@ local function BuildSettings()
         end
     end
 
-    local linesEdit = CreateEditBox(dispContent, "Time Lines (comma separated, blank=off)", linesStr, function(text)
+    local linesEdit
+    linesEdit = CreateEditBox(dispContent, "Time Lines (comma separated, blank=off)", linesStr, function(text)
         if text == "" or text == "off" then
             CONFIG.lines = nil
         else
             local vals = {}
             for num in text:gmatch("[%d%.]+") do
                 local n = tonumber(num)
-                if n then vals[#vals + 1] = n end
+                if n and n > 0 and n <= CONFIG.future then vals[#vals + 1] = n end
             end
-            if #vals == 0 then
+            table.sort(vals)
+            -- A repeat draws a second line on the same pixel and reads as one thick one.
+            local uniq = {}
+            for _, v in ipairs(vals) do
+                if uniq[#uniq] ~= v then uniq[#uniq + 1] = v end
+            end
+            if #uniq == 0 then
                 CONFIG.lines = nil
-            elseif #vals == 1 then
-                CONFIG.lines = vals[1]
+            elseif #uniq == 1 then
+                CONFIG.lines = uniq[1]
             else
-                CONFIG.lines = vals
+                CONFIG.lines = uniq
             end
         end
         ApplyLayoutToAllBars()
         ns.SaveCurrentProfile()
+        -- Written back so a dropped value is visible.
+        if linesEdit then
+            local out = ""
+            if type(CONFIG.lines) == "table" then
+                local parts = {}
+                for _, v in ipairs(CONFIG.lines) do parts[#parts + 1] = tostring(v) end
+                out = table.concat(parts, ", ")
+            elseif type(CONFIG.lines) == "number" then
+                out = tostring(CONFIG.lines)
+            end
+            linesEdit:SetText(out)
+        end
     end)
     AddDispWidget(linesEdit)
 
