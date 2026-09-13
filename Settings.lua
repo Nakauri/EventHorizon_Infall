@@ -18,8 +18,9 @@ local TOGGLE_KEYS = {
     "showVariantNames", "smoothBars", "showPastBars",
     "forceViewersAlways", "autoPairBuffs", "stackIndicators",
     "showCooldownDuration", "estimateRuneCooldowns",
-    "iconsEnabled", "iconIgnoreGCD", "iconGlow", "castSpark", "castSparkMatchCast",
-    "queueSpark", "pressSpark", "dotTicks",
+    "iconsEnabled", "iconIgnoreGCD", "iconGlow", "iconQueued",
+    "castSpark", "castSparkMatchCast",
+    "queueSpark", "pressSpark", "pressSparkCastOnly", "dotTicks",
 }
 
 local DISPLAY_KEYS = {
@@ -42,7 +43,8 @@ local DISPLAY_KEYS = {
 local COLOR_KEYS = {
     "cooldownColor", "castColor", "buffColor", "debuffColor", "potionBuffColor",
     "bgcolor", "bordercolor", "nowLineColor", "gcdColor", "gcdSparkColor", "castSparkColor",
-    "queueSparkColor", "queueBarColor", "pressSparkColor", "dotTickColor", "linesColor",
+    "queueSparkColor", "queueBarColor", "pressSparkColor", "pressLateColor",
+    "iconQueuedColor", "dotTickColor", "linesColor",
     "iconUsableColor", "iconNotEnoughManaColor", "iconNotUsableColor", "iconNotInRangeColor",
     "chargeTextColor", "stackTextColor",
     "variantTextColor",
@@ -83,6 +85,12 @@ local BUFF_SEARCH_CATEGORIES = { 3, 2 }
 local function CategoryEntryIDs(category, allowUnknown)
     local ids = ns.OrderedCooldownIDs and ns.OrderedCooldownIDs(category, allowUnknown)
     if type(ids) == "table" then return ids, true end
+    -- The unknown-inclusive read answers only from the provider, which is often dirty.
+    -- Live viewer frames are real and see what the player dragged; static defaults do not.
+    if allowUnknown and ns.OrderedCooldownIDs then
+        local live = ns.OrderedCooldownIDs(category, false)
+        if type(live) == "table" then return live, true end
+    end
     local ok, set = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category,
         allowUnknown and true or false)
     return (ok and set) or {}, false
@@ -395,22 +403,16 @@ end
 
 -- Once per spec profile. A self mapping is not evidence of a choice, it is what
 -- every earlier build wrote for any ability with an aura.
-function ns.RepairSelfBuffPairingsOnce()
-    -- Automatic only while the player has asked for automatic pairing. Repointing
-    -- a pairing someone made by hand is the same unrequested write as creating
-    -- one. `/infall repair` still runs it on demand.
+function ns.RepairSelfBuffPairingsAuto()
+    -- Automatic only while the player asked for automatic pairing. Repointing a
+    -- pairing made by hand is the same unrequested write as creating one.
     if not CONFIG.autoPairBuffs then return end
-    local key = ns.GetSpecKey and ns.GetSpecKey()
-    if not key then return end
-    InfallDB.pairingRepair = InfallDB.pairingRepair or {}
-    if InfallDB.pairingRepair[key] then return end
 
-    -- Never burn the stamp on a layout that could not be read, or the one run
-    -- this profile gets is the run that had no data.
-    local fixed, trusted = ns.RepairSelfBuffPairings(false)
-    if not trusted then return end
-    InfallDB.pairingRepair[key] = true
-    if fixed > 0 then
+    -- Deliberately keeps no record of having run. It is idempotent, it never runs
+    -- in combat, and a stored note that it had finished is what left pairings
+    -- broken until someone unpaired and re-paired them by hand.
+    local fixed = ns.RepairSelfBuffPairings(false)
+    if fixed and fixed > 0 then
         print("|cff00ff00[Infall]|r Repaired " .. fixed .. " buff pairings that could not draw a wedge.")
     end
 end
@@ -419,15 +421,17 @@ function ns.GetSpecKey()
     local name = UnitName("player")
     local realm = GetRealmName()
     if not name or not realm then return nil end
-    local specIndex = GetSpecialization()
-    local specID = specIndex and GetSpecializationInfo(specIndex)
-    return name .. "-" .. realm .. "-" .. (specID or 0)
+    local specID = ns.SpecIDFor(ns.SpecIndex())
+    -- Nil, never zero. A "-0" key is a real looking profile that saves land in
+    -- and the real spec profile then overwrites.
+    if not specID or specID == 0 then return nil end
+    return name .. "-" .. realm .. "-" .. specID
 end
 
 -- Everything the icon strip owns. Buff pairings are deliberately absent: they are
 -- shared with the timeline, so carrying them would rewrite the target spec's bars.
 local ICON_COPY_KEYS = { "iconList", "iconStates", "iconContainers", "customIcons" }
-local ICON_COPY_TOGGLES = { "iconsEnabled", "iconGlow", "iconIgnoreGCD", "hideIcons" }
+local ICON_COPY_TOGGLES = { "iconsEnabled", "iconGlow", "iconQueued", "iconIgnoreGCD", "hideIcons" }
 
 -- Spec profiles are keyed `Name-Realm-specID`, and InfallDB is account wide, so
 -- every character's profiles are visible here.
@@ -515,6 +519,15 @@ end
 local function PairingDefaultColor(buffCdID, isDebuff)
     if isDebuff then return DeepCopy(CONFIG.debuffColor), "target" end
     return DeepCopy(CONFIG.buffColor), nil
+end
+ns.PairingDefaultColor = PairingDefaultColor
+
+-- A slot holds a pairing or a custom timer. Reading only the pairing list makes a
+-- filled custom timer answer empty, which blocks the slot after it.
+function ns.BuffSlotFilled(entry)
+    if not entry then return false end
+    if entry.customDuration then return true end
+    return (entry.buffCooldownIDs and #entry.buffCooldownIDs > 0) or false
 end
 
 -- Icon for a CDM entry. Item entries carry no spellID, so GetSpellTexture returns
@@ -611,6 +624,7 @@ function ns.SeedProfileFromClassConfig(specKey)
 end
 
 function ns.ApplyProfile(profile)
+    if ns.PressMarks_Reset then ns.PressMarks_Reset() end
     if not profile then return end
 
     if profile.toggles then
@@ -758,7 +772,16 @@ end
 
 function ns.SaveCurrentProfile()
     local specKey = ns.currentSpecKey
-    if not specKey then return end
+    -- Warned once per unsaved run, not silently dropped: the caller sites all
+    -- ignore the return, so the change is live on screen either way.
+    if not specKey then
+        if not ns._saveKeyWarned then
+            ns._saveKeyWarned = true
+            print("|cffff0000[Infall]|r Spec not resolved yet, that change was NOT saved. Change it again in a moment.")
+        end
+        return
+    end
+    ns._saveKeyWarned = nil
 
     local profile = InfallDB.profiles[specKey]
     if not profile then
@@ -2209,11 +2232,24 @@ local function BuildColoursTab(contentArea, tabFrames)
     end)
     AddColourWidget(queueBarColourSwatch)
 
-    local pressSparkColourSwatch = CreateColorSwatch(colourContent, "Keypress", DeepCopy(CONFIG.pressSparkColor), function(c)
+    local pressSparkColourSwatch = CreateColorSwatch(colourContent, "Keypress In Time", DeepCopy(CONFIG.pressSparkColor), function(c)
         CONFIG.pressSparkColor = c
         DebouncedApplyAndSave()
     end)
     AddColourWidget(pressSparkColourSwatch)
+
+    local pressLateColourSwatch = CreateColorSwatch(colourContent, "Keypress Late", DeepCopy(CONFIG.pressLateColor), function(c)
+        CONFIG.pressLateColor = c
+        DebouncedApplyAndSave()
+    end)
+    AddColourWidget(pressLateColourSwatch)
+
+    local iconQueuedColourSwatch = CreateColorSwatch(colourContent, "Queued Icon Tint", DeepCopy(CONFIG.iconQueuedColor), function(c)
+        CONFIG.iconQueuedColor = c
+        DebouncedApplyAndSave()
+        if ns.RefreshIcons then ns.RefreshIcons() end
+    end)
+    AddColourWidget(iconQueuedColourSwatch)
 
     local dotTickColourSwatch = CreateColorSwatch(colourContent, "DoT Ticks", DeepCopy(CONFIG.dotTickColor), function(c)
         CONFIG.dotTickColor = c
@@ -2459,6 +2495,8 @@ local function BuildColoursTab(contentArea, tabFrames)
         if CONFIG.queueSparkColor then queueSparkColourSwatch:SetColor(DeepCopy(CONFIG.queueSparkColor)) end
         if CONFIG.queueBarColor then queueBarColourSwatch:SetColor(DeepCopy(CONFIG.queueBarColor)) end
         if CONFIG.pressSparkColor then pressSparkColourSwatch:SetColor(DeepCopy(CONFIG.pressSparkColor)) end
+        if CONFIG.pressLateColor then pressLateColourSwatch:SetColor(DeepCopy(CONFIG.pressLateColor)) end
+        if CONFIG.iconQueuedColor then iconQueuedColourSwatch:SetColor(DeepCopy(CONFIG.iconQueuedColor)) end
         if CONFIG.dotTickColor then dotTickColourSwatch:SetColor(DeepCopy(CONFIG.dotTickColor)) end
         if CONFIG.linesColor then linesColourSwatch:SetColor(DeepCopy(CONFIG.linesColor)) end
         if CONFIG.iconUsableColor then iconUsableColourSwatch:SetColor(DeepCopy(CONFIG.iconUsableColor)) end
@@ -3651,7 +3689,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.4.0")
+    versionText:SetText("v1.4.2")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -3798,7 +3836,7 @@ local function BuildSettings()
     local instrBlock = CreateFrame("Frame", nil, barsTab, "BackdropTemplate")
     instrBlock:SetPoint("TOPLEFT", 0, 0)
     instrBlock:SetPoint("TOPRIGHT", 0, 0)
-    instrBlock:SetHeight(92)
+    instrBlock:SetHeight(92)   -- replaced by LayoutInstr below, which measures the text
     instrBlock:SetBackdrop({
         bgFile = "Interface\\Buttons\\WHITE8x8",
         edgeFile = "Interface\\Buttons\\WHITE8x8",
@@ -3856,10 +3894,28 @@ local function BuildSettings()
     cdmBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     cdmBtn:SetScript("OnClick", ns.OpenCooldownManager)
 
+    -- The paragraph wraps to a different number of lines depending on the player's font
+    -- and panel width, so a fixed block height dropped the last line onto the buttons.
+    -- Guarded against re-entry because setting the height re-fires OnSizeChanged.
+    local INSTR_TOP, INSTR_GAP, INSTR_BTN, INSTR_BOT = 10, 8, 22, 10
+    local lastInstrW, lastInstrH
+    local function LayoutInstr()
+        local w = math.floor((instrBlock:GetWidth() or 0) + 0.5)
+        local textH = math.ceil(instrText:GetStringHeight() or 0)
+        if textH <= 0 then return end
+        local want = INSTR_TOP + textH + INSTR_GAP + INSTR_BTN + INSTR_BOT
+        if w == lastInstrW and want == lastInstrH then return end
+        lastInstrW, lastInstrH = w, want
+        instrBlock:SetHeight(want)
+    end
+    instrBlock:SetScript("OnSizeChanged", LayoutInstr)
+    instrBlock:SetScript("OnShow", LayoutInstr)
+    LayoutInstr()
+
     -- Top panel: Cooldown Rows with visibility checkboxes and buff pairing
     local topPanel = CreateFrame("Frame", nil, barsTab, "BackdropTemplate")
-    topPanel:SetPoint("TOPLEFT", 0, -96)
-    topPanel:SetPoint("RIGHT", 0, 0)
+    topPanel:SetPoint("TOPLEFT", instrBlock, "BOTTOMLEFT", 0, -4)
+    topPanel:SetPoint("TOPRIGHT", instrBlock, "BOTTOMRIGHT", 0, -4)
     topPanel:SetHeight(250)
     topPanel:SetBackdrop({
         bgFile = "Interface\\Buttons\\WHITE8x8",
@@ -4219,11 +4275,11 @@ local function BuildSettings()
                 -- Enforce slot ordering
                 if slotIndex == 2 then
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    local s1 = m and m[1] and m[1].buffCooldownIDs and #m[1].buffCooldownIDs > 0
+                    local s1 = m and ns.BuffSlotFilled(m[1])
                     if not s1 then statusText:SetText("|cffff6666Pair Buff 1 first before using Buff 2.|r"); return end
                 elseif slotIndex == 3 then
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                    local s2 = m and m[2] and m[2].buffCooldownIDs and #m[2].buffCooldownIDs > 0
+                    local s2 = m and ns.BuffSlotFilled(m[2])
                     if not s2 then statusText:SetText("|cffff6666Pair Buff 1 and 2 first before using Buff 3.|r"); return end
                 end
                 local buffCdID = selectedBuff
@@ -5011,14 +5067,14 @@ local function BuildSettings()
                             -- Enforce slot ordering
                             if slotIndex == 2 then
                                 local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                                local slot1Valid = m and m[1] and m[1].buffCooldownIDs and #m[1].buffCooldownIDs > 0
+                                local slot1Valid = m and ns.BuffSlotFilled(m[1])
                                 if not slot1Valid then
                                     statusText:SetText("|cffff6666Pair Buff 1 first before using Buff 2.|r")
                                     return
                                 end
                             elseif slotIndex == 3 then
                                 local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
-                                local slot2Valid = m and m[2] and m[2].buffCooldownIDs and #m[2].buffCooldownIDs > 0
+                                local slot2Valid = m and ns.BuffSlotFilled(m[2])
                                 if not slot2Valid then
                                     statusText:SetText("|cffff6666Pair Buff 1 and 2 first before using Buff 3.|r")
                                     return
@@ -5891,11 +5947,10 @@ local function BuildSettings()
                         learnState, learnDur, learnKey =
                             ns.AuraCompat.GetLearnStateForCooldown(buffCdID)
                     end
-                    -- Marked only once the fallback has actually had to run for this
-                    -- spell. A measured duration the game never makes us use is not
-                    -- something the player needs to decide about.
+                    -- Asked of the ENTRY, and only once the fallback has had to run.
+                    -- The learn key is shared with the never fed Essential entry.
                     local estimatable = (learnState == "learned") and learnKey ~= nil
-                        and ns.AuraCompat.IsEstimateUsed(learnKey)
+                        and ns.AuraCompat.IsEstimateUsed(buffCdID)
                     local function RefreshEstimateDot()
                         if not estimatable then btn.estimateDot:Hide() return end
                         local on = ns.AuraCompat.IsEstimateAllowed(learnKey)
@@ -6388,53 +6443,9 @@ local function BuildSettings()
     end)
     AddDispWidget(gcdSparkSlider)
 
-    -- Toggle, width and colour together, not split across tabs.
+    -- Each header owns its own toggle, width and colour.
     AddDispHeader("Cast Spark")
     AddDispDescription("Draws a line at the end of a cast, crossing every lane and travelling toward the now line, so you can read where the cast lands against everything else on the timeline.")
-
-    AddDispDescription("Marks where the spell queue window opens, a fixed distance behind the global cooldown's leading edge. Press an ability after this line and the game stores the press and fires it the instant the global cooldown ends, instead of throwing it away.")
-
-    local queueSparkCheck = CreateCheckbox(dispContent, "Enable Queue Window Spark",
-        "Off by default. Follows your SpellQueueWindow setting, so it moves if you change it. Marks the window on the GCD and on any cast.",
-        CONFIG.queueSpark, function(v)
-        CONFIG.queueSpark = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(queueSparkCheck)
-
-    local queueSparkWidthSlider = CreateSlider(dispContent, "Queue Window Spark Width", 1, 6, 1, CONFIG.queueSparkWidth, function(v)
-        CONFIG.queueSparkWidth = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(queueSparkWidthSlider)
-
-    local pressSparkCheck = CreateCheckbox(dispContent, "Enable Keypress Spark",
-        "Off by default. Marks where a keypress was accepted, on the row of the spell you pressed. A press the game refused draws nothing, which means you were too early.",
-        CONFIG.pressSpark, function(v)
-        CONFIG.pressSpark = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(pressSparkCheck)
-
-    local pressSparkWidthSlider = CreateSlider(dispContent, "Keypress Spark Width", 1, 6, 1, CONFIG.pressSparkWidth, function(v)
-        CONFIG.pressSparkWidth = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(pressSparkWidthSlider)
-
-    local dotTicksCheck = CreateCheckbox(dispContent, "Enable DoT Tick Marks",
-        "Off by default. Notches along the top of a buff bar at each periodic tick. Only drawn for spells with a known tick rate.",
-        CONFIG.dotTicks, function(v)
-        CONFIG.dotTicks = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(dotTicksCheck)
-
-    local dotTickWidthSlider = CreateSlider(dispContent, "DoT Tick Width", 1, 6, 1, CONFIG.dotTickWidth, function(v)
-        CONFIG.dotTickWidth = v
-        ns.SaveCurrentProfile()
-    end)
-    AddDispWidget(dotTickWidthSlider)
 
     local castSparkCheck = CreateCheckbox(dispContent, "Enable Cast Spark",
         "Off by default. Channels and empowered casts use it too.", CONFIG.castSpark, function(v)
@@ -6462,6 +6473,71 @@ local function BuildSettings()
         ns.SaveCurrentProfile()
     end)
     AddDispWidget(castSparkSwatch)
+
+    AddDispHeader("Spell Queue Window")
+    AddDispDescription("Marks where the spell queue window opens, a fixed distance behind the global cooldown's leading edge. Press an ability after this line and the game stores the press and fires it the instant the global cooldown ends, instead of throwing it away.")
+
+    local queueSparkCheck = CreateCheckbox(dispContent, "Enable Queue Window Spark",
+        "Off by default. Follows your SpellQueueWindow setting, so it moves if you change it. Marks the window on the GCD and on any cast.",
+        CONFIG.queueSpark, function(v)
+        CONFIG.queueSpark = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(queueSparkCheck)
+
+    local queueSparkWidthSlider = CreateSlider(dispContent, "Queue Window Spark Width", 1, 6, 1, CONFIG.queueSparkWidth, function(v)
+        CONFIG.queueSparkWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(queueSparkWidthSlider)
+
+    local pressSparkCheck = CreateCheckbox(dispContent, "Enable Keypress Spark",
+        "Off by default. Marks every press on the timeline and carries it back through the past, coloured for whether it landed inside the queue window or after it closed.",
+        CONFIG.pressSpark, function(v)
+        CONFIG.pressSpark = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pressSparkCheck)
+
+    local pressCastOnlyCheck = CreateCheckbox(dispContent, "Only Presses That Cast",
+        "Hides the dimmed marks for presses the game dropped, so mashing one button leaves a single line for the press that actually went out.",
+        CONFIG.pressSparkCastOnly, function(v)
+        CONFIG.pressSparkCastOnly = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pressCastOnlyCheck)
+
+    local pressSparkWidthSlider = CreateSlider(dispContent, "Keypress Spark Width", 1, 6, 1, CONFIG.pressSparkWidth, function(v)
+        CONFIG.pressSparkWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pressSparkWidthSlider)
+
+    local iconQueuedCheck = CreateCheckbox(dispContent, "Highlight Queued Icons",
+        "Tints an icon while that spell is queued as your next cast, the same as your action bars do.",
+        CONFIG.iconQueued ~= false, function(v)
+        CONFIG.iconQueued = v
+        ns.SaveCurrentProfile()
+        if ns.RefreshIcons then ns.RefreshIcons() end
+    end)
+    AddDispWidget(iconQueuedCheck)
+
+    AddDispHeader("DoT Tick Marks")
+    AddDispDescription("Notches along the top of a buff bar at each periodic tick.")
+
+    local dotTicksCheck = CreateCheckbox(dispContent, "Enable DoT Tick Marks",
+        "Off by default. Notches along the top of a buff bar at each periodic tick. Only drawn for spells with a known tick rate.",
+        CONFIG.dotTicks, function(v)
+        CONFIG.dotTicks = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(dotTicksCheck)
+
+    local dotTickWidthSlider = CreateSlider(dispContent, "DoT Tick Width", 1, 6, 1, CONFIG.dotTickWidth, function(v)
+        CONFIG.dotTickWidth = v
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(dotTickWidthSlider)
 
     -- Static Height
     AddDispHeader("Static Height")
@@ -7525,8 +7601,7 @@ local function BuildSettings()
                 print("|cff00ff00[Infall]|r Could not determine character.")
                 return
             end
-            local specIndex = GetSpecialization()
-            local currentSpecID = specIndex and GetSpecializationInfo(specIndex)
+            local currentSpecID = ns.SpecIDFor(ns.SpecIndex())
             local count = 0
             for specID, profile in pairs(data.specs) do
                 local numID = tonumber(specID) or specID

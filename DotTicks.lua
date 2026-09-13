@@ -13,7 +13,7 @@ function ns.HasteMultiplier()
     local ok, obj = pcall(C_Spell.GetSpellCooldownDuration, 61304)
     if not ok or not obj or not obj.GetTotalDuration then return lastHaste end
     local tOk, total = pcall(obj.GetTotalDuration, obj)
-    if issecretvalue and issecretvalue(total) then return lastHaste end
+    if issecret(total) then return lastHaste end
     if tOk and type(total) == "number" and total > 0 then
         local mult = 1.5 / total
         if mult >= 1 and mult < 3 then lastHaste = mult end
@@ -173,7 +173,12 @@ function ns.UpdateDotTicks(row)
     local onePx = ns.OnePxForFrame(anchor)
     local shown = 0
 
-    for k = 1, MAX_MARKS do
+    -- Start at the first tick that can be inside the window. Counting from tick 1
+    -- spends the budget on ticks that already scrolled off, so a long fast DoT drew
+    -- nothing. floor+1, not ceil: a tick landing exactly on the edge is excluded.
+    local firstK = math.floor((now - CONFIG.past - startT) / period) + 1
+    if firstK < 1 then firstK = 1 end
+    for k = firstK, firstK + MAX_MARKS - 1 do
         local at = startT + k * period
         if at > endT + 0.01 then break end
         local offset = at - now

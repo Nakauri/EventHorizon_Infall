@@ -21,9 +21,9 @@ function ns.ExportProfile(profile)
     export._version = 2
     local name = UnitName("player") or "Unknown"
     local specName = ""
-    local specIndex = GetSpecialization()
+    local specIndex = ns.SpecIndex()
     if specIndex then
-        local _, sName = GetSpecializationInfo(specIndex)
+        local _, sName = ns.SpecInfo(specIndex)
         specName = sName or ""
     end
     export._source = name .. " (" .. specName .. ")"

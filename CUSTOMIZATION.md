@@ -93,7 +93,7 @@ These flip a feature on or off each time you run them. Changes are saved to your
 
 ### Value Commands
 
-These take a number or value after the command. Running them without a value shows the current setting. Layout changes from slash commands last until reload. To make them permanent, either use the Settings GUI (which saves everything to your profile automatically) or add the CONFIG line to Core.lua as each command tells you.
+These take a number or value after the command. Running them without a value shows the current setting. Layout changes from slash commands are saved to your profile as soon as you set them, the same as changing them in the Settings GUI. The exception is `/infall hide`, which takes effect at once but is only written to your profile the next time anything else saves.
 
 | Command | What It Does |
 |---|---|

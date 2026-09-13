@@ -637,7 +637,7 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
             if ns.RefreshIcons then ns.RefreshIcons() end
             if ns.SaveCurrentProfile then ns.SaveCurrentProfile() end
         end)
-    enableCB:SetPoint("TOPLEFT", 8, -34)
+    enableCB:SetPoint("TOPLEFT", instrText, "BOTTOMLEFT", -4, -6)
 
     local sideButtons = {}
 
@@ -659,8 +659,24 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
     end)
 
     local sideLabel = instrBlock:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    sideLabel:SetPoint("TOPLEFT", 12, -68)
+    sideLabel:SetPoint("TOPLEFT", enableCB, "BOTTOMLEFT", 4, -2)
     sideLabel:SetText("Active strip:")
+
+    -- Height follows the content. Text measures in PIXELS, so UI scale and resolution
+    -- move the wrap point and a fixed height ran the sentence into the checkbox.
+    local lastIW, lastIH
+    local function LayoutIconsInstr()
+        local w = math.floor((instrBlock:GetWidth() or 0) + 0.5)
+        local th = math.ceil(instrText:GetStringHeight() or 0)
+        if th <= 0 then return end
+        local want = 10 + th + 6 + (enableCB:GetHeight() or 36) + 2 + 24 + 10
+        if w == lastIW and want == lastIH then return end
+        lastIW, lastIH = w, want
+        instrBlock:SetHeight(want)
+    end
+    instrBlock:SetScript("OnSizeChanged", LayoutIconsInstr)
+    instrBlock:SetScript("OnShow", LayoutIconsInstr)
+    LayoutIconsInstr()
 
     for i, def in ipairs(ANCHORS) do
         local value = def[1]
@@ -848,7 +864,17 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         local m = CONFIG.buffMappings[cooldownID]
         if not m then m = {} CONFIG.buffMappings[cooldownID] = m end
         -- Slots fill in order, matching how the Bars tab treats its lanes.
-        m[math.min(idx, #m + 1)] = { buffCooldownIDs = { selectedBuff } }
+        -- Unit and colour are written here too, or a debuff paired from this tab
+        -- resolves on the wrong unit and draws in the buff colour.
+        local slotIndex = math.min(idx, #m + 1)
+        local bOk, bInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, selectedBuff)
+        local bSID = bOk and bInfo and (bInfo.overrideTooltipSpellID or bInfo.overrideSpellID or bInfo.spellID)
+        local isDebuff = bSID and C_Spell.IsSpellHarmful and C_Spell.IsSpellHarmful(bSID)
+        local defaultColor, pairUnit = ns.PairingDefaultColor(selectedBuff, isDebuff)
+        if slotIndex >= 2 then defaultColor[4] = 0.3 end
+        local mapping = { buffCooldownIDs = { selectedBuff }, color = defaultColor }
+        if pairUnit then mapping.unit = pairUnit end
+        m[slotIndex] = mapping
         statusText:SetText("")
         refreshAll()
         Apply()

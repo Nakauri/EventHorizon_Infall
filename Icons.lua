@@ -7,6 +7,8 @@ local CONFIG = ns.CONFIG
 local ICON = {}
 ns.Icons = ICON
 
+local QUEUED_DEFAULT = {1, 1, 1, 0.22}
+
 -- Settings
 
 local CONTAINER_DEFAULTS = {
@@ -443,6 +445,12 @@ local function GetIcon(key, index)
     ic.tex = ic:CreateTexture(nil, "ARTWORK")
     ic.tex:SetAllPoints()
 
+    -- Queued is not a state: a spell can be queued while on cooldown, ready or buffed.
+    -- Same reasoning as the glow, so it composes over whatever state is drawn.
+    ic.queued = ic:CreateTexture(nil, "OVERLAY", nil, 1)
+    ic.queued:SetAllPoints()
+    ic.queued:Hide()
+
     -- The engine draws the countdown, so the time never passes through Lua.
     ic.cd = CreateFrame("Cooldown", nil, ic, "CooldownFrameTemplate")
     ic.cd:SetAllPoints()
@@ -651,7 +659,23 @@ local function PaintIcon(ic, entry, cfg)
         end
     end
 
-    if feedID and (refeedNow or not wasShown) then
+    if info and info.equipSlot then
+        -- An equipped item has no spellID and no CDM timing; its slot carries the
+        -- cooldown, and its on-use spell's is shorter and draws ready early.
+        if refeedNow or not wasShown then
+            -- An unreadable slot is unknown, never ready. Same contract the bars keep.
+            local itemDur, readable = ns.ItemCooldownDurObj(info.equipSlot)
+            if itemDur then
+                pcall(ic.cd.SetCooldownFromDurationObject, ic.cd, itemDur, true)
+                fed = "item"
+            elseif readable then
+                ic.cd:SetCooldown(0, 0)
+                fed = "item-ready"
+            else
+                fed = "item-unknown"
+            end
+        end
+    elseif feedID and (refeedNow or not wasShown) then
         -- ignoreGCD returns the real cooldown and a zero span during a pure GCD.
         -- Per entry, falling back to the general setting.
         local ignoreGCD = entry.ignoreGCD
@@ -721,8 +745,11 @@ local function PaintIcon(ic, entry, cfg)
     end
 
     -- Exclude the global cooldown EXPLICITLY, never by asking the API to do it.
+    -- An item entry has neither id, so both tests above miss it and the icon drew
+    -- ready with a running sweep underneath. Its slot is what makes it knowable.
     local cdKnown = (spellID ~= nil and cdState[spellID] == true)
         or (spellID == nil and feedID ~= nil)
+        or (info ~= nil and info.equipSlot ~= nil)
     local spellOnCd = cdKnown and ic.cd:IsShown()
 
     -- A recharge in flight is not the same question as the spell's own cooldown running.
@@ -762,6 +789,22 @@ local function PaintIcon(ic, entry, cfg)
     local wantGlow = entry.glow
     if wantGlow == nil then wantGlow = CONFIG.iconGlow ~= false end
     SetGlow(ic, glowing and wantGlow and true or false)
+
+    -- A custom icon has no spellID, so this can never light up on one.
+    if ic.queued then
+        local q = false
+        if CONFIG.iconQueued ~= false and spellID and C_Spell and C_Spell.IsCurrentSpell then
+            local okQ, isQ = pcall(C_Spell.IsCurrentSpell, spellID)
+            q = okQ and isQ and true or false
+        end
+        if q then
+            local c = CONFIG.iconQueuedColor or QUEUED_DEFAULT
+            ic.queued:SetColorTexture(c[1], c[2], c[3], c[4] or 0.22)
+            ic.queued:Show()
+        else
+            ic.queued:Hide()
+        end
+    end
 
     -- Config data, never a secret.
     local _, tex
@@ -1142,6 +1185,7 @@ function ICON.Refresh()
     eventFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
     eventFrame:RegisterEvent("SPELL_UPDATE_CHARGES")
     eventFrame:RegisterEvent("SPELL_UPDATE_USABLE")
+    eventFrame:RegisterEvent("CURRENT_SPELL_CAST_CHANGED")
     -- Filtered to the player: unfiltered, this fires for every unit in a raid.
     eventFrame:RegisterUnitEvent("UNIT_AURA", "player")
     eventFrame:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")

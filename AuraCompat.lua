@@ -38,10 +38,23 @@ function AC.LoadDB()
     InfallDB = InfallDB or {}
     InfallDB.auraDurations = InfallDB.auraDurations or {}
     InfallDB.auraPermanent = InfallDB.auraPermanent or {}
-    InfallDB.auraPermanentUser = InfallDB.auraPermanentUser or {}
     InfallDB.auraEstimateOff = InfallDB.auraEstimateOff or {}
+    -- Rekeyed from spellID to cooldownID; the old contents cannot be matched across.
+    if InfallDB.auraEstimateUsedVer ~= 2 then
+        InfallDB.auraEstimateUsed, InfallDB.auraEstimateUsedVer = {}, 2
+    end
+    InfallDB.auraEstimateUsed = InfallDB.auraEstimateUsed or {}
     learnedDuration = InfallDB.auraDurations
     learnedPermanent = InfallDB.auraPermanent
+end
+
+-- The cooldown ENTRY a frame belongs to. One spell can hold a fed Tracked Bars
+-- entry and an unfed Essential one, so the estimate flag cannot be per spell.
+local function FrameCdID(frame)
+    if not frame then return nil end
+    local ok, cdID = pcall(function() return frame.cooldownID end)
+    if not ok then return nil end
+    return cdID
 end
 
 -- Non-secret spell id for a CDM frame.
@@ -63,19 +76,30 @@ function AC.GetConfigSpellID(frame)
     return nil
 end
 
--- True once an estimate has actually driven this spell's bar. Most bars are fed
--- by the game and their measurement is never used, so this is what separates the
--- entries worth marking in the UI from the rest.
-function AC.IsEstimateUsed(spellID)
-    return spellID ~= nil and InfallDB and InfallDB.auraEstimateUsed
-        and InfallDB.auraEstimateUsed[spellID] == true or false
+-- True while an estimate is what currently drives this ENTRY's bar. Most bars are
+-- fed by the game and their measurement is never used, so this is what separates
+-- the entries worth marking in the UI from the rest.
+function AC.IsEstimateUsed(cdID)
+    return cdID ~= nil and InfallDB and InfallDB.auraEstimateUsed
+        and InfallDB.auraEstimateUsed[cdID] == true or false
 end
 
-local function NoteEstimateUsed(spellID)
-    if spellID == nil then return end
+-- Both write only on a change: ResolveFill runs from the buff poll, not once.
+local function NoteEstimateUsed(cdID)
+    if cdID == nil then return end
     InfallDB = InfallDB or {}
     InfallDB.auraEstimateUsed = InfallDB.auraEstimateUsed or {}
-    InfallDB.auraEstimateUsed[spellID] = true
+    if InfallDB.auraEstimateUsed[cdID] ~= true then
+        InfallDB.auraEstimateUsed[cdID] = true
+    end
+end
+
+-- Real timing arriving is what retires the notice. Without this the flag latches
+-- for the life of the profile and the tooltip keeps claiming the bar is unfed.
+local function ClearEstimateUsed(cdID)
+    if cdID == nil then return end
+    local t = InfallDB and InfallDB.auraEstimateUsed
+    if t and t[cdID] ~= nil then t[cdID] = nil end
 end
 
 -- Absence means allowed, so a profile written before this existed is unchanged.
@@ -91,21 +115,26 @@ function AC.SetEstimateAllowed(spellID, allowed)
     InfallDB.auraEstimateOff[spellID] = (not allowed) and true or nil
 end
 
-function AC.IsUserPermanent(spellID)
-    return spellID ~= nil and InfallDB and InfallDB.auraPermanentUser
-        and InfallDB.auraPermanentUser[spellID] == true
-end
-
-function AC.SetUserPermanent(spellID, isPermanent)
-    if not spellID then return end
-    AC.LoadDB()
-    InfallDB.auraPermanentUser[spellID] = isPermanent and true or nil
-end
-
-function AC.IsPermanent(spellID)
+function AC.LearnedPermanent(spellID)
     if not spellID then return false end
-    if AC.IsUserPermanent(spellID) then return true end
     return learnedPermanent[spellID] == true
+end
+
+-- Drops learned aura state. It lives in SavedVariables, so a reinstall does not clear it.
+function AC.ForgetLearned()
+    AC.LoadDB()
+    local n = 0
+    for k in pairs(InfallDB.auraPermanent) do
+        InfallDB.auraPermanent[k] = nil
+        n = n + 1
+    end
+    for k in pairs(InfallDB.auraDurations) do
+        InfallDB.auraDurations[k] = nil
+        n = n + 1
+    end
+    learnedPermanent = InfallDB.auraPermanent
+    learnedDuration = InfallDB.auraDurations
+    return n
 end
 
 function AC.GetLearnedDuration(spellID)
@@ -117,7 +146,7 @@ end
 --   "permanent" | "learned" (detail = seconds) | "unlearned"
 function AC.GetLearnState(spellID)
     if not spellID then return "unlearned" end
-    if AC.IsPermanent(spellID) then return "permanent" end
+    if AC.LearnedPermanent(spellID) then return "permanent" end
     local dur = learnedDuration[spellID]
     if dur then return "learned", dur end
     return "unlearned"
@@ -141,6 +170,15 @@ function AC.GetLearnStateForCooldown(cdID)
     return "unlearned", nil, ids[1]
 end
 
+-- The one duration rule for permanence. A positive duration is tested first so a
+-- transitional read cannot be mistaken for a no-expiry aura. Returns nil when unreadable.
+local function PermanentFromDuration(dur)
+    if type(dur) ~= "number" then return nil end
+    if dur > 0 then return false end
+    if dur == 0 then return true end
+    return nil
+end
+
 -- Caches duration and permanence. No-op while auras are restricted.
 function AC.Learn(frame)
     if AC.AurasRestricted() then return end
@@ -151,15 +189,15 @@ function AC.Learn(frame)
     if not ok or not ad then return end
 
     local okD, dur = pcall(function() return ad.duration end)
-    local okE, exp = pcall(function() return ad.expirationTime end)
     if not okD or issecret(dur) then return end
 
-    if dur == 0 or (okE and not issecret(exp) and exp == 0) then
-        learnedPermanent[spellID] = true
-        learnedDuration[spellID] = nil
-    elseif type(dur) == "number" and dur > 0 then
+    local perm = PermanentFromDuration(dur)
+    if perm == false then
         learnedPermanent[spellID] = nil
         learnedDuration[spellID] = dur
+    elseif perm == true then
+        learnedPermanent[spellID] = true
+        learnedDuration[spellID] = nil
     end
 end
 
@@ -233,7 +271,7 @@ function AC.IdentityIDsForCooldown(cdID)
     if not cdID then return nil end
 
     local cached = identityCache[cdID]
-    if cached then return cached end
+    if cached ~= nil then return cached or nil end
 
     local tierSpell = ns.TierSpellIDForCooldown and ns.TierSpellIDForCooldown(cdID)
     if tierSpell then
@@ -260,7 +298,12 @@ function AC.IdentityIDsForCooldown(cdID)
         AddDerived(set, list, C_Spell and C_Spell.GetBaseSpell, list[i])
     end
 
-    if #list == 0 then return nil end
+    -- No ids at all is an answer, not unknown. Item entries carry no spellID.
+    -- Cached as false so the two tables above are not rebuilt on every call.
+    if #list == 0 then
+        identityCache[cdID] = false
+        return nil
+    end
     identityCache[cdID] = list
     return list
 end
@@ -303,6 +346,13 @@ local fillCache = setmetatable({}, { __mode = "k" })
 -- Returns kind, payload for the first identity whose aura is live and reads
 -- non-secret. Every DurationObject setter refuses secret arguments from a
 -- tainted caller, so a secret duration is skipped, not half read.
+local function AuraInstanceOf(aura)
+    if not aura then return nil end
+    local ok, iid = pcall(function() return aura.auraInstanceID end)
+    if not ok or iid == nil or issecret(iid) then return nil end
+    return iid
+end
+
 function AC.AuraFill(frame, unit)
     local ids = AC.IdentityIDs(frame)
     if not ids then return nil end
@@ -316,7 +366,7 @@ function AC.AuraFill(frame, unit)
                 local okE, exp = pcall(function() return aura.expirationTime end)
                 if okD and okE and not issecret(dur) and not issecret(exp)
                     and type(dur) == "number" and type(exp) == "number" then
-                    if dur == 0 or exp == 0 then
+                    if AC.IsAuraPermanent(unit, AuraInstanceOf(aura), dur) then
                         fillCache[frame] = nil
                         return "permanent", nil
                     end
@@ -352,32 +402,60 @@ function AC.HasAuraBySpellID(spellID)
     return ReadAura(nil, spellID) ~= nil
 end
 
+-- true permanent, false expires, nil unknown or secret.
+local function GameSaysPermanent(unit, iid)
+    if not (C_UnitAuras and C_UnitAuras.DoesAuraHaveExpirationTime) then return nil end
+    if not unit or not iid then return nil end
+    local ok, hasExp = pcall(C_UnitAuras.DoesAuraHaveExpirationTime, unit, iid)
+    if not ok or hasExp == nil or issecret(hasExp) then return nil end
+    return hasExp == false
+end
+
+-- The single question. The game's answer wins; the duration read is the fallback for
+-- when it will not answer. Every fill path asks through here.
+function AC.IsAuraPermanent(unit, iid, dur)
+    if iid ~= nil then
+        local live = GameSaysPermanent(unit, iid)
+        if live ~= nil then return live end
+    end
+    return PermanentFromDuration(dur)
+end
+
 -- Fill resolution
 
 -- Returns kind, payload, resolvedUnit: "mirror" widget, "durobj" object, "permanent", or nil.
 
-function AC.ResolveFill(frame, unit)
-    if not frame then return nil end
-
+local function ResolveFillInner(frame, unit)
     local spellID = AC.GetConfigSpellID(frame)
 
     -- Matched across every id the entry can present, never on one field.
     local learnState, learnDur, learnKey = AC.GetLearnStateForFrame(frame)
 
-    if learnState == "permanent" then
-        return "permanent", nil
-    end
+    local restricted = AC.AurasRestricted()
+    local iOk, iid = pcall(function() return frame.auraInstanceID end)
+    -- select(2, pcall(...)) hands back the error string on failure, which then
+    -- travels as a unit token. Nil is the only honest answer.
+    local uOk, cdmUnit = pcall(function() return frame.auraDataUnit end)
+    if not uOk then cdmUnit = nil end
 
-    if not AC.AurasRestricted() then
-        local iOk, iid = pcall(function() return frame.auraInstanceID end)
-        if iOk and iid then
-            local ok, durObj = pcall(C_UnitAuras.GetAuraDuration, unit, iid)
-            if ok and durObj then return "durobj", durObj, unit end
-            local cdmUnit = select(2, pcall(function() return frame.auraDataUnit end))
-            if cdmUnit and cdmUnit ~= unit then
-                local rOk, rDur = pcall(C_UnitAuras.GetAuraDuration, cdmUnit, iid)
-                if rOk and rDur then return "durobj", rDur, cdmUnit end
-            end
+    -- The game's own answer wins. The learned flag is only the fallback for when it
+    -- cannot be read, which is auras on a restricted map.
+    local live
+    if not restricted and iOk and iid then
+        live = AC.IsAuraPermanent(unit, iid, nil)
+        if live == nil and cdmUnit and cdmUnit ~= unit then
+            live = AC.IsAuraPermanent(cdmUnit, iid, nil)
+        end
+    end
+    if live == true then return "permanent", nil end
+    if live == nil and learnState == "permanent" then return "permanent", nil end
+
+    if not restricted and iOk and iid then
+        local ok, durObj = pcall(C_UnitAuras.GetAuraDuration, unit, iid)
+        if ok and durObj then return "durobj", durObj, unit end
+        if cdmUnit and cdmUnit ~= unit then
+            local rOk, rDur = pcall(C_UnitAuras.GetAuraDuration, cdmUnit, iid)
+            if rOk and rDur then return "durobj", rDur, cdmUnit end
         end
     end
 
@@ -404,15 +482,31 @@ function AC.ResolveFill(frame, unit)
     local dur = learnDur or AC.GetLearnedDuration(spellID)
     local key = learnKey or spellID
     if dur and start then
-        NoteEstimateUsed(key)
+        -- Flagged estimated either way: switched off still means the game is not
+        -- feeding it, which is what the tooltip and the right click affordance say.
         if AC.IsEstimateAllowed(key) then
             local durObj = C_DurationUtil.CreateDuration()
             durObj:SetTimeFromStart(start, dur)
-            return "durobj", durObj
+            return "durobj", durObj, nil, true
         end
+        return nil, nil, nil, true
     end
 
     return nil
+end
+
+function AC.ResolveFill(frame, unit)
+    if not frame then return nil end
+    local kind, payload, resolved, estimated = ResolveFillInner(frame, unit)
+    -- Runs per lane per row at 30Hz, and FrameCdID builds a closure for its pcall.
+    -- Nothing to clear on an empty table, which is the normal case.
+    local used = InfallDB and InfallDB.auraEstimateUsed
+    if estimated then
+        NoteEstimateUsed(FrameCdID(frame))
+    elseif kind and used and next(used) ~= nil then
+        ClearEstimateUsed(FrameCdID(frame))
+    end
+    return kind, payload, resolved
 end
 
 -- Frame field reads
@@ -454,7 +548,7 @@ function AC.AuraFillBySpellID(spellID, unit)
         spellFillCache[spellID] = nil
         return nil
     end
-    if dur == 0 or exp == 0 then
+    if AC.IsAuraPermanent(unit, AuraInstanceOf(aura), dur) then
         spellFillCache[spellID] = nil
         return "permanent", nil
     end

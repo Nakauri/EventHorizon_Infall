@@ -1,6 +1,7 @@
 -- EventHorizon Infall: tier set bonus auras.
 
 local ns = EventHorizon_Infall
+local issecret = issecretvalue or function() return false end
 
 -- [bonusSpellID] = { spec, pieces, auras = { spellID, ... } }
 ns.TIER_SET_AURAS = {
@@ -33,17 +34,18 @@ ns.TIER_SET_AURAS = {
 ns.TIER_ID_BASE = 90000000
 
 function ns.TierCooldownIDForSpell(spellID)
+    if type(spellID) ~= "number" or issecret(spellID) then return nil end
     return ns.TIER_ID_BASE + spellID
 end
 
 function ns.TierSpellIDForCooldown(cdID)
+    if issecret(cdID) then return nil end
     if type(cdID) == "number" and cdID >= ns.TIER_ID_BASE then
         return cdID - ns.TIER_ID_BASE
     end
     return nil
 end
 
-local issecret = issecretvalue or function() return false end
 
 local TIER_SLOTS = { 1, 3, 5, 7, 10 }
 
@@ -66,9 +68,9 @@ local function Scan()
     if InCombatLockdown() then return end
     if not C_Item or not C_Item.GetSetBonusesForSpecializationByItemID then return end
 
-    local specIndex = GetSpecialization and GetSpecialization()
-    if not specIndex or not GetSpecializationInfo then return end
-    local specOk, specID = pcall(GetSpecializationInfo, specIndex)
+    local specIndex = ns.SpecIndex()
+    if not specIndex then return end
+    local specOk, specID = pcall(ns.SpecIDFor, specIndex)
     if not specOk or not specID or issecret(specID) then return end
 
     local seen = {}

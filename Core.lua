@@ -7,6 +7,47 @@ local ns = EventHorizon_Infall
 
 ns.ADDON_NAME = ADDON_NAME
 
+-- 12.1 moved both of these under C_SpecializationInfo. Blizzard's own UI calls the
+-- bare globals zero times; every spec read in this addon goes through here.
+function ns.SpecIndex()
+    if C_SpecializationInfo and C_SpecializationInfo.GetSpecialization then
+        return C_SpecializationInfo.GetSpecialization()
+    end
+    return GetSpecialization and GetSpecialization()
+end
+
+-- Full return list, matching Blizzard's. SpecIDFor is the id only.
+function ns.SpecInfo(index)
+    if not index then return nil end
+    if C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfo then
+        return C_SpecializationInfo.GetSpecializationInfo(index)
+    end
+    if GetSpecializationInfo then return GetSpecializationInfo(index) end
+    return nil
+end
+
+function ns.SpecIDFor(index)
+    return (ns.SpecInfo(index))
+end
+
+-- The CDM carries no timing for an equipped item, only its slot, so the cooldown
+-- comes from the slot. Returns durObj, readable; nil+true means genuinely ready.
+function ns.ItemCooldownDurObj(equipSlot)
+    if not equipSlot or not C_DurationUtil or not GetInventoryItemCooldown then
+        return nil, false
+    end
+    local ok, start, dur, enable = pcall(GetInventoryItemCooldown, "player", equipSlot)
+    if not ok or start == nil or dur == nil then return nil, false end
+    if issecretvalue and (issecretvalue(start) or issecretvalue(dur)) then
+        return nil, false
+    end
+    -- 1.5 filters the GCD sized cooldown the slot reports right after any use.
+    if enable ~= 1 or dur <= 1.5 or start <= 0 then return nil, true end
+    local d = C_DurationUtil.CreateDuration()
+    d:SetTimeFromStart(start, dur)
+    return d, true
+end
+
 ns.CONFIG = {
     width = 352,
     height = 20,  -- SINGLE ROW HEIGHT CONTROL
@@ -40,7 +81,11 @@ ns.CONFIG = {
 
     pressSpark = false,
     pressSparkWidth = 2,
-    pressSparkColor = {0.4, 0.7, 1, 0.9},
+    pressSparkColor = {0.34, 1, 0.35, 0.65},
+    pressLateColor = {1, 0.35, 0.35, 0.9},
+    pressSparkCastOnly = false,
+    iconQueued = true,
+    iconQueuedColor = {1, 1, 1, 0.22},
 
     -- Notches on a buff bar at each of its periodic ticks. Off by default.
     dotTicks = false,

@@ -1,12 +1,15 @@
 -- EventHorizon Infall: charge past columns.
 
 -- A column per past moment, each fed the charge count from that moment.
--- See docs/past-bar-audit.md and docs/charge-past-bar-port-plan.md.
+-- READ docs/charge-past-delay-line.md before editing this file.
 
 local ns = EventHorizon_Infall
 local CONFIG = ns.CONFIG
 
-local COLS = 50           -- target columns across the whole past window
+-- Device pixels per column, held CONSTANT so a longer past window looks identical
+-- instead of stair stepping. A fixed column COUNT made colW grow with the window.
+local COL_PX = 2
+local MAX_COLS = 220
 local RING = 600
 local TEX = "Interface\\AddOns\\EventHorizon_Infall\\Smooth"
 
@@ -17,10 +20,14 @@ local function Geometry()
     if nowPx <= 0 then return 0, 0, 0 end
     local onePx = ns.OnePxForFrame and ns.OnePxForFrame(ns.EH_Parent) or 1
     if onePx <= 0 then onePx = 1 end
-    local colW = math.floor((nowPx / COLS) / onePx + 0.5) * onePx
-    if colW < onePx then colW = onePx end
-    -- One spare column so the sub pixel scroll never uncovers the left edge.
+    local colW = COL_PX * onePx
     local cols = math.ceil(nowPx / colW) + 1
+    if cols > MAX_COLS then
+        colW = math.floor((nowPx / MAX_COLS) / onePx + 0.5) * onePx
+        if colW < onePx then colW = onePx end
+    end
+    -- One spare column so the sub pixel scroll never uncovers the left edge.
+    cols = math.ceil(nowPx / colW) + 1
     return colW, cols, (CONFIG.past or 2.5) / (nowPx / colW)
 end
 
@@ -124,6 +131,8 @@ function ns.ChargePast_Build(row, maxC, laneH)
             col.ind:ClearAllPoints()
             col.ind:SetPoint("TOPRIGHT", track, "TOPRIGHT", -(i - 1) * colW, 0)
             col.ind:SetMinMaxValues(lo, hi)
+            -- hi draws BLANK here: the fill is clipped between the bar texture's top
+            -- and the lane top, and the bar's own texture is alpha zero.
             col.ind:SetValue(hi)
             col.wrap:ClearAllPoints()
             col.wrap:SetPoint("TOPRIGHT", col.ind, "TOPRIGHT")
