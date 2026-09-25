@@ -260,10 +260,25 @@ function ns.OpenCustomBuffMenu(anchor, cooldownID, slotIndex, onApplied)
     local function setTimer(prefill)
         PromptSeconds({ cooldownID = cooldownID, slotIndex = slotIndex }, prefill)
     end
+    -- The slot's source is the ability's own activation glow; no timer, no aura.
+    local function setGlow()
+        CONFIG.buffMappings = CONFIG.buffMappings or {}
+        local mapList = CONFIG.buffMappings[cooldownID] or {}
+        local idx = math.min(slotIndex or 1, #mapList + 1)
+        local prev = mapList[idx]
+        local colour = (prev and prev.color) or DeepCopy(CONFIG.buffColor)
+        if idx >= 2 and not (prev and prev.color) then colour[4] = 0.3 end
+        mapList[idx] = { glowSource = true, color = colour }
+        CONFIG.buffMappings[cooldownID] = mapList
+        SetPairingCleared(cooldownID, false)
+        ns.SaveCurrentProfile()
+        if customBuffApplied then customBuffApplied() end
+    end
 
     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
     local existing = m and m[slotIndex]
     local isCustom = existing and existing.customDuration ~= nil
+    local isGlow = existing and existing.glowSource == true
 
     if MenuUtil and MenuUtil.CreateContextMenu then
         MenuUtil.CreateContextMenu(anchor, function(_, root)
@@ -275,8 +290,20 @@ function ns.OpenCustomBuffMenu(anchor, cooldownID, slotIndex, onApplied)
                 root:CreateButton("Remove", function()
                     ns.RemoveCustomBuff(cooldownID, slotIndex)
                 end)
+            elseif isGlow then
+                root:CreateButton("Remove", function()
+                    ns.RemoveCustomBuff(cooldownID, slotIndex)
+                end)
             else
                 root:CreateButton("Custom timer...", function() setTimer() end)
+                local glowBtn = root:CreateButton("While glowing", setGlow)
+                if glowBtn and glowBtn.SetTooltip then
+                    glowBtn:SetTooltip(function(tooltip)
+                        GameTooltip_SetTitle(tooltip, "While glowing")
+                        GameTooltip_AddNormalLine(tooltip,
+                            "Full bar while this ability's glow is up, gone when it ends.")
+                    end)
+                end
             end
         end)
     else
@@ -526,7 +553,7 @@ ns.PairingDefaultColor = PairingDefaultColor
 -- filled custom timer answer empty, which blocks the slot after it.
 function ns.BuffSlotFilled(entry)
     if not entry then return false end
-    if entry.customDuration then return true end
+    if entry.customDuration or entry.glowSource then return true end
     return (entry.buffCooldownIDs and #entry.buffCooldownIDs > 0) or false
 end
 
@@ -3689,7 +3716,7 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.4.2")
+    versionText:SetText("v1.4.3")
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
@@ -4133,8 +4160,8 @@ local function BuildSettings()
             -- A custom entry has no buffCooldownIDs to look art up from, so it
             -- carries its own. Without this branch the slot rendered empty and
             -- there was no colour control, which read as nothing having been set.
-            if m and m.customDuration then
-                slot.icon:SetTexture(136243)
+            if m and (m.customDuration or m.glowSource) then
+                slot.icon:SetTexture(m.glowSource and CooldownIcon(cooldownID, nil) or 136243)
                 slot.icon:Show()
                 slot.pairedCooldownID = nil
                 slot.customEntry = m
@@ -4142,7 +4169,7 @@ local function BuildSettings()
                 local cc = m.color or (m.unit == "target" and CONFIG.debuffColor) or CONFIG.buffColor
                 colorBtn.tex:SetColorTexture(cc[1], cc[2], cc[3], cc[4] or 1)
                 colorBtn:Show()
-                colorBtn.procDot:SetShown(false)
+                colorBtn.procDot:SetShown(m.glowSource == true)
                 return
             end
             if not (m and m.buffCooldownIDs and m.buffCooldownIDs[1]) then return end
@@ -4201,6 +4228,15 @@ local function BuildSettings()
         local function buffSlotTooltip(self, slotName)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             local ce = self.customEntry
+            if ce and ce.glowSource then
+                GameTooltip:SetText(slotName .. ": while glowing", 1, 1, 1)
+                GameTooltip:AddLine("Full bar while this ability's glow is up, gone when it ends.",
+                    0.7, 0.7, 0.7, true)
+                GameTooltip:AddLine("Right click: remove", 0.5, 0.8, 0.5)
+                GameTooltip:Show()
+                ns.HideSpellTooltip()
+                return
+            end
             if ce then
                 GameTooltip:SetText(slotName .. ": custom timer", 1, 1, 1)
                 GameTooltip:AddLine(ce.customDuration
@@ -4226,7 +4262,7 @@ local function BuildSettings()
                     GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                 else
                     GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
-                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
+                    GameTooltip:AddLine("Or right click for a custom timer or a glow bar", 0.5, 0.8, 0.5)
                 end
             end
             GameTooltip:Show()
@@ -4318,14 +4354,16 @@ local function BuildSettings()
                 if m and m[slotIndex] and m[slotIndex].requireGlow then
                     GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                 end
-                GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                if not (m and m[slotIndex] and m[slotIndex].glowSource) then
+                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                end
                 GameTooltip:Show()
             end)
             colorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
             colorBtn:SetScript("OnClick", function(self, button)
                 local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                 if button == "RightButton" then
-                    if m and m[slotIndex] then
+                    if m and m[slotIndex] and not m[slotIndex].glowSource then
                         m[slotIndex].requireGlow = not m[slotIndex].requireGlow
                         self.procDot:SetShown(m[slotIndex].requireGlow == true)
                         ns.SaveCurrentProfile()
@@ -4843,8 +4881,8 @@ local function BuildSettings()
                     else
                         if self.customEntry then
                             local ce = self.customEntry
-                            GameTooltip:SetText("Buff 1: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
-                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:SetText(ce.glowSource and "Buff 1: while glowing" or ("Buff 1: custom timer (" .. ce.customDuration .. "s)"), 1, 1, 1)
+                            GameTooltip:AddLine(ce.glowSource and "Right click: remove" or "Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
                             ns.HideSpellTooltip()
                             return
@@ -4854,7 +4892,7 @@ local function BuildSettings()
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
-                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
+                    GameTooltip:AddLine("Or right click for a custom timer or a glow bar", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4879,8 +4917,8 @@ local function BuildSettings()
                     else
                         if self.customEntry then
                             local ce = self.customEntry
-                            GameTooltip:SetText("Buff 2: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
-                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:SetText(ce.glowSource and "Buff 2: while glowing" or ("Buff 2: custom timer (" .. ce.customDuration .. "s)"), 1, 1, 1)
+                            GameTooltip:AddLine(ce.glowSource and "Right click: remove" or "Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
                             ns.HideSpellTooltip()
                             return
@@ -4890,7 +4928,7 @@ local function BuildSettings()
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
-                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
+                    GameTooltip:AddLine("Or right click for a custom timer or a glow bar", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4915,8 +4953,8 @@ local function BuildSettings()
                     else
                         if self.customEntry then
                             local ce = self.customEntry
-                            GameTooltip:SetText("Buff 3: custom timer (" .. ce.customDuration .. "s)", 1, 1, 1)
-                            GameTooltip:AddLine("Right click: change or remove", 0.5, 0.8, 0.5)
+                            GameTooltip:SetText(ce.glowSource and "Buff 3: while glowing" or ("Buff 3: custom timer (" .. ce.customDuration .. "s)"), 1, 1, 1)
+                            GameTooltip:AddLine(ce.glowSource and "Right click: remove" or "Right click: change or remove", 0.5, 0.8, 0.5)
                             GameTooltip:Show()
                             ns.HideSpellTooltip()
                             return
@@ -4926,7 +4964,7 @@ local function BuildSettings()
                             GameTooltip:AddLine("Click to pair selected buff here", 0.5, 1, 0.5)
                         else
                             GameTooltip:AddLine("Select a buff from the Buffs pool first", 0.7, 0.7, 0.7)
-                    GameTooltip:AddLine("Or right click for a custom buff", 0.5, 0.8, 0.5)
+                    GameTooltip:AddLine("Or right click for a custom timer or a glow bar", 0.5, 0.8, 0.5)
                         end
                     end
                     GameTooltip:Show()
@@ -4951,8 +4989,8 @@ local function BuildSettings()
                 -- Custom entries carry their own art and have no buffCooldownIDs
                 -- to resolve it from, so they are drawn before the paired paths.
                 local function ApplyCustomSlot(slot, colorBtn, m)
-                    if not (m and m.customDuration) then return false end
-                    slot.icon:SetTexture(136243)
+                    if not (m and (m.customDuration or m.glowSource)) then return false end
+                    slot.icon:SetTexture(m.glowSource and CooldownIcon(cooldownID, nil) or 136243)
                     slot.icon:Show()
                     slot.pairedCooldownID = nil
                     slot.customEntry = m
@@ -4961,7 +4999,7 @@ local function BuildSettings()
                         or CONFIG.buffColor
                     colorBtn.tex:SetColorTexture(cc[1], cc[2], cc[3], cc[4] or 1)
                     colorBtn:Show()
-                    colorBtn.procDot:SetShown(false)
+                    colorBtn.procDot:SetShown(m.glowSource == true)
                     return true
                 end
                 if mappings then
@@ -5128,14 +5166,16 @@ local function BuildSettings()
                     if m and m[1] and m[1].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    if not (m and m[1] and m[1].glowSource) then
+                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    end
                     GameTooltip:Show()
                 end)
                 buff1ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff1ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[1] then
+                        if m and m[1] and not m[1].glowSource then
                             m[1].requireGlow = not m[1].requireGlow
                             self.procDot:SetShown(m[1].requireGlow == true)
                             ns.SaveCurrentProfile()
@@ -5163,14 +5203,16 @@ local function BuildSettings()
                     if m and m[2] and m[2].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    if not (m and m[2] and m[2].glowSource) then
+                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    end
                     GameTooltip:Show()
                 end)
                 buff2ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff2ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[2] then
+                        if m and m[2] and not m[2].glowSource then
                             m[2].requireGlow = not m[2].requireGlow
                             self.procDot:SetShown(m[2].requireGlow == true)
                             ns.SaveCurrentProfile()
@@ -5199,14 +5241,16 @@ local function BuildSettings()
                     if m and m[3] and m[3].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    if not (m and m[3] and m[3].glowSource) then
+                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
+                    end
                     GameTooltip:Show()
                 end)
                 buff3ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff3ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[3] then
+                        if m and m[3] and not m[3].glowSource then
                             m[3].requireGlow = not m[3].requireGlow
                             self.procDot:SetShown(m[3].requireGlow == true)
                             ns.SaveCurrentProfile()
@@ -6886,12 +6930,9 @@ local function BuildSettings()
     end
 
     local forceAlwaysCheck = CreateCheckbox(togContent, "Force Always Visible",
-        "Infall requires CDM viewers set to Always so buff and cooldown frames stay populated. Disable only if another addon manages CDM visibility.",
+        "Infall requires CDM viewers set to Always so buff and cooldown frames stay populated. Disable only if another addon manages CDM visibility. Takes effect after a reload.",
         CONFIG.forceViewersAlways ~= false, function(v)
             CONFIG.forceViewersAlways = v
-            if v and not InCombatLockdown() then
-                if ns.ForceViewersAlways then ns.ForceViewersAlways() end
-            end
             ns.SaveCurrentProfile()
             RefreshCDMStatus()
         end)

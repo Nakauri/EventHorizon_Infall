@@ -640,10 +640,7 @@ local function PaintIcon(ic, entry, cfg)
     local chargeActive = hasCharges and chargeState[spellID] == true
 
     -- Feed the cooldown first: the state test reads this frame's IsShown().
-    -- `fed` is instrumentation: it separates "the API said no cooldown" from "the
-    -- API did not answer", which this branch currently treats identically.
-    local fed = "skip"
-    -- INSTRUMENTATION: captured before the feed, because the feed is what changes it.
+    -- Captured before the feed changes it.
     local wasShown = ic.cd:IsShown()
     -- One reading for the whole paint: the throttle and both holds must agree on
     -- when "now" is, and three separate GetTime calls invite an off by a frame bug.
@@ -667,12 +664,8 @@ local function PaintIcon(ic, entry, cfg)
             local itemDur, readable = ns.ItemCooldownDurObj(info.equipSlot)
             if itemDur then
                 pcall(ic.cd.SetCooldownFromDurationObject, ic.cd, itemDur, true)
-                fed = "item"
             elseif readable then
                 ic.cd:SetCooldown(0, 0)
-                fed = "item-ready"
-            else
-                fed = "item-unknown"
             end
         end
     elseif feedID and (refeedNow or not wasShown) then
@@ -688,12 +681,9 @@ local function PaintIcon(ic, entry, cfg)
             local okD, d = pcall(C_Spell.GetSpellChargeDuration, feedID)
             if okD then durObj = d end
         end
-        if durObj then
-            fed = "charge"
-        else
+        if not durObj then
             local ok, d = pcall(C_Spell.GetSpellCooldownDuration, feedID, ignoreGCD)
             if ok then durObj = d end
-            fed = ok and (d and "cd" or "cd-nil") or "cd-err"
         end
 
         if durObj then
@@ -702,7 +692,6 @@ local function PaintIcon(ic, entry, cfg)
             ic.cd:SetCooldown(0, 0)
         end
     elseif not feedID then
-        fed = "nospell"
         ic.cd:SetCooldown(0, 0)
     end
 

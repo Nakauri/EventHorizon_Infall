@@ -38,11 +38,12 @@ function ns.ItemCooldownDurObj(equipSlot)
     end
     local ok, start, dur, enable = pcall(GetInventoryItemCooldown, "player", equipSlot)
     if not ok or start == nil or dur == nil then return nil, false end
-    if issecretvalue and (issecretvalue(start) or issecretvalue(dur)) then
+    if issecretvalue and (issecretvalue(start) or issecretvalue(dur) or issecretvalue(enable)) then
         return nil, false
     end
     -- 1.5 filters the GCD sized cooldown the slot reports right after any use.
-    if enable ~= 1 or dur <= 1.5 or start <= 0 then return nil, true end
+    -- enable arrives as 1/0 or true/false.
+    if not enable or enable == 0 or dur <= 1.5 or start <= 0 then return nil, true end
     local d = C_DurationUtil.CreateDuration()
     d:SetTimeFromStart(start, dur)
     return d, true

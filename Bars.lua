@@ -32,6 +32,7 @@ local deferredGen = {}
 local specChangeToken = 0
 local specChangePending = false
 local K = {
+    NO_MAPPING = {},
     SLIDE_KEYS = {"activeCdSlide", "activeBuffSlide", "activeOverlaySlide", "activeThirdSlide", "activeDepletedSlide", "activeChargeSlide"},
     PTR_KEYS = {"lastPtr_cd", "lastPtr_charge", "lastPtr_buff", "lastPtr_overlay", "lastPtr_third"},
     HIDDEN_KEYS = {"hidden_cd", "hidden_charge", "hidden_buff", "hidden_overlay", "hidden_third"},
@@ -186,9 +187,21 @@ local function GetChargesWithOverride(spellID, baseSpellID)
     return info
 end
 
+-- Lane count as ConfigureBarForSpell derives it: 1 = no charges, nil = unreadable.
+function EHF.EffectiveMaxCharges(spellID, baseSpellID)
+    local info = GetChargesWithOverride(spellID, baseSpellID)
+    if not info or not info.maxCharges then return 1 end
+    if issecretvalue(info.maxCharges) then return nil end
+    local override = CONFIG.chargeOverflow and CONFIG.chargeOverflow[baseSpellID]
+    local m = (override and override.base) or info.maxCharges
+    if override and override.trueMax and m > override.trueMax then m = override.trueMax end
+    return m
+end
+
+-- Updates entries in place; a secret read keeps the learned duration.
 local function PreCacheChargeSpells()
-    InfallDB.chargeSpells = {}
-    InfallDB.chargeDurations = {}
+    InfallDB.chargeSpells = InfallDB.chargeSpells or {}
+    InfallDB.chargeDurations = InfallDB.chargeDurations or {}
 
     local cooldownIDs = {}
     local success, result = pcall(function()
@@ -203,16 +216,12 @@ local function PreCacheChargeSpells()
             local ovOk, ovID = pcall(C_Spell.GetOverrideSpell, spellID)
             local resolvedID = (ovOk and ovID and ovID ~= spellID) and ovID or spellID
             local chargeInfo = GetChargesWithOverride(resolvedID, spellID)
+            local m = EHF.EffectiveMaxCharges(resolvedID, spellID)
+            if m then
+                InfallDB.chargeSpells[cooldownID] = (m > 1)
+                    and { hasChargeMechanic = true, maxCharges = m } or nil
+            end
             if chargeInfo and chargeInfo.maxCharges then
-                local override = CONFIG.chargeOverflow and CONFIG.chargeOverflow[spellID]
-                local cachedMax = chargeInfo.maxCharges
-                if override and override.trueMax and cachedMax > override.trueMax then
-                    cachedMax = override.trueMax
-                end
-                InfallDB.chargeSpells[cooldownID] = {
-                    hasChargeMechanic = true,
-                    maxCharges = cachedMax
-                }
                 pcall(function()
                     if chargeInfo.cooldownDuration and chargeInfo.cooldownDuration > 0 then
                         InfallDB.chargeDurations[cooldownID] = chargeInfo.cooldownDuration
@@ -1261,6 +1270,7 @@ local function UpdateAllMinMax()
         if row.buffBarOverlay then row.buffBarOverlay:SetMinMaxValues(0, CONFIG.future) end
         if row.buffBarThird then row.buffBarThird:SetMinMaxValues(0, CONFIG.future) end
         if row.gcdBar then row.gcdBar:SetMinMaxValues(0, CONFIG.future) end
+        if row.depletedCdBar then row.depletedCdBar:SetMinMaxValues(0, CONFIG.future) end
     end
 end
 ns.UpdateAllMinMax = UpdateAllMinMax
@@ -1396,21 +1406,6 @@ local function FeedHiddenCooldown(rowRef, timerType, durObj, clearIfZero)
     if timerType == "cd" then FeedCdText(rowRef, durObj) end
 end
 
--- Raw write that also updates the pointer cache. FeedHiddenCooldown early-returns
--- on a matching pointer, so a stale cache makes the next clear a no-op.
-local function FeedHiddenCooldownRaw(rowRef, timerType, durObj)
-    local keys = hiddenKeys[timerType]
-    if not keys then return end
-    local cd = rowRef[keys.frame]
-    if not cd then return end
-    if durObj then
-        pcall(cd.SetCooldownFromDurationObject, cd, durObj)
-    else
-        cd:SetCooldown(0, 0)
-    end
-    rowRef[keys.ptr] = durObj
-end
-
 function EHF.ArmPotionWindow(row, windowSeconds)
     if not row or not row.buffBar then return end
     local window = windowSeconds or K.POTION_BUFF_DURATION
@@ -1436,7 +1431,9 @@ local function FeedChargeIndicators(row, chargeInfo)
     local cc = chargeInfo.currentCharges
     if ns.ChargePast_Push then ns.ChargePast_Push(row, cc) end
     row.depletedIndicator:SetValue(cc)
-    if row.ndHelperSpacer then row.ndHelperSpacer:SetValue(cc) end
+    if row.ndHelperSpacer and row.maxCharges and row.maxCharges > 2 then
+        row.ndHelperSpacer:SetValue(cc)
+    end
     if row.middleClipIndicators then
         for _, ind in pairs(row.middleClipIndicators) do ind:SetValue(cc) end
     end
@@ -1838,6 +1835,10 @@ function EHF.ResizeContainer()
             if row.depletedWrapper then
                 local futW = GetFutureWidth()
                 local nowOff = EHF.GetBarOffset() + GetNowPixelOffset()
+                local slotPx = row.chargeDurationConstant
+                    and math.max(1, (row.chargeDurationConstant / CONFIG.future) * futW) or 0
+                row._chargeSlotPx = slotPx
+                local chargeW = slotPx > 0 and slotPx or futW
 
                 -- Re-anchor, not just resize: these were positioned once at
                 -- configure time and stayed put when the bar offset moved.
@@ -1853,32 +1854,29 @@ function EHF.ResizeContainer()
                 row.notDepletedWrapper:ClearAllPoints()
                 row.notDepletedWrapper:SetPoint("TOPLEFT", row.depletedIndicator:GetStatusBarTexture(), "TOPLEFT")
                 row.notDepletedWrapper:SetPoint("BOTTOMRIGHT", row, "TOPLEFT", nowOff + futW, -rowHeight)
-                row.depletedCdBar:SetHeight(lH)
-                row.depletedHelperBar:SetHeight(lH)
+                row.depletedCdBar:SetSize(futW, lH)
+                row.depletedHelperBar:SetSize(math.max(1, (maxC - 1) * slotPx), lH)
                 row.depletedHelperBar:ClearAllPoints()
                 row.depletedHelperBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", 0, bottomY)
-                row.depletedChargeBar:SetHeight(lH)
+                row.depletedChargeBar:SetSize(chargeW, lH)
                 row.depletedChargeBar:ClearAllPoints()
-                local slotPx = row._chargeSlotPx or 0
                 row.depletedChargeBar:SetPoint("TOPLEFT", row.depletedWrapper, "TOPLEFT", (maxC - 1) * slotPx, bottomY)
-                row.normalChargeBar:SetHeight(lH)
+                row.normalChargeBar:SetSize(chargeW, lH)
                 row.normalChargeBar:ClearAllPoints()
-                if row.ndHelperSpacer then
+                -- Spacer anchoring for 3+ charge rows only.
+                local useSpacer = maxC > 2 and row.ndHelperSpacer
+                if useSpacer then
                     row.ndHelperSpacer:SetSize(math.max(1, (maxC - 1) * slotPx), lH)
                     row.ndHelperSpacer:ClearAllPoints()
                     row.ndHelperSpacer:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
                     row.normalChargeBar:SetPoint("TOPLEFT", row.ndHelperSpacer:GetStatusBarTexture(), "TOPLEFT")
+                    if row.notDepletedHelperBar then
+                        row.notDepletedHelperBar:ClearAllPoints()
+                        row.notDepletedHelperBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
+                        row.notDepletedHelperBar:SetPoint("BOTTOMRIGHT", row.ndHelperSpacer:GetStatusBarTexture(), "BOTTOMLEFT")
+                    end
                 else
                     row.normalChargeBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
-                end
-                if row.notDepletedHelperBar then
-                    row.notDepletedHelperBar:ClearAllPoints()
-                    row.notDepletedHelperBar:SetPoint("TOPLEFT", row.notDepletedWrapper, "TOPLEFT", 0, bottomY)
-                    if row.ndHelperSpacer then
-                        row.notDepletedHelperBar:SetPoint("BOTTOMRIGHT", row.ndHelperSpacer:GetStatusBarTexture(), "BOTTOMLEFT")
-                    else
-                        row.notDepletedHelperBar:SetHeight(lH)
-                    end
                 end
             end
             if row.middleLanes and row.maxCharges and row.maxCharges > 2 then
@@ -1886,9 +1884,19 @@ function EHF.ResizeContainer()
                     ns.ChargePast_Build(row, row.maxCharges, lH)
                 end
                 local slotPx = row._chargeSlotPx or 0
+                local mNow = EHF.GetBarOffset() + GetNowPixelOffset()
                 for j = 1, row.maxCharges - 2 do
-                    if row.middleClipIndicators and row.middleClipIndicators[j] then
-                        row.middleClipIndicators[j]:SetSize(GetFutureWidth(), rowHeight)
+                    local ci = row.middleClipIndicators and row.middleClipIndicators[j]
+                    if ci then
+                        ci:SetSize(GetFutureWidth(), rowHeight)
+                        ci:ClearAllPoints()
+                        ci:SetPoint("TOPLEFT", row, "TOPLEFT", mNow, 0)
+                        local cw = row.middleClipWrappers and row.middleClipWrappers[j]
+                        if cw then
+                            cw:ClearAllPoints()
+                            cw:SetPoint("TOPLEFT", row, "TOPLEFT", mNow, 0)
+                            cw:SetPoint("BOTTOMRIGHT", ci:GetStatusBarTexture(), "TOPRIGHT")
+                        end
                     end
                     local ml = row.middleLanes[j]
                     if ml then
@@ -1901,7 +1909,7 @@ function EHF.ResizeContainer()
                             ml.helperSpacer:ClearAllPoints()
                             ml.helperSpacer:SetPoint("TOPLEFT", row.middleClipWrappers[j], "TOPLEFT", 0, laneY)
                         end
-                        ml.depletedChargeBar:SetHeight(lH)
+                        ml.depletedChargeBar:SetSize(slotPx > 0 and slotPx or GetFutureWidth(), lH)
                         ml.depletedChargeBar:ClearAllPoints()
                         if ml.helperSpacer then
                             ml.depletedChargeBar:SetPoint("TOPLEFT", ml.helperSpacer:GetStatusBarTexture(), "TOPLEFT")
@@ -2069,24 +2077,12 @@ local function ScanViewer(viewerName)
     local viewer = _G[viewerName]
     if not viewer then return nil end
     
-    -- Prefer pool enumeration
     if viewer.itemFramePool then
         local ok, iter, pool, first = pcall(viewer.itemFramePool.EnumerateActive, viewer.itemFramePool)
         if ok and iter then
             return iter, pool, first
         end
     end
-    
-    -- Fallback to GetChildren()
-    local success, children = pcall(function() return {viewer:GetChildren()} end)
-    if success and children then
-        local i = 0
-        return function()
-            i = i + 1
-            return children[i]
-        end
-    end
-    
     return nil
 end
 
@@ -2121,6 +2117,16 @@ local buffPromoteNext = {}
 local function ResolveBuffFrame(cdID)
     if not cdID then return nil end
     local frame = persistentBuffMap[cdID]
+    -- A holder of another id is dropped and re resolved.
+    if frame then
+        local ok, held = pcall(extractCooldownID, frame)
+        if not ok or held ~= cdID then
+            persistentBuffMap[cdID] = nil
+            persistentBuffFallback[cdID] = true
+            buffPromoteNext[cdID] = nil
+            frame = nil
+        end
+    end
     if frame and not persistentBuffFallback[cdID] then return frame end
     -- Stand-ins only; walking every id returns pool iteration to the combat path.
     if not persistentBuffFallback[cdID] then return frame end
@@ -2153,10 +2159,35 @@ local function ResolveBuffFrame(cdID)
     return frame
 end
 
+-- Field read for pcall without a closure.
+function EHF.Field(t, k) return t[k] end
+
 local function IsBuffViewerFrame(frame)
-    local ok, viewer = pcall(function() return frame.viewerFrame end)
+    local ok, viewer = pcall(EHF.Field, frame, "viewerFrame")
     if not ok or not viewer then return false end
     return viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"]
+end
+
+-- Liveness of a viewer frame. A bar frame answers with isActive; a secret read is
+-- unknown and falls back to the aura test every frame can answer.
+function EHF.FrameLive(frame)
+    local okB, bar = pcall(EHF.Field, frame, "Bar")
+    local isBuff = IsBuffViewerFrame(frame)
+    if (okB and bar) or isBuff then
+        local okA, active = pcall(EHF.Field, frame, "isActive")
+        if okA and not issecretvalue(active) then return active == true end
+    end
+    local okI, iid = pcall(EHF.Field, frame, "auraInstanceID")
+    if okI and iid ~= nil then return true end
+    if isBuff then return false end
+    -- Cooldown tile totem: a readable slot, and not past a readable expiry.
+    local okT, td = pcall(EHF.Field, frame, "totemData")
+    if not okT or td == nil or issecretvalue(td) then return false end
+    local okS, slot = pcall(EHF.Field, td, "slot")
+    if not okS or slot == nil or issecretvalue(slot) then return false end
+    local okE, exp = pcall(EHF.Field, td, "expirationTime")
+    if okE and exp ~= nil and not issecretvalue(exp) and exp <= GetTime() then return false end
+    return true
 end
 
 -- Consumers only index this map, so a proxy upgrades stand-ins on read.
@@ -2173,21 +2204,8 @@ ns.GetPersistentCooldownFrame = function(cdID)
     return persistentCooldownMap[cdID]
 end
 local viewerScanDirty = true
-local cdmFrameToCdID = setmetatable({}, { __mode = "k" })
+-- Weak keyed. Holds the cooldownID a hooked frame last received, or true.
 local hookedAuraFrames = setmetatable({}, { __mode = "k" })
-
--- Mirror push: forward the CDM's own bar write instead of reading it back a tick later.
---
--- VALUE ONLY. Our min max stays (0, CONFIG.future) because the lane width is the
--- future window in pixels; taking theirs turns every lane into a percentage.
-local MIRROR_PUSH = true
--- Only has to outlast one client frame. Short on purpose: a redundant read is
--- harmless, holding a stale lane is not.
-local MIRROR_FRESH = 0.2
-local mirrorRowsByCdID = {}
-local hookedMirrorBars = setmetatable({}, { __mode = "k" })
-local mirrorInterp = nil
-local mirrorPushCount, mirrorPollCount = 0, 0
 
 local function MarkBuffDirtyForCdID(cdID)
     for _, row in ipairs(cooldownBars) do
@@ -2199,14 +2217,40 @@ local function MarkBuffDirtyForCdID(cdID)
     end
 end
 
-local function GetTotemSlotForRow(buffFrame)
-    if buffFrame.totemData == nil then return nil end
-    return buffFrame.preferredTotemUpdateSlot
-end
-
 function EHF.InstallBuffFrameHooks(frame)
     if hookedAuraFrames[frame] then return end
     hookedAuraFrames[frame] = true
+    if frame.SetCooldownID then
+        hooksecurefunc(frame, "SetCooldownID", function(self, cdID)
+            if not cdID then return end
+            local okV, viewer = pcall(function() return self.viewerFrame end)
+            if not okV or not viewer then return end
+            -- Releases the map entries of the id this frame held before.
+            local old = hookedAuraFrames[self]
+            if old ~= true and old ~= cdID then
+                if persistentCooldownMap[old] == self then persistentCooldownMap[old] = nil end
+                if persistentBuffMap[old] == self then
+                    persistentBuffMap[old] = nil
+                    persistentBuffFallback[old] = nil
+                    buffPromoteNext[old] = nil
+                end
+            end
+            hookedAuraFrames[self] = cdID
+            if viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"] then
+                persistentBuffMap[cdID] = self
+                persistentBuffFallback[cdID] = nil
+                buffPromoteNext[cdID] = nil
+            elseif viewer == _G["EssentialCooldownViewer"] or viewer == _G["UtilityCooldownViewer"] then
+                persistentCooldownMap[cdID] = self
+                if not persistentBuffMap[cdID] then
+                    persistentBuffMap[cdID] = self
+                    persistentBuffFallback[cdID] = true
+                end
+            end
+            MarkBuffDirtyForCdID(cdID)
+            viewerScanDirty = true
+        end)
+    end
     if frame.SetAuraInstanceInfo then
         hooksecurefunc(frame, "SetAuraInstanceInfo", function(self)
             AC.NoteAuraStart(self)
@@ -2214,8 +2258,7 @@ function EHF.InstallBuffFrameHooks(frame)
             -- seconds and a short buff can start and end between two of them, so
             -- it never got measured at all. No-ops while auras are restricted.
             AC.Learn(self)
-            local cdID = cdmFrameToCdID[self]
-            if not cdID then cdID = self.cooldownID end
+            local cdID = self.cooldownID
             if cdID then
                 if IsBuffViewerFrame(self) then
                     persistentBuffMap[cdID] = self
@@ -2232,12 +2275,12 @@ function EHF.InstallBuffFrameHooks(frame)
     if frame.ClearAuraInstanceInfo then
         hooksecurefunc(frame, "ClearAuraInstanceInfo", function(self)
             AC.ClearAuraStart(self)
-            local cdID = cdmFrameToCdID[self]
-            if not cdID then cdID = self.cooldownID end
+            -- A pool release nils cooldownID first; the last id seen stands in.
+            local last = hookedAuraFrames[self]
+            local cdID = self.cooldownID or (last ~= true and last) or nil
             if cdID then MarkBuffDirtyForCdID(cdID) end
         end)
     end
-    if EHF.InstallMirrorBarHook then EHF.InstallMirrorBarHook(frame) end
 end
 
 function EHF.ScanViewerFrames()
@@ -2316,6 +2359,17 @@ local function MirrorECMState(row, cooldownViewerFrames)
     end
     
     local ecmFrame = cooldownViewerFrames[row.cooldownID]
+    if ecmFrame then
+        -- A recycled frame holding another id is dropped until the maps catch up.
+        local ok, held = pcall(extractCooldownID, ecmFrame)
+        if not ok or held ~= row.cooldownID then
+            if persistentCooldownMap[row.cooldownID] == ecmFrame then
+                persistentCooldownMap[row.cooldownID] = nil
+            end
+            viewerScanDirty = true
+            ecmFrame = nil
+        end
+    end
     if not ecmFrame then
         row.chargeText:Hide()
         return
@@ -2534,19 +2588,13 @@ local _thirdBuffEntry = {}
 local BUFF_LANES = {
     { entry = _primaryBuffEntry, bar = "buffBar",        timer = "buff",
       dur = "activeBuffDuration",        mirror = "_auraMirrorCdID",
-      color = "resolvedBuffColor",       tracked = "trackedBuffAuraInstanceID",
-      totemSlot = "_totemSlot",          totemFed = "_totemCooldownFed",
-      push = "_mirrorPushAt" },
+      color = "resolvedBuffColor",       tracked = "trackedBuffAuraInstanceID" },
     { entry = _overlayBuffEntry, bar = "buffBarOverlay", timer = "overlay",
       dur = "activeBuffOverlayDuration", mirror = "_auraMirrorCdIDOverlay",
-      color = "resolvedOverlayColor",    tracked = "trackedOverlayAuraInstanceID",
-      totemSlot = "_overlayTotemSlot",   totemFed = "_overlayTotemFed",
-      push = "_mirrorPushAtOverlay" },
+      color = "resolvedOverlayColor",    tracked = "trackedOverlayAuraInstanceID" },
     { entry = _thirdBuffEntry,   bar = "buffBarThird",   timer = "third",
       dur = "activeBuffThirdDuration",   mirror = "_auraMirrorCdIDThird",
-      color = "resolvedThirdColor",      tracked = "trackedThirdAuraInstanceID",
-      totemSlot = "_thirdTotemSlot",     totemFed = "_thirdTotemFed",
-      push = "_mirrorPushAtThird" },
+      color = "resolvedThirdColor",      tracked = "trackedThirdAuraInstanceID" },
 }
 
 local function ResolveBuffColor(buffEntry)
@@ -2566,84 +2614,6 @@ end
 
 local _buffLanes = {}
 
--- A row registers itself against the buff cooldownID it mirrors. The list is
--- append only; the lane test below is what keeps a stale entry harmless, so
--- there is no bookkeeping at the twelve sites that clear a mirror id.
-function EHF.RegisterMirrorRow(cdID, row)
-    if not MIRROR_PUSH or not cdID or not row then return end
-    local list = mirrorRowsByCdID[cdID]
-    if not list then
-        list = {}
-        mirrorRowsByCdID[cdID] = list
-    end
-    for i = 1, #list do
-        if list[i] == row then return end
-    end
-    list[#list + 1] = row
-end
-
--- Runs inside Blizzard's own call stack, so it must be incapable of erroring:
--- table lookups, a secret accepting SetValue, and one comparison against a
--- literal zero that Blizzard pushes as a plain number. No arithmetic on v, ever.
-function EHF.InstallMirrorBarHook(frame)
-    if not MIRROR_PUSH then return end
-    -- Bare read, matching FillBuffLaneBar: callers only ever pass a live pooled
-    -- frame, either from an out of combat walk or from the SetCooldownID hook.
-    local bar = frame.Bar
-    if not bar or not bar.SetValue or hookedMirrorBars[bar] then return end
-    hookedMirrorBars[bar] = true
-
-    hooksecurefunc(bar, "SetValue", function(_, v)
-        local cdID = cdmFrameToCdID[frame]
-        if not cdID then return end
-        local list = mirrorRowsByCdID[cdID]
-        if not list then return end
-        local now = GetTime()
-        for i = 1, #list do
-            local row = list[i]
-            for l = 1, 3 do
-                local lane = BUFF_LANES[l]
-                -- The identity re-check: a pooled frame can be reassigned, and
-                -- only the row that currently mirrors THIS id may be written.
-                if row[lane.mirror] == cdID and row[lane.tracked] then
-                    local b = row[lane.bar]
-                    if b then
-                        b:SetValue(v, mirrorInterp)
-                        row[lane.push] = now
-                        mirrorPushCount = mirrorPushCount + 1
-                    end
-                end
-            end
-        end
-    end)
-
-    if bar.SetMinMaxValues then
-        hooksecurefunc(bar, "SetMinMaxValues", function(_, _, mx)
-            -- Their inactive push is a literal SetMinMaxValues(0, 0), so this
-            -- is a non-secret comparison and the only clean "row went dead"
-            -- edge available. Never mirror their scale onto our lane.
-            if issecretvalue and issecretvalue(mx) then return end
-            if mx ~= 0 then return end
-            local cdID = cdmFrameToCdID[frame]
-            if not cdID then return end
-            local list = mirrorRowsByCdID[cdID]
-            if not list then return end
-            for i = 1, #list do
-                local row = list[i]
-                for l = 1, 3 do
-                    if row[BUFF_LANES[l].mirror] == cdID then
-                        row[BUFF_LANES[l].push] = nil
-                        row._buffDirty = true
-                    end
-                end
-            end
-        end)
-    end
-end
-
-ns.MirrorStats = function()
-    return mirrorPushCount, mirrorPollCount, MIRROR_PUSH
-end
 
 -- Callers must test the lane is unclaimed first; these wipe the shared entry table.
 local function FillAuraLane(laneIdx, frame, mapData, unitHint, secretAuraSpellId)
@@ -2658,17 +2628,6 @@ local function FillAuraLane(laneIdx, frame, mapData, unitHint, secretAuraSpellId
     return e
 end
 
-local function FillTotemLane(laneIdx, frame, mapData, totemSlot)
-    local e = BUFF_LANES[laneIdx].entry
-    wipe(e)
-    e.frame = frame
-    e.color = (mapData and mapData.color) or CONFIG.buffColor
-    e.hasCustomColor = (mapData and mapData.color) ~= nil
-    e.unit = "player"
-    e.totemSlot = totemSlot
-    return e
-end
-
 -- Shared by lanes 2 and 3. Lane 1 is separate: pandemic pulse, variant name, potion window.
 local function UpdateSecondaryLane(row, buffEntry, lane)
     local bar = row[lane.bar]
@@ -2680,8 +2639,6 @@ local function UpdateSecondaryLane(row, buffEntry, lane)
         row[lane.color] = nil
         row[lane.tracked] = nil
         row[lane.mirror] = nil
-        row[lane.totemSlot] = nil
-        row[lane.totemFed] = false
         FeedHiddenCooldown(row, lane.timer, nil)
         return
     end
@@ -2693,26 +2650,11 @@ local function UpdateSecondaryLane(row, buffEntry, lane)
     local hidden = row["hidden_" .. lane.timer]
     local lastPtr = "lastPtr_" .. lane.timer
 
-    if buffEntry.totemSlot then
-        if not row[lane.totemFed] then
-            -- Bound first: passing the call through directly would forward any
-            -- extra return values as further arguments.
-            local totemDurObj = GetTotemDuration(buffEntry.totemSlot)
-            FeedHiddenCooldownRaw(row, lane.timer, totemDurObj)
-            row[lane.totemFed] = true
-        end
-        row[lane.dur] = nil
-        row[lane.totemSlot] = buffEntry.totemSlot
-        if hidden:IsShown() then bar:Show() else bar:Hide() end
-        row[lane.tracked] = nil
-        return
-    end
-
-    row[lane.totemSlot] = nil
-    -- A custom lane carries its own ids and length, so there is nothing for the
-    -- resolver to read off a frame it does not have.
+    -- Glow lanes and user timers: no frame to resolve.
     local kind, payload
-    if buffEntry.timerDurObj then
+    if buffEntry.glowLane then
+        kind = "permanent"
+    elseif buffEntry.timerDurObj then
         kind, payload = "durobj", buffEntry.timerDurObj
     else
         kind, payload = AC.ResolveFill(buffEntry.frame, buffEntry.unit)
@@ -2729,10 +2671,7 @@ local function UpdateSecondaryLane(row, buffEntry, lane)
         end
     elseif kind then
         row[lane.dur] = (kind == "durobj") and payload or nil
-        local newMirror = (kind == "mirror") and buffEntry.frame.cooldownID or nil
-        if row[lane.mirror] ~= newMirror then row[lane.push] = nil end
-        row[lane.mirror] = newMirror
-        if newMirror then EHF.RegisterMirrorRow(newMirror, row) end
+        row[lane.mirror] = (kind == "mirror") and buffEntry.frame.cooldownID or nil
         FeedHiddenCooldown(row, lane.timer, row[lane.dur])
         row[lane.tracked] = buffEntry.frame and buffEntry.frame.auraInstanceID or nil
         if not bar:IsShown() then bar:SetValue(0) end
@@ -2776,7 +2715,7 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
                 if mapData.buffCooldownIDs then
                     for _, mappedID in ipairs(mapData.buffCooldownIDs) do
                         local buffFrame = buffViewerFrames[mappedID]
-                        if buffFrame and buffFrame.auraInstanceID then
+                        if buffFrame and EHF.FrameLive(buffFrame) then
                             local unitHint = mapData.unit or buffFrame.auraDataUnit or "player"
                             local secretAuraSpellId
                             if CONFIG.showVariantNames and buffFrame.auraInstanceID then
@@ -2819,7 +2758,7 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
                             break
                         end
                     end
-                    if selfFrame and selfFrame.auraInstanceID
+                    if selfFrame and EHF.FrameLive(selfFrame)
                         and shares and not claimed and not wrongUnit then
                         local unitHint = mapData.unit or selfFrame.auraDataUnit or "player"
                         local secretAuraSpellId
@@ -2833,34 +2772,18 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
                 end
             end
         end
-    end
 
-    -- Totem pass (CDM tracks summon abilities via preferredTotemUpdateSlot)
-    if not _buffLanes[1] and row.cooldownID then
-        local selfFrame = buffViewerFrames[row.cooldownID]
-        if selfFrame and not selfFrame.auraInstanceID then
-            local totemSlot = GetTotemSlotForRow(selfFrame)
-            if totemSlot then
-                _buffLanes[1] = FillTotemLane(1, selfFrame, nil, totemSlot)
+        -- A totem on the row's own tile needs no pairing.
+        if not _buffLanes[1] then
+            local tile = persistentCooldownMap[row.cooldownID]
+            local okId, held = pcall(extractCooldownID, tile)
+            local claimed = false
+            for l = 1, 3 do
+                if _buffLanes[l] and _buffLanes[l].frame == tile then claimed = true end
             end
-        end
-        if not _buffLanes[1] and mappings then
-            for mapIdx, mapData in ipairs(mappings) do
-                if _buffLanes[1] then break end
-                if mapData.buffCooldownIDs then
-                    for _, mappedID in ipairs(mapData.buffCooldownIDs) do
-                        local buffFrame = buffViewerFrames[mappedID]
-                        if buffFrame and not buffFrame.auraInstanceID then
-                            local totemSlot = GetTotemSlotForRow(buffFrame)
-                            if totemSlot then
-                                if mapIdx <= 3 and not _buffLanes[mapIdx] then
-                                    _buffLanes[mapIdx] = FillTotemLane(mapIdx, buffFrame, mapData, totemSlot)
-                                end
-                                break
-                            end
-                        end
-                    end
-                end
+            if tile and okId and held == row.cooldownID and not claimed
+                and not tile.auraInstanceID and EHF.FrameLive(tile) then
+                _buffLanes[1] = FillAuraLane(1, tile, K.NO_MAPPING, "player", nil)
             end
         end
     end
@@ -2943,6 +2866,21 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
         end
     end
 
+    -- Glow pass: a slot whose source is the ability's own activation glow.
+    if mappings and row.isGlowing then
+        for mapIdx, mapData in ipairs(mappings) do
+            if mapIdx <= 3 and not _buffLanes[mapIdx] and mapData.glowSource then
+                local e = BUFF_LANES[mapIdx].entry
+                wipe(e)
+                e.glowLane = true
+                e.color = mapData.color or CONFIG.buffColor
+                e.hasCustomColor = mapData.color ~= nil
+                e.unit = "player"
+                _buffLanes[mapIdx] = e
+            end
+        end
+    end
+
     -- Glow-gated: suppress buff bar but preserve secretAuraSpellId for variant text.
     local primaryBuff, overlayBuff, thirdBuff = _buffLanes[1], _buffLanes[2], _buffLanes[3]
 
@@ -2970,36 +2908,12 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
         row.resolvedBuffColor = resolvedColor
         row.buffBar:SetStatusBarColor(unpack(resolvedColor))
 
-        if primaryBuff.totemSlot then
-            if not row._totemCooldownFed then
-                local totemDurObj = GetTotemDuration(primaryBuff.totemSlot)
-                if totemDurObj then
-                    FeedHiddenCooldownRaw(row, "buff", totemDurObj)
-                else
-                    FeedHiddenCooldownRaw(row, "buff", nil)
-                end
-                row._totemCooldownFed = true
-            end
-            row.activeBuffDuration = nil
-            row._totemSlot = primaryBuff.totemSlot
-            row.cachedPandemicIcon = nil
-            if row.buffPandemicAnim and row.buffPandemicAnim:IsPlaying() then
-                row.buffPandemicAnim:Stop()
-                row.buffBar:SetAlpha(1.0)
-            end
-            if row.hidden_buff:IsShown() then
-                row.buffBar:Show()
-            else
-                row.buffBar:Hide()
-            end
-            row.trackedBuffAuraInstanceID = nil
-            row.secretAuraSpellId = nil
-        else
-            row._totemSlot = nil
-            -- A frameless or user declared lane carries its own ids and length, so
-            -- there is nothing for the resolver to read off a frame it does not have.
+        do
+            -- Glow lanes and user timers: no frame to resolve.
             local fillKind, fillPayload, resolvedUnit
-            if primaryBuff.timerDurObj then
+            if primaryBuff.glowLane then
+                fillKind = "permanent"
+            elseif primaryBuff.timerDurObj then
                 fillKind, fillPayload = "durobj", primaryBuff.timerDurObj
             else
                 fillKind, fillPayload, resolvedUnit =
@@ -3028,12 +2942,7 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
                 end
             elseif fillKind then
                 row.activeBuffDuration = (fillKind == "durobj") and fillPayload or nil
-                local newMirror = (fillKind == "mirror") and primaryBuff.frame.cooldownID or nil
-                -- Freshness belongs to the source. Keeping it across a source
-                -- change lets the lane hold the previous aura's value.
-                if row._auraMirrorCdID ~= newMirror then row._mirrorPushAt = nil end
-                row._auraMirrorCdID = newMirror
-                if newMirror then EHF.RegisterMirrorRow(newMirror, row) end
+                row._auraMirrorCdID = (fillKind == "mirror") and primaryBuff.frame.cooldownID or nil
 
                 if primaryBuff.unit == "target" and CONFIG.pandemicPulse then
                     row.cachedPandemicIcon = primaryBuff.frame
@@ -3081,8 +2990,6 @@ function EHF.UpdateBuffState(row, buffViewerFrames)
         row.resolvedBuffColor = nil
         row.cachedPandemicIcon = nil
         row.trackedBuffAuraInstanceID = nil
-        row._totemSlot = nil
-        row._totemCooldownFed = false
         if not row._glowGatedVariant then
             row.secretAuraSpellId = nil
         end
@@ -3405,31 +3312,13 @@ local function FillBuffLaneBar(row, lane, interp)
     local bar = row[lane.bar]
     if not bar then return end
 
-    local slot = row[lane.totemSlot]
-    if slot then
-        local timeLeft = GetTotemTimeLeft(slot)
-        if timeLeft ~= nil then
-            bar:SetValue(timeLeft, interp)
-        else
-            bar:Hide()
-            row[lane.totemSlot] = nil
-        end
-        return
-    end
-
-    if row[lane.mirror] and row[lane.tracked] then
-        -- A fresh push already wrote this lane with the value the read would
-        -- return. If pushes stop, the read resumes on the next frame by itself.
-        local pushAt = row[lane.push]
-        if pushAt and (GetTime() - pushAt) < MIRROR_FRESH then return end
-
+    if row[lane.mirror] then
         local mf = ResolveBuffFrame(row[lane.mirror])
         local mbar = mf and mf.Bar
         local ok, val = false, nil
         if mbar then ok, val = pcall(mbar.GetValue, mbar) end
         if ok then
             bar:SetValue(val, interp)
-            mirrorPollCount = mirrorPollCount + 1
         else
             -- A failed read is unknown, not ended, so mark dirty rather than hide.
             row._buffDirty = true
@@ -3464,6 +3353,16 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
                     row._buffDirty = true
                 end
                 row._wasVisible = visible
+                -- Mirror lanes: dirty when the frame goes inactive.
+                if visible and not row._buffDirty then
+                    for l = 1, 3 do
+                        local cdID = row[BUFF_LANES[l].mirror]
+                        if cdID then
+                            local f = persistentBuffMap[cdID]
+                            if not (f and EHF.FrameLive(f)) then row._buffDirty = true end
+                        end
+                    end
+                end
                 -- Hidden rows keep their dirty flag so the show edge reconciles.
                 if row._buffDirty and visible then
                     row._buffDirty = false
@@ -3481,9 +3380,6 @@ EH_Parent:SetScript("OnUpdate", function(self, elapsed)
 
     if updateTimer >= 0.033 then
         local interp = GetInterpolation()
-        -- The push runs on Blizzard's frame, between our ticks, so it reads the
-        -- last resolved value rather than recomputing inside their call stack.
-        mirrorInterp = interp
 
         for _, row in ipairs(cooldownBars) do
             -- Cooldown bar fill
@@ -3755,13 +3651,6 @@ local function ResetBarState(bar)
     bar.isExtras = nil
     bar.extrasType = nil
     bar.extrasKey = nil
-    bar._extrasAuraInstanceID = nil
-    bar._totemSlot = nil
-    bar._totemCooldownFed = false
-    bar._overlayTotemSlot = nil
-    bar._overlayTotemFed = false
-    bar._thirdTotemSlot = nil
-    bar._thirdTotemFed = false
     bar.trackedBuffAuraInstanceID = nil
     bar.trackedOverlayAuraInstanceID = nil
     bar.trackedThirdAuraInstanceID = nil
@@ -3778,9 +3667,15 @@ local function ResetBarState(bar)
     HideCastOverlays(bar)
     if bar.depletedWrapper then bar.depletedWrapper:Hide() end
     if bar.notDepletedWrapper then bar.notDepletedWrapper:Hide() end
+    -- A running timer survives a reconfigure; SetValue is what cancels it.
+    bar._chargeDurObj = nil
+    bar._cdDurObj = nil
+    if bar.depletedChargeBar then bar.depletedChargeBar:SetValue(0) end
+    if bar.normalChargeBar then bar.normalChargeBar:SetValue(0) end
     if ns.ChargePast_Reset then ns.ChargePast_Reset(bar) end
     if bar.middleLanes then
         for _, ml in ipairs(bar.middleLanes) do
+            ml.depletedChargeBar:SetValue(0)
             ml.depletedChargeBar:Hide()
             ml.depletedHelperBar:Hide()
             ml.activeSlide = nil
@@ -3922,8 +3817,10 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
                 InfallDB.chargeSpells[cooldownID] = nil
             end
         end
+    elseif InfallDB.chargeSpells then
+        InfallDB.chargeSpells[cooldownID] = nil
     end
-    
+
     bar.hasCharges = isChargeSpell
 
     -- User toggle: single bar, but keep charge count text
@@ -3973,10 +3870,7 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             InfallDB.chargeDurations = InfallDB.chargeDurations or {}
             InfallDB.chargeDurations[cooldownID] = chargeInfo.cooldownDuration
         else
-            local saved = InfallDB.chargeDurations and InfallDB.chargeDurations[cooldownID]
-            if saved then
-                bar.chargeDurationConstant = saved
-            end
+            bar.chargeDurationConstant = InfallDB.chargeDurations and InfallDB.chargeDurations[cooldownID]
         end
     elseif not isChargeSpell then
         bar.chargeDurationConstant = nil
@@ -4137,7 +4031,14 @@ local function ConfigureBarForSpell(bar, spellID, cooldownID, index)
             bar.normalChargeBar:SetPoint("TOPLEFT", bar.ndHelperSpacer:GetStatusBarTexture(), "TOPLEFT")
         elseif bar.notDepletedHelperBar then
             bar.notDepletedHelperBar:Hide()
-            if bar.ndHelperSpacer then bar.ndHelperSpacer:Hide() end
+            if bar.ndHelperSpacer then
+                bar.ndHelperSpacer:ClearAllPoints()
+                bar.ndHelperSpacer:SetPoint("TOPLEFT", bar.notDepletedWrapper, "TOPLEFT", 0, 0)
+                bar.ndHelperSpacer:SetSize(1, 1)
+                bar.ndHelperSpacer:SetMinMaxValues(0, 1)
+                bar.ndHelperSpacer:SetValue(1)
+                bar.ndHelperSpacer:Hide()
+            end
         end
 
         -- Middle lanes (3+ charges): clip indicator + wrapper per threshold
@@ -4481,22 +4382,19 @@ end
 -- Rebuilds only when the count moved. A live row cannot have its maxCharges
 -- changed in place.
 local function RedetectChargesAndRebuild()
-    local oldCache = {}
-    if InfallDB.chargeSpells then
-        for k, v in pairs(InfallDB.chargeSpells) do
-            oldCache[k] = type(v) == "table" and v.maxCharges or v
-        end
-    end
     PreCacheChargeSpells()
+    -- Each shown row against a live read.
     local changed = false
-    if InfallDB.chargeSpells then
-        for k, v in pairs(InfallDB.chargeSpells) do
-            local newMax = type(v) == "table" and v.maxCharges or v
-            if oldCache[k] ~= newMax then changed = true; break end
-        end
-        if not changed then
-            for k in pairs(oldCache) do
-                if not InfallDB.chargeSpells[k] then changed = true; break end
+    for _, row in ipairs(cooldownBars) do
+        if row.spellID and not row.isExtras then
+            local m = EHF.EffectiveMaxCharges(row.spellID, row.baseSpellID)
+            if m then
+                local isCharge = m > 1
+                if isCharge ~= (row.hasCharges == true)
+                    or (isCharge and row.isChargeSpell and m ~= row.maxCharges) then
+                    changed = true
+                    break
+                end
             end
         end
     end
@@ -4624,6 +4522,7 @@ end
 
 local ecmVisQueued = false
 local ecmVisPending = false
+local ecmHiddenByUs = {}
 
 -- Defers out of Blizzard's own call stack: touching CDM frames inside their
 -- hooks taints the rest of that secure execution.
@@ -4634,6 +4533,11 @@ local function QueueECMVisibility()
         ecmVisQueued = false
         if InCombatLockdown() then
             ecmVisPending = true
+            -- Viewer alpha is allowed in combat; item frames wait for it to end.
+            for name, key in pairs(ecmViewerKey) do
+                local frame = _G[name]
+                if frame and CONFIG[key] then pcall(frame.SetAlpha, frame, 0) end
+            end
             return
         end
         if ns.ApplyECMVisibility then ns.ApplyECMVisibility() end
@@ -4648,6 +4552,7 @@ local function ApplyECMVisibility()
         if frame then
             local key = ecmViewerKey[name]
             if key and CONFIG[key] then
+                ecmHiddenByUs[name] = true
                 pcall(function() frame:SetAlpha(0) end)
                 -- Disable mouse on main frame and all item frames
                 pcall(function() frame:EnableMouse(false) end)
@@ -4657,13 +4562,15 @@ local function ApplyECMVisibility()
                         itemFrame:SetMouseClickEnabled(false)
                     end
                 end)
-            else
+            elseif ecmHiddenByUs[name] then
+                -- Only a viewer we hid; restores the game's own opacity and tooltip state.
+                ecmHiddenByUs[name] = nil
                 pcall(function() frame:UpdateSystemSettingOpacity() end)
-                pcall(function() frame:EnableMouse(true) end)
                 pcall(function()
+                    local tips = frame.tooltipsShown ~= false
                     for itemFrame in frame.itemFramePool:EnumerateActive() do
-                        itemFrame:SetMouseMotionEnabled(true)
-                        itemFrame:SetMouseClickEnabled(true)
+                        itemFrame:SetMouseClickEnabled(false)
+                        itemFrame:SetMouseMotionEnabled(tips)
                     end
                 end)
             end
@@ -4749,9 +4656,8 @@ local function ForceViewersAlways()
         print("|cff00ff00[Infall]|r CDM viewers need to be set to Always. Open Edit Mode and change each viewer's visibility, or create a custom layout.")
     end
 
-    -- SaveLayouts AT MOST ONCE, during init, NEVER at runtime: a runtime call
-    -- reapplies the layout from addon code and taints isActive, read on every
-    -- viewer child. Runtime callers get it in memory, written next login.
+    -- SaveLayouts at most once, at login. A runtime save reapplies the layout from
+    -- addon code and taints isActive.
     if ns._editModeSaved or not isFirstCall then
         return true
     end
@@ -4774,16 +4680,17 @@ local function GetCDMStatus()
     return cvarEnabled, allAlways
 end
 ns.GetCDMStatus = GetCDMStatus
-ns.ForceViewersAlways = ForceViewersAlways
 
 local function ApplyCastBarVisibility()
     if InCombatLockdown() then return end
     local bar = PlayerCastingBarFrame
     if not bar then return end
     if CONFIG.hideBlizzCastBar then
+        ecmHiddenByUs.PlayerCastingBarFrame = true
         bar:SetAlpha(0)
         pcall(function() bar:UnregisterAllEvents() end)
-    else
+    elseif ecmHiddenByUs.PlayerCastingBarFrame then
+        ecmHiddenByUs.PlayerCastingBarFrame = nil
         bar:SetAlpha(1)
         pcall(function()
             -- Blizzard's own list for this frame, unit filtered the way they register it.
@@ -4825,9 +4732,6 @@ loginInitFrame:SetScript("OnEvent", function()
         if CONFIG.hideBuffBarCD == nil then CONFIG.hideBuffBarCD = v end
         CONFIG.hideBlizzECM = nil
     end
-
-    -- Correct the CDM viewer settings to "Always" in layout data
-    if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
 
     PreCacheChargeSpells()
     if ns.AutoPopulateSelfBuffMappings then ns.AutoPopulateSelfBuffMappings() end
@@ -4898,71 +4802,20 @@ loginInitFrame:SetScript("OnEvent", function()
             -- Re-disable mouse after CDM layout rebuilds (login, spec swap, zone transition)
             if frame.RefreshLayout then
                 hooksecurefunc(frame, "RefreshLayout", function(self)
+                    -- Pool released and refilled: cached frames are stale.
+                    viewerScanDirty = true
                     if key and CONFIG[key] then QueueECMVisibility() end
                 end)
             end
         end
     end
 
-    -- Mixin hooks: maintain persistent CDM frame maps reactively
-    if CooldownViewerItemDataMixin then
-        if CooldownViewerItemDataMixin.SetCooldownID then
-            hooksecurefunc(CooldownViewerItemDataMixin, "SetCooldownID", function(frame, cdID)
-                if not cdID then return end
-                local oldCdID = cdmFrameToCdID[frame]
-                if oldCdID then
-                    if persistentCooldownMap[oldCdID] == frame then persistentCooldownMap[oldCdID] = nil end
-                    if persistentBuffMap[oldCdID] == frame then
-                        persistentBuffMap[oldCdID] = nil
-                        persistentBuffFallback[oldCdID] = nil
-                        buffPromoteNext[oldCdID] = nil
-                    end
-                end
-                cdmFrameToCdID[frame] = cdID
-
-                local viewer = frame.viewerFrame
-                if not viewer then return end
-                local isBuff = (viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"])
-                local isCooldown = (viewer == _G["EssentialCooldownViewer"] or viewer == _G["UtilityCooldownViewer"])
-
-                if isCooldown then
-                    persistentCooldownMap[cdID] = frame
-                    if not persistentBuffMap[cdID] then
-                        persistentBuffMap[cdID] = frame
-                        persistentBuffFallback[cdID] = true
-                    end
-                end
-                if isBuff then
-                    persistentBuffMap[cdID] = frame
-                    persistentBuffFallback[cdID] = nil
-                    buffPromoteNext[cdID] = nil
-                end
+    -- Per frame hooks, installed as the pool hands frames out.
+    for _, name in ipairs(ecmFrameNames) do
+        local viewer = _G[name]
+        if viewer and viewer.OnAcquireItemFrame then
+            hooksecurefunc(viewer, "OnAcquireItemFrame", function(_, frame)
                 EHF.InstallBuffFrameHooks(frame)
-                MarkBuffDirtyForCdID(cdID)
-                viewerScanDirty = true
-
-                -- Disable mouse on item frames assigned to hidden viewers
-                local viewerName = viewer:GetName()
-                if viewerName then
-                    local hideKey = ecmViewerKey[viewerName]
-                    if hideKey and CONFIG[hideKey] then QueueECMVisibility() end
-                end
-            end)
-        end
-        if CooldownViewerItemDataMixin.ClearCooldownID then
-            hooksecurefunc(CooldownViewerItemDataMixin, "ClearCooldownID", function(frame)
-                local cdID = cdmFrameToCdID[frame]
-                if cdID then
-                    if persistentCooldownMap[cdID] == frame then persistentCooldownMap[cdID] = nil end
-                    if persistentBuffMap[cdID] == frame then
-                        persistentBuffMap[cdID] = nil
-                        persistentBuffFallback[cdID] = nil
-                        buffPromoteNext[cdID] = nil
-                    end
-                    cdmFrameToCdID[frame] = nil
-                    MarkBuffDirtyForCdID(cdID)
-                    viewerScanDirty = true
-                end
             end)
         end
     end
@@ -5027,6 +4880,8 @@ loginInitFrame:SetScript("OnEvent", function()
     end
 
     -- must be after profile loading sets CONFIG
+    -- Correct the CDM viewer settings to "Always" in layout data
+    if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
     NormalizeGrowAnchor()
     ApplyCastBarVisibility()
     if CONFIG.clickthrough then
@@ -5047,6 +4902,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         local loadedAddon = ...
         if loadedAddon == ADDON_NAME then
+            if InfallDB then InfallDB.laneLog = nil; InfallDB.laneLogOn = nil end
             -- Migrate old flat InfallDB to profile structure
             if InfallDB and not InfallDB.profiles then
                 local oldToggles = {}
@@ -5117,13 +4973,9 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end)
         end
         C_Timer.After(2.5, UpdateVisibility)
-        -- Viewers may recreate after zone transitions; re-force Always + re-hide
+        -- Viewers may recreate after zone transitions; re-hide
         C_Timer.After(2.5, function()
-            if InCombatLockdown() then
-                ns._pendingECMReapply = true
-                return
-            end
-            if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
+            if InCombatLockdown() then return end
             ApplyECMVisibility()
         end)
 
@@ -5284,6 +5136,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         for _, row in ipairs(cooldownBars) do
             if RowMatchesCastSpell(row, spellID) then
                 HandleProcGlow(row, true)
+                row._buffDirty = true
             end
         end
         UpdateBars()
@@ -5294,6 +5147,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         for _, row in ipairs(cooldownBars) do
             if RowMatchesCastSpell(row, spellID) then
                 HandleProcGlow(row, false)
+                row._buffDirty = true
             end
         end
         
@@ -5331,10 +5185,9 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
         end
 
     elseif event == "PLAYER_TOTEM_UPDATE" then
+        -- Totem start and end: every row reconciles.
         for _, row in ipairs(cooldownBars) do
-            row._totemCooldownFed = false
-            row._overlayTotemFed = false
-            row._thirdTotemFed = false
+            row._buffDirty = true
         end
         UpdateBars()
 
@@ -5417,6 +5270,7 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                 QueueECMVisibility()
             end
             viewerScanDirty = true
+            local chargeCountMoved = false
             for _, row in ipairs(cooldownBars) do
                 row.cachedPandemicIcon = nil
                 -- Detach active slides so they drift off naturally
@@ -5439,26 +5293,18 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
                     if row[key] then row[key]:SetCooldown(0, 0) end
                 end
 
-                -- readable out of combat
+                -- Lane count is compared here, never written: a live row rebuilds.
                 if row.isChargeSpell then
-                    local cInfo = GetChargesWithOverride(row.spellID, row.baseSpellID)
-                    if cInfo and cInfo.currentCharges then
-                        if not issecretvalue(cInfo.maxCharges) then
-                            local override = CONFIG.chargeOverflow and CONFIG.chargeOverflow[row.baseSpellID]
-                            local effectiveMax = cInfo.maxCharges
-                            if override and override.trueMax and effectiveMax > override.trueMax then
-                                effectiveMax = override.trueMax
-                            end
-                            row.maxCharges = effectiveMax
-                            local bH = row.cdBar.fullHeight or CONFIG.height
-                            SetChargeLaneMetrics(row, bH, effectiveMax)
-                        end
-                    end
+                    -- 1 here means no charge info, as on a transformed form; not a move.
+                    local m = EHF.EffectiveMaxCharges(row.spellID, row.baseSpellID)
+                    if m and m ~= 1 and m ~= row.maxCharges then chargeCountMoved = true end
                     EHF.FeedChargeBarTimers(row)
                 end
 
 
             end
+
+            if chargeCountMoved then RedetectChargesAndRebuild() end
 
             if ns._pendingReorder then
                 ns._pendingReorder = nil
@@ -5473,10 +5319,6 @@ EH_Parent:SetScript("OnEvent", function(self, event, ...)
             end
 
             -- Re-apply ECM visibility after combat
-            if ns._pendingECMReapply then
-                ns._pendingECMReapply = nil
-                if CONFIG.forceViewersAlways ~= false then ForceViewersAlways() end
-            end
             if AnyViewerHidden() then
                 ApplyECMVisibility()
             end

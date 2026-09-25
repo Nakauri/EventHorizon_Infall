@@ -396,12 +396,6 @@ function AC.ApplicationsBySpellID(spellID)
     return apps
 end
 
--- True while that aura is on the player.
-function AC.HasAuraBySpellID(spellID)
-    if not spellID or not AuraReadable(spellID) then return false end
-    return ReadAura(nil, spellID) ~= nil
-end
-
 -- true permanent, false expires, nil unknown or secret.
 local function GameSaysPermanent(unit, iid)
     if not (C_UnitAuras and C_UnitAuras.DoesAuraHaveExpirationTime) then return nil end
@@ -466,6 +460,19 @@ local function ResolveFillInner(frame, unit)
 
     if canMirror and okIID and iid ~= nil then
         return "mirror", bar
+    end
+
+    -- A totem entry carries no aura; the game times it by slot.
+    if not canMirror and not (okIID and iid ~= nil) and GetTotemDuration then
+        local tOk, slot, exp = pcall(function()
+            local t = frame.totemData
+            if t then return t.slot, t.expirationTime end
+        end)
+        local over = exp ~= nil and not issecretvalue(exp) and exp <= GetTime()
+        if tOk and slot ~= nil and not issecretvalue(slot) and not over then
+            local dOk, tDur = pcall(GetTotemDuration, slot)
+            if dOk and tDur then return "durobj", tDur, nil end
+        end
     end
 
     local kind, payload = AC.AuraFill(frame, unit)

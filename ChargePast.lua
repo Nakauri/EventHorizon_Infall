@@ -48,17 +48,22 @@ function ns.ChargePast_Push(row, cc)
     end
     local n = (row._cpRingN or 0) + 1
     row._cpRingN = n
-    ring[n] = ring[n] or {}
-    ring[n].t = GetTime()
-    ring[n].v = cc
-    for i = 1, n - RING do ring[i] = nil end
+    -- Fixed slots, overwritten in turn.
+    local slot = (n - 1) % RING + 1
+    local e = ring[slot]
+    if not e then
+        e = {}
+        ring[slot] = e
+    end
+    e.t = GetTime()
+    e.v = cc
 end
 
 local function ValueAt(row, when)
     local ring, n = row._cpRing, row._cpRingN or 0
     if not ring then return nil end
-    for i = n, math.max(1, n - RING), -1 do
-        local e = ring[i]
+    for i = n, math.max(1, n - RING + 1), -1 do
+        local e = ring[(i - 1) % RING + 1]
         if e and e.t and e.t <= when then return e.v end
     end
     return nil
