@@ -5,12 +5,12 @@
 local ns = EventHorizon_Infall
 local issecret = issecretvalue or function() return false end
 
--- Haste from the GCD, which is spell 61304 and never secret. Floors at 0.75s,
+-- Haste from the GCD, read off ns.GCD_SPELL and never secret. Floors at 0.75s,
 -- so this saturates near 2.0.
 local lastHaste = 1
 function ns.HasteMultiplier()
     if not C_Spell or not C_Spell.GetSpellCooldownDuration then return lastHaste end
-    local ok, obj = pcall(C_Spell.GetSpellCooldownDuration, 61304)
+    local ok, obj = pcall(C_Spell.GetSpellCooldownDuration, ns.GCD_SPELL)
     if not ok or not obj or not obj.GetTotalDuration then return lastHaste end
     local tOk, total = pcall(obj.GetTotalDuration, obj)
     if issecret(total) then return lastHaste end
@@ -25,10 +25,11 @@ end
 local CONFIG = ns.CONFIG
 local MAX_MARKS = 20
 
--- A secret id cannot be a table key, and the lookup errors rather than missing.
+-- This client's period table. A secret id cannot be a table key, and the lookup
+-- errors rather than missing.
 local function Period(id)
-    if id == nil or issecret(id) then return nil end
-    return ns.TICK_PERIODS[id]
+    if id == nil or issecret(id) or not ns.TickPeriodFor then return nil end
+    return (ns.TickPeriodFor(id))
 end
 
 -- The paired buff's spell id, if any id it can present has a known period.
@@ -155,6 +156,11 @@ function ns.UpdateDotTicks(row)
     end
 
     local startT, endT = ns.TickWindow(row, spellID, fromCast, haste)
+    -- One log line per change: which aura, from where, and why nothing drew.
+    if ns.RecTicks then
+        local why = not startT and "no window" or (GetTime() > endT and "expired" or "drawn")
+        ns.RecTicks(row, spellID, fromCast, period, why)
+    end
     if not startT or not endT or GetTime() > endT then
         HideFrom(row, 1)
         return
@@ -178,9 +184,16 @@ function ns.UpdateDotTicks(row)
     -- nothing. floor+1, not ceil: a tick landing exactly on the edge is excluded.
     local firstK = math.floor((now - CONFIG.past - startT) / period) + 1
     if firstK < 1 then firstK = 1 end
+    -- A hasted DoT ends with a partial tick at expiry, after the last whole period;
+    -- that tick is drawn at endT unless a whole-period tick already sits there.
+    local lastWhole = math.floor((endT - startT) / period + 0.01)
+    local extra = (endT - (startT + lastWhole * period)) > 0.05
     for k = firstK, firstK + MAX_MARKS - 1 do
         local at = startT + k * period
-        if at > endT + 0.01 then break end
+        if at > endT + 0.01 then
+            if not extra then break end
+            at, extra = endT, false
+        end
         local offset = at - now
         if offset > -CONFIG.past and offset < CONFIG.future then
             shown = shown + 1

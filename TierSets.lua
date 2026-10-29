@@ -106,7 +106,15 @@ watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
 watcher:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 watcher:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 watcher:RegisterEvent("PLAYER_REGEN_ENABLED")
+-- An equipment set fires PLAYER_EQUIPMENT_CHANGED once per slot: one scan per frame.
+local scanPending = false
+local function PendingScan()
+    scanPending = false
+    Scan()
+end
 watcher:SetScript("OnEvent", function(_, event)
     if event == "PLAYER_REGEN_ENABLED" and scanned and #activeAuras > 0 then return end
-    C_Timer.After(0, Scan)
+    if scanPending then return end
+    scanPending = true
+    C_Timer.After(0, PendingScan)
 end)

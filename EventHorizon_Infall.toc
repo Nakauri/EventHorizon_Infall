@@ -1,18 +1,21 @@
-## Interface: 120100
+## Interface: 120105, 120107, 16001
 ## Title: EventHorizon Infall
 ## Notes: Event Horizon for Midnight, cooldown timeline bars driven by CDM
 ## Author: Infall
-## Version: 1.4.3
+## Version: 1.4.5
 ## IconTexture: Interface\Icons\Spell_animamaw_orb
 ## SavedVariables: InfallDB
 
 Core.lua
+Report.lua
 Perf.lua
 AuraCompat.lua
 TierSets.lua
 TickPeriods.lua
+CDMSpecs.lua
 DotTicks.lua
 ChargePast.lua
+StackGate.lua
 PressMarks.lua
 Migrate121.lua
 

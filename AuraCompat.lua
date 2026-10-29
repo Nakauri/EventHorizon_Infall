@@ -17,7 +17,9 @@ local restrictedStamp = -1
 -- call is refused, so it is trusted to answer YES and never NO.
 function AC.AurasRestricted()
     local now = GetTime()
-    if C_Secrets and C_Secrets.ShouldAurasBeSecret and C_Secrets.ShouldAurasBeSecret() then
+    local secretAuras = C_Secrets and C_Secrets.ShouldAurasBeSecret and C_Secrets.ShouldAurasBeSecret()
+    -- Forever can answer with a secret boolean; a secret answer means restricted.
+    if secretAuras ~= nil and (issecret(secretAuras) or secretAuras == true) then
         restrictedStamp = now
         return true
     end
@@ -33,17 +35,17 @@ end
 
 local learnedDuration = {}
 local learnedPermanent = {}
+-- Last aura instance learned from, per spell, this session. A refresh keeps the
+-- instance, so only a new instance is measured.
+local learnedInstance = {}
 
 function AC.LoadDB()
     InfallDB = InfallDB or {}
     InfallDB.auraDurations = InfallDB.auraDurations or {}
     InfallDB.auraPermanent = InfallDB.auraPermanent or {}
     InfallDB.auraEstimateOff = InfallDB.auraEstimateOff or {}
-    -- Rekeyed from spellID to cooldownID; the old contents cannot be matched across.
-    if InfallDB.auraEstimateUsedVer ~= 2 then
-        InfallDB.auraEstimateUsed, InfallDB.auraEstimateUsedVer = {}, 2
-    end
-    InfallDB.auraEstimateUsed = InfallDB.auraEstimateUsed or {}
+    -- Estimate use is session state now; the saved copy is retired.
+    InfallDB.auraEstimateUsed, InfallDB.auraEstimateUsedVer = nil, nil
     learnedDuration = InfallDB.auraDurations
     learnedPermanent = InfallDB.auraPermanent
 end
@@ -76,30 +78,39 @@ function AC.GetConfigSpellID(frame)
     return nil
 end
 
+-- Entries an estimate has driven this session, keyed by cooldownID and wiped on a
+-- spec change, so no mark carries over from another character, spec or session.
+-- estimateViewer holds the NAME of the viewer the estimated frame sat in.
+local estimateUsed = {}
+local estimateViewer = {}
+
 -- True while an estimate is what currently drives this ENTRY's bar. Most bars are
 -- fed by the game and their measurement is never used, so this is what separates
 -- the entries worth marking in the UI from the rest.
 function AC.IsEstimateUsed(cdID)
-    return cdID ~= nil and InfallDB and InfallDB.auraEstimateUsed
-        and InfallDB.auraEstimateUsed[cdID] == true or false
+    return cdID ~= nil and estimateUsed[cdID] == true or false
+end
+
+function AC.EstimateViewer(cdID)
+    return cdID ~= nil and estimateViewer[cdID] or nil
 end
 
 -- Both write only on a change: ResolveFill runs from the buff poll, not once.
-local function NoteEstimateUsed(cdID)
+local function NoteEstimateUsed(cdID, frame)
     if cdID == nil then return end
-    InfallDB = InfallDB or {}
-    InfallDB.auraEstimateUsed = InfallDB.auraEstimateUsed or {}
-    if InfallDB.auraEstimateUsed[cdID] ~= true then
-        InfallDB.auraEstimateUsed[cdID] = true
+    if estimateUsed[cdID] ~= true then estimateUsed[cdID] = true end
+    if estimateViewer[cdID] == nil and ns.ViewerName then
+        local name = ns.ViewerName(frame)
+        if name ~= "?" then estimateViewer[cdID] = name end
     end
 end
 
 -- Real timing arriving is what retires the notice. Without this the flag latches
--- for the life of the profile and the tooltip keeps claiming the bar is unfed.
+-- and the tooltip keeps claiming the bar is unfed.
 local function ClearEstimateUsed(cdID)
     if cdID == nil then return end
-    local t = InfallDB and InfallDB.auraEstimateUsed
-    if t and t[cdID] ~= nil then t[cdID] = nil end
+    if estimateUsed[cdID] ~= nil then estimateUsed[cdID] = nil end
+    if estimateViewer[cdID] ~= nil then estimateViewer[cdID] = nil end
 end
 
 -- Absence means allowed, so a profile written before this existed is unchanged.
@@ -134,6 +145,7 @@ function AC.ForgetLearned()
     end
     learnedPermanent = InfallDB.auraPermanent
     learnedDuration = InfallDB.auraDurations
+    wipe(learnedInstance)
     return n
 end
 
@@ -185,8 +197,16 @@ function AC.Learn(frame)
     local spellID = AC.GetConfigSpellID(frame)
     if not spellID then return end
 
+    local okI, iid = pcall(function() return frame.auraInstanceID end)
+    if not okI or iid == nil or issecret(iid) then return end
+    if learnedInstance[spellID] == iid then return end
+
     local ok, ad = pcall(function() return frame.auraDataCached end)
     if not ok or not ad then return end
+    -- The frame takes a new instance before its cached data catches up; learning then would
+    -- pin the expired aura's length to the new instance.
+    local okA, adIID = pcall(function() return ad.auraInstanceID end)
+    if not okA or adIID == nil or issecret(adIID) or adIID ~= iid then return end
 
     local okD, dur = pcall(function() return ad.duration end)
     if not okD or issecret(dur) then return end
@@ -195,9 +215,11 @@ function AC.Learn(frame)
     if perm == false then
         learnedPermanent[spellID] = nil
         learnedDuration[spellID] = dur
+        learnedInstance[spellID] = iid
     elseif perm == true then
         learnedPermanent[spellID] = true
         learnedDuration[spellID] = nil
+        learnedInstance[spellID] = iid
     end
 end
 
@@ -254,7 +276,7 @@ function AC.ClearIdentityCache()
 end
 
 local function AddID(set, list, id)
-    if type(id) ~= "number" or id <= 0 or set[id] then return end
+    if type(id) ~= "number" or issecret(id) or id <= 0 or set[id] then return end
     set[id] = true
     list[#list + 1] = id
 end
@@ -290,6 +312,7 @@ function AC.IdentityIDsForCooldown(cdID)
     AddID(set, list, info.overrideTooltipSpellID)
     AddID(set, list, info.overrideSpellID)
     AddID(set, list, info.spellID)
+    if ns.IS_FOREVER then AddID(set, list, info.displaySpellID) end
 
     -- Both directions: an entry can name either end of a transform.
     local seeded = #list
@@ -418,6 +441,14 @@ end
 -- Fill resolution
 
 -- Returns kind, payload, resolvedUnit: "mirror" widget, "durobj" object, "permanent", or nil.
+-- lastVia names the branch that answered, for the report.
+
+local lastVia
+local fillVia = setmetatable({}, { __mode = "k" })
+
+function AC.FillVia(frame)
+    return frame and fillVia[frame]
+end
 
 local function ResolveFillInner(frame, unit)
     local spellID = AC.GetConfigSpellID(frame)
@@ -441,10 +472,11 @@ local function ResolveFillInner(frame, unit)
             live = AC.IsAuraPermanent(cdmUnit, iid, nil)
         end
     end
-    if live == true then return "permanent", nil end
-    if live == nil and learnState == "permanent" then return "permanent", nil end
+    if live == true then lastVia = "game-permanent" return "permanent", nil end
+    if live == nil and learnState == "permanent" then lastVia = "learned-permanent" return "permanent", nil end
 
     if not restricted and iOk and iid then
+        lastVia = "aura"
         local ok, durObj = pcall(C_UnitAuras.GetAuraDuration, unit, iid)
         if ok and durObj then return "durobj", durObj, unit end
         if cdmUnit and cdmUnit ~= unit then
@@ -459,6 +491,7 @@ local function ResolveFillInner(frame, unit)
     local canMirror = (okBar and bar and bar.GetValue) and true or false
 
     if canMirror and okIID and iid ~= nil then
+        lastVia = "mirror"
         return "mirror", bar
     end
 
@@ -471,14 +504,15 @@ local function ResolveFillInner(frame, unit)
         local over = exp ~= nil and not issecretvalue(exp) and exp <= GetTime()
         if tOk and slot ~= nil and not issecretvalue(slot) and not over then
             local dOk, tDur = pcall(GetTotemDuration, slot)
-            if dOk and tDur then return "durobj", tDur, nil end
+            if dOk and tDur then lastVia = "totem" return "durobj", tDur, nil end
         end
     end
 
     local kind, payload = AC.AuraFill(frame, unit)
-    if kind then return kind, payload, unit end
+    if kind then lastVia = "aurafill" return kind, payload, unit end
 
     if canMirror then
+        lastVia = "mirror-noaura"
         return "mirror", bar
     end
 
@@ -492,25 +526,31 @@ local function ResolveFillInner(frame, unit)
         -- Flagged estimated either way: switched off still means the game is not
         -- feeding it, which is what the tooltip and the right click affordance say.
         if AC.IsEstimateAllowed(key) then
+            lastVia = "estimate"
             local durObj = C_DurationUtil.CreateDuration()
             durObj:SetTimeFromStart(start, dur)
             return "durobj", durObj, nil, true
         end
+        lastVia = "estimate-off"
         return nil, nil, nil, true
     end
 
+    lastVia = "none"
     return nil
 end
 
 function AC.ResolveFill(frame, unit)
     if not frame then return nil end
+    lastVia = nil
     local kind, payload, resolved, estimated = ResolveFillInner(frame, unit)
+    if fillVia[frame] ~= lastVia then fillVia[frame] = lastVia end
     -- Runs per lane per row at 30Hz, and FrameCdID builds a closure for its pcall.
     -- Nothing to clear on an empty table, which is the normal case.
-    local used = InfallDB and InfallDB.auraEstimateUsed
     if estimated then
-        NoteEstimateUsed(FrameCdID(frame))
-    elseif kind and used and next(used) ~= nil then
+        local cdID = FrameCdID(frame)
+        NoteEstimateUsed(cdID, frame)
+        if ns.RecEstimateGate then ns.RecEstimateGate(frame, cdID, lastVia) end
+    elseif kind and next(estimateUsed) ~= nil then
         ClearEstimateUsed(FrameCdID(frame))
     end
     return kind, payload, resolved
@@ -524,9 +564,15 @@ function AC.ReadApplications(frame)
     local ok, ad = pcall(function() return frame.auraDataCached end)
     if ok and ad then
         local okA, apps = pcall(function() return ad.applications end)
-        if okA and apps ~= nil then return apps end
+        if okA and apps ~= nil then
+            if ns.RecStack then ns.RecStack(frame, "cache", apps) end
+            return apps
+        end
     end
-    if AC.AurasRestricted() then return nil end
+    if AC.AurasRestricted() then
+        if ns.RecStack then ns.RecStack(frame, "restricted", nil) end
+        return nil
+    end
     local uOk, unit = pcall(function() return frame.auraDataUnit end)
     local iOk, iid = pcall(function() return frame.auraInstanceID end)
     if not iOk or not iid then return nil end
@@ -534,6 +580,43 @@ function AC.ReadApplications(frame)
         (uOk and unit) or "player", iid)
     if okD and d then return d.applications end
     return nil
+end
+
+-- Field read for pcall without a closure.
+function AC.Field(t, k) return t[k] end
+
+function AC.IsBuffViewerFrame(frame)
+    local ok, viewer = pcall(AC.Field, frame, "viewerFrame")
+    if not ok or not viewer then return false end
+    return viewer == _G["BuffIconCooldownViewer"] or viewer == _G["BuffBarCooldownViewer"]
+end
+
+-- Liveness of a viewer frame. A bar frame answers with isActive; a secret read is
+-- unknown and falls back to the aura test every frame can answer.
+function AC.FrameLive(frame)
+    local okB, bar = pcall(AC.Field, frame, "Bar")
+    local isBuff = AC.IsBuffViewerFrame(frame)
+    if (okB and bar) or isBuff then
+        local okA, active = pcall(AC.Field, frame, "isActive")
+        if okA and not issecret(active) then return active == true end
+    end
+    local okI, iid = pcall(AC.Field, frame, "auraInstanceID")
+    if okI and iid ~= nil then return true end
+    if isBuff then return false end
+    -- Cooldown tile totem: a readable slot, and not past a readable expiry.
+    local okT, td = pcall(AC.Field, frame, "totemData")
+    if not okT or td == nil or issecret(td) then return false end
+    local okS, slot = pcall(AC.Field, td, "slot")
+    if not okS or slot == nil or issecret(slot) then return false end
+    local okE, exp = pcall(AC.Field, td, "expirationTime")
+    if okE and exp ~= nil and not issecret(exp) and exp <= GetTime() then return false end
+    return true
+end
+
+-- Stack count of a live frame; nil when the frame is down or the count unreadable.
+function AC.LiveApplications(frame)
+    if not frame or not AC.FrameLive(frame) then return nil end
+    return AC.ReadApplications(frame)
 end
 
 local spellFillCache = {}
@@ -584,6 +667,14 @@ end
 
 local learnTicker = CreateFrame("Frame")
 learnTicker:RegisterEvent("PLAYER_LOGIN")
-learnTicker:SetScript("OnEvent", function()
+learnTicker:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+learnTicker:SetScript("OnEvent", function(_, event, unit)
+    if event == "PLAYER_SPECIALIZATION_CHANGED" then
+        if unit == "player" then
+            wipe(estimateUsed)
+            wipe(estimateViewer)
+        end
+        return
+    end
     C_Timer.NewTicker(2, AC.LearnVisible)
 end)

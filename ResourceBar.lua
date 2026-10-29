@@ -81,23 +81,11 @@ local function GetRegenRate()
     return observedRegen
 end
 
-local function IsTalentKnown(talentSpellID)
-    if C_SpellBook and C_SpellBook.IsSpellKnown then
-        local ok, known = pcall(C_SpellBook.IsSpellKnown, talentSpellID)
-        if ok and known then return true end
-    end
-    if IsPlayerSpell then
-        local ok, known = pcall(IsPlayerSpell, talentSpellID)
-        if ok and known then return true end
-    end
-    return false
-end
-
 local function IsCdmBuffActive(cdID)
     if not cdID then return true end
     if ns.GetPersistentBuffFrame then
         local frame = ns.GetPersistentBuffFrame(cdID)
-        if frame and frame.auraInstanceID ~= nil then return true end
+        if frame and ns.AuraCompat.FrameLive(frame) then return true end
     end
     return false
 end
@@ -114,7 +102,8 @@ local function GetSpellGeneration(spellID)
     local total = entry.base or 0
     if entry.talents then
         for _, talent in ipairs(entry.talents) do
-            if IsTalentKnown(talent.spellID) and IsCdmBuffActive(talent.requiresCdmBuff) then
+            if talent.spellID and ns.IsTalentKnown(talent.spellID)
+                and IsCdmBuffActive(talent.requiresCdmBuff) then
                 total = total + (talent.bonus or 0)
             end
         end
@@ -919,7 +908,7 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
         if not rb.generationOverrides then rb.generationOverrides = {} end
 
         for spellID, entry in pairs(CONFIG.spellGeneration) do
-            local isKnown = IsPlayerSpell and IsPlayerSpell(spellID)
+            local isKnown = ns.IsTalentKnown(spellID)
             if isKnown then
             local spellName = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID) or ("#" .. spellID)
             local total = entry.base or 0
@@ -928,7 +917,7 @@ function ns.BuildResourceBarTab(contentArea, tabFrames, helpers)
             if entry.talents then
                 for _, talent in ipairs(entry.talents) do
                     local tName = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(talent.spellID) or ("#" .. talent.spellID)
-                    local known = IsTalentKnown(talent.spellID)
+                    local known = talent.spellID and ns.IsTalentKnown(talent.spellID)
                     if known then
                         local suffix = ""
                         if talent.requiresAura then

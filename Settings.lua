@@ -25,7 +25,7 @@ local TOGGLE_KEYS = {
 
 local DISPLAY_KEYS = {
     "width", "height", "spacing", "paddingTop", "paddingBottom",
-    "paddingLeft", "paddingRight", "future", "past", "iconSize",
+    "paddingLeft", "paddingRight", "future", "past", "chargePastSmoothness", "iconSize",
     "iconGap", "hiddenIconWidth", "nowLineWidth", "gcdSparkWidth", "castSparkWidth",
     "queueSparkWidth", "pressSparkWidth", "dotTickWidth", "scale",
     "staticHeight", "staticFrames", "lines",
@@ -336,6 +336,11 @@ function ns.AutoPopulateSelfBuffMappings()
     local buffCdBySpell = BuffEntryBySpell(BUFF_SEARCH_CATEGORIES)
     local created = false
 
+    -- Mid spec change the layout can still be the last spec's: never write its ids.
+    local specID, classID = ns.ProfileSpecClass()
+    local function Sibling(id) return ns.SiblingSpecCdID(id, specID, classID) end
+    local skipped = 0
+
     for _, cooldownID in ipairs(cooldownIDs) do
         local infoOk, cdInfo = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
         local info = infoOk and cdInfo or nil
@@ -358,7 +363,13 @@ function ns.AutoPopulateSelfBuffMappings()
                 end
                 if not seen then buffCdIDs[#buffCdIDs + 1] = cooldownID end
             end
-            if buffCdIDs and #buffCdIDs > 0 then
+            local foreign = Sibling(cooldownID)
+            for _, id in ipairs(buffCdIDs or {}) do
+                if Sibling(id) then foreign = true end
+            end
+            if foreign then
+                skipped = skipped + 1
+            elseif buffCdIDs and #buffCdIDs > 0 then
                 CONFIG.buffMappings[cooldownID] = {
                     { buffCooldownIDs = buffCdIDs,
                       unit = MappingUnitFor(buffCdIDs[1], info and info.spellID) },
@@ -384,6 +395,10 @@ function ns.AutoPopulateSelfBuffMappings()
         end
     end
 
+    if skipped > 0 and ns.Report and ns.Report.Log then
+        ns.Report.Log(string.format("autopair spec=%s skipped=%d (another spec's ids)",
+            tostring(specID), skipped))
+    end
     if created then
         ns.SaveCurrentProfile()
     end
@@ -446,18 +461,19 @@ end
 
 function ns.GetSpecKey()
     local name = UnitName("player")
-    local realm = GetRealmName()
-    if not name or not realm then return nil end
+    if not name or (not ns.IS_FOREVER and not GetRealmName()) then return nil end
     local specID = ns.SpecIDFor(ns.SpecIndex())
     -- Nil, never zero. A "-0" key is a real looking profile that saves land in
     -- and the real spec profile then overwrites.
     if not specID or specID == 0 then return nil end
-    return name .. "-" .. realm .. "-" .. specID
+    local key = ns.CharPrefix() .. specID
+    if ns.IS_FOREVER and ns.MigrateRealmKey then ns.MigrateRealmKey(key, name, specID) end
+    return key
 end
 
 -- Everything the icon strip owns. Buff pairings are deliberately absent: they are
 -- shared with the timeline, so carrying them would rewrite the target spec's bars.
-local ICON_COPY_KEYS = { "iconList", "iconStates", "iconContainers", "customIcons" }
+local ICON_COPY_KEYS = { "iconList", "iconStates", "iconContainers" }
 local ICON_COPY_TOGGLES = { "iconsEnabled", "iconGlow", "iconQueued", "iconIgnoreGCD", "hideIcons" }
 
 -- Spec profiles are keyed `Name-Realm-specID`, and InfallDB is account wide, so
@@ -469,17 +485,33 @@ function ns.IconCopySources()
     local prefix = mine:match("^(.*)%-%d+$")
     if not prefix then return out end
     local _, myClass = UnitClass("player")
+    local charPrefix = ns.CharPrefix()
 
     for key, profile in pairs(InfallDB.profiles) do
-        if key ~= mine and type(profile) == "table" then
+        local isMine = type(key) == "string" and key:sub(1, #charPrefix) == charPrefix
+        -- This character's keys are exactly prefix + spec id; any other tail is a stale copy.
+        if key ~= mine and type(key) == "string" and type(profile) == "table"
+            and not (isMine and not key:sub(#charPrefix + 1):match("^%d+$")) then
             local specID = tonumber(key:match("%-(%d+)$"))
             local rows = profile.iconList and #profile.iconList or 0
             if specID and specID > 0 and rows > 0 then
-                local ok, specName, specClass = pcall(function()
-                    local _, n, _, _, _, c = GetSpecializationInfoByID(specID)
-                    return n, c
-                end)
-                local sameChar = key:find(prefix, 1, true) == 1
+                local ok, specName, specClass
+                if GetSpecializationInfoByID then
+                    ok, specName, specClass = pcall(function()
+                        local _, n, _, _, _, c = GetSpecializationInfoByID(specID)
+                        return n, c
+                    end)
+                else
+                    -- Forever: name only. One spec per class there, so the same spec id
+                    -- is the same class.
+                    ok = true
+                    if GetSpecializationInfoForSpecID then
+                        local nOk, _, n = pcall(GetSpecializationInfoForSpecID, specID)
+                        if nOk then specName = n end
+                    end
+                    if tostring(specID) == mine:match("%-(%d+)$") then specClass = myClass end
+                end
+                local sameChar = isMine
                 local sameClass = specClass and myClass and specClass == myClass
                 if ok and (sameChar or sameClass) then
                     local label
@@ -506,27 +538,49 @@ function ns.CopyIconsFromProfile(srcKey)
     local src = InfallDB.profiles and InfallDB.profiles[srcKey]
     if type(src) ~= "table" then return false, "missing" end
 
+    -- The source's ids, translated to this spec's by the rules a load uses, icons and
+    -- pairings together so an icon never parts from its pairing.
+    local incoming = {
+        iconList = src.iconList and DeepCopy(src.iconList) or {},
+        buffMappings = type(src.pairings) == "table" and DeepCopy(src.pairings) or {},
+        pairingCleared = type(src.pairingCleared) == "table" and DeepCopy(src.pairingCleared) or {},
+        customIcons = type(src.customIcons) == "table" and DeepCopy(src.customIcons) or {},
+    }
+    ns.LocalizeForCurrentSpec(incoming)
+
     for _, key in ipairs(ICON_COPY_KEYS) do
         CONFIG[key] = src[key] and DeepCopy(src[key]) or {}
     end
+    CONFIG.iconList = incoming.iconList
     if src.toggles then
         for _, key in ipairs(ICON_COPY_TOGGLES) do
             if src.toggles[key] ~= nil then CONFIG[key] = src.toggles[key] end
         end
     end
 
-    -- Only the rows that just arrived. Never overwrites an existing or cleared pairing.
+    -- Bar rows read custom icons too, so only the arriving rows' entries are added,
+    -- and never over one already set.
+    CONFIG.customIcons = CONFIG.customIcons or {}
+    for _, entry in ipairs(CONFIG.iconList) do
+        local id = entry.cooldownID or entry.key
+        if id ~= nil and incoming.customIcons[id] ~= nil and CONFIG.customIcons[id] == nil then
+            CONFIG.customIcons[id] = incoming.customIcons[id]
+        end
+    end
+
+    -- Only the rows that just arrived. Never over a cleared pairing or one set by hand;
+    -- an automatic one yields to a hand made one.
     local paired = 0
-    if type(src.pairings) == "table" then
-        CONFIG.buffMappings = CONFIG.buffMappings or {}
-        for _, entry in ipairs(CONFIG.iconList or {}) do
-            local id = entry.cooldownID or entry.key
-            local incoming = id and src.pairings[id]
-            if type(incoming) == "table" and next(incoming) ~= nil
-                and CONFIG.buffMappings[id] == nil then
-                CONFIG.buffMappings[id] = DeepCopy(incoming)
-                paired = paired + 1
-            end
+    CONFIG.buffMappings = CONFIG.buffMappings or {}
+    for _, entry in ipairs(CONFIG.iconList) do
+        local id = entry.cooldownID or entry.key
+        local new = id and incoming.buffMappings[id]
+        local cur = id and CONFIG.buffMappings[id]
+        local open = type(cur) ~= "table" or next(cur) == nil
+            or (ns.PairingAutoShaped(cur) and not ns.PairingAutoShaped(new))
+        if type(new) == "table" and next(new) ~= nil and open and not PairingCleared(id) then
+            CONFIG.buffMappings[id] = DeepCopy(new)
+            paired = paired + 1
         end
     end
 
@@ -650,6 +704,31 @@ function ns.SeedProfileFromClassConfig(specKey)
     return profile
 end
 
+-- The spec the loaded profile belongs to, from its key, and the player's class.
+function ns.ProfileSpecClass()
+    local specID = ns.currentSpecKey and tonumber(ns.currentSpecKey:match("%-(%d+)$"))
+    local classID = select(3, UnitClass("player"))
+    if not specID or specID == 0 or not classID then return nil end
+    return specID, classID
+end
+
+-- Another spec's cooldown ids, rewritten to this spec's in a CONFIG shaped table. The
+-- saved profile changes only at the next save, and then only id for id.
+function ns.LocalizeForCurrentSpec(cfg)
+    if ns.IS_FOREVER or not ns.LocalizeProfileIDs then return nil end
+    local specID, classID = ns.ProfileSpecClass()
+    if not specID then return nil end
+    local res = ns.LocalizeProfileIDs(cfg, specID, classID, ns.classConfigDefaults)
+    if res.moved + res.kept > 0 and ns.Report and ns.Report.Log then
+        local parts = {}
+        for reason, n in pairs(res.reasons) do parts[#parts + 1] = reason .. ":" .. n end
+        table.sort(parts)
+        ns.Report.Log(string.format("localize spec=%d ids=%d kept=%d moves=%d reasons=%s",
+            specID, res.idCount or 0, res.keptIDs or 0, res.moved, table.concat(parts, ",")))
+    end
+    return res
+end
+
 function ns.ApplyProfile(profile)
     if ns.PressMarks_Reset then ns.PressMarks_Reset() end
     if not profile then return end
@@ -663,27 +742,35 @@ function ns.ApplyProfile(profile)
             end
             profile.toggles.hideBlizzECM = nil
         end
-        for _, key in ipairs(TOGGLE_KEYS) do
-            if profile.toggles[key] ~= nil then
-                CONFIG[key] = profile.toggles[key]
-            end
-        end
     end
 
-    if profile.display then
-        for _, key in ipairs(DISPLAY_KEYS) do
-            if profile.display[key] ~= nil then
-                local val = profile.display[key]
-                CONFIG[key] = val == false and nil or DeepCopy(val)
-            end
+    -- A key the profile does not carry takes its default, never the previous spec's value:
+    -- a profile saved before a setting existed otherwise inherits whatever was loaded last.
+    local defaults = ns.classConfigDefaults
+    local toggles, display, colors = profile.toggles or {}, profile.display or {}, profile.colors or {}
+    for _, key in ipairs(TOGGLE_KEYS) do
+        if toggles[key] ~= nil then
+            CONFIG[key] = toggles[key]
+        elseif defaults then
+            CONFIG[key] = defaults.toggles[key]
         end
     end
-
-    if profile.colors then
-        for _, key in ipairs(COLOR_KEYS) do
-            if profile.colors[key] ~= nil then
-                CONFIG[key] = DeepCopy(profile.colors[key])
-            end
+    for _, key in ipairs(DISPLAY_KEYS) do
+        local val = display[key]
+        if val == nil and defaults then val = defaults.display[key] end
+        -- `false` is the saved form of "off"; it must land as nil. (`val == false and nil or x`
+        -- always yields x in Lua, which left false behind and showed Static Height ticked.)
+        if val == false then
+            CONFIG[key] = nil
+        elseif val ~= nil then
+            CONFIG[key] = DeepCopy(val)
+        end
+    end
+    for _, key in ipairs(COLOR_KEYS) do
+        local val = colors[key]
+        if val == nil and defaults then val = defaults.colors[key] end
+        if val ~= nil then
+            CONFIG[key] = DeepCopy(val)
         end
     end
 
@@ -737,6 +824,12 @@ function ns.ApplyProfile(profile)
     CONFIG.iconContainers = profile.iconContainers and DeepCopy(profile.iconContainers) or {}
     CONFIG.iconList = profile.iconList and DeepCopy(profile.iconList) or {}
     CONFIG.iconStates = profile.iconStates and DeepCopy(profile.iconStates) or {}
+
+    -- Reset to Default and the named default are the class's own ids already.
+    local namedDefault = InfallDB and InfallDB.namedProfiles and InfallDB.namedProfiles["default"]
+    if profile ~= ns.classConfigDefaults and profile ~= namedDefault then
+        ns.LocalizeForCurrentSpec(CONFIG)
+    end
 
     -- Both custom lists are in place now, so collisions carried in from a
     -- profile written before the keyspace was shared can be separated.
@@ -852,6 +945,12 @@ function ns.SaveCurrentProfile()
     end
 
     InfallDB.profiles[specKey] = profile
+end
+
+-- Forever: retail class config ids that also exist there would pair by accident.
+if ns.IS_FOREVER then
+    CONFIG.buffMappings, CONFIG.extraCasts, CONFIG.stackMappings = {}, {}, {}
+    CONFIG.spellGeneration, CONFIG.chargeOverflow = {}, {}
 end
 
 -- Snapshot defaults for Reset to Default
@@ -1510,6 +1609,7 @@ function ns.OpenCooldownManager()
         print("|cff00ff00[Infall]|r Cannot open the Cooldown Manager in combat.")
         return
     end
+    if ns.GamepadBlocks and ns.GamepadBlocks() then return end
     local cdm = CooldownViewerSettings
     if not cdm then
         print("|cff00ff00[Infall]|r Cooldown Manager not available.")
@@ -1660,6 +1760,361 @@ local function OpenInlineColorPicker(currentColor, onChange)
         end,
     }
     ColorPickerFrame:SetupColorPickerAndShow(info)
+end
+
+-- STACK OPTIONS. Right click menus on a pairing slot's colour swatch (show at N
+-- stacks) and on the stack slot's colour swatch (colour the number by count).
+
+local STACK_DIM_CHOICES = { 15, 30, 50, 70 }
+local BAND_DEFAULT_COLOURS = { { 1, 0.82, 0, 1 }, { 1, 0.5, 0, 1 }, { 1, 0.25, 0.25, 1 } }
+
+-- Whole number from 2 to data.max, or empty / 0 for Always when data.allowAlways.
+-- Returns ok, value (nil value means Always).
+local function ParseStackEntry(text, data)
+    text = tostring(text or ""):match("^%s*(.-)%s*$")
+    if text == "" or text == "0" then
+        return data and data.allowAlways and true or false, nil
+    end
+    local n = tonumber(text)
+    local max = (data and data.max) or 99
+    if not n or n ~= math.floor(n) or n < 2 or n > max then return false, nil end
+    return true, n
+end
+
+local function SyncStackAccept(dialog, text, data)
+    local ok = ParseStackEntry(text, data)
+    local b = dialog and dialog.GetButton1 and dialog:GetButton1()
+    if b then b:SetEnabled(ok) end
+end
+
+StaticPopupDialogs["EVENTHORIZON_STACK_NUMBER"] = {
+    text = "%s",
+    button1 = OKAY,
+    button2 = CANCEL,
+    hasEditBox = 1,
+    editBoxWidth = 80,
+    maxLetters = 2,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    OnShow = function(dialog, data)
+        local eb = dialog:GetEditBox()
+        if eb then
+            eb:SetText((data and data.prefill) and tostring(data.prefill) or "")
+            eb:HighlightText()
+            eb:SetFocus()
+            SyncStackAccept(dialog, eb:GetText(), data)
+        end
+    end,
+    OnAccept = function(dialog, data)
+        local eb = dialog:GetEditBox()
+        local ok, n = ParseStackEntry(eb and eb:GetText(), data)
+        if ok and data and data.apply then data.apply(n) end
+    end,
+    EditBoxOnTextChanged = function(editBox, data)
+        SyncStackAccept(editBox:GetParent(), editBox:GetText(), data)
+    end,
+    EditBoxOnEnterPressed = function(editBox, data)
+        local ok, n = ParseStackEntry(editBox:GetText(), data)
+        if not ok then return end
+        if data and data.apply then data.apply(n) end
+        editBox:GetParent():Hide()
+    end,
+    EditBoxOnEscapePressed = function(editBox) editBox:GetParent():Hide() end,
+}
+
+local function PromptStackNumber(text, data)
+    StaticPopup_Show("EVENTHORIZON_STACK_NUMBER", text, nil, data)
+end
+
+local function StackOptionsChanged(onChanged)
+    ns.SaveCurrentProfile()
+    if ns.StackGate_Bump then ns.StackGate_Bump() end
+    if onChanged then onChanged() end
+end
+
+-- Most stacks a buff entry can hold, read from each spell id it names. Nil when the
+-- game gives no answer at all; 0 or 1 means it does not stack.
+local function BuffStackInfo(buffCdID)
+    local name, best
+    if not buffCdID or not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then
+        return nil, nil
+    end
+    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, buffCdID)
+    if not ok or not info then return nil, nil end
+    local maxApi = C_Spell and C_Spell.GetSpellMaxCumulativeAuraApplications
+    local function try(id)
+        if id == nil or issecretvalue(id) or type(id) ~= "number" or id <= 0 then return end
+        if not name then
+            local okN, n = pcall(C_Spell.GetSpellName, id)
+            if okN and n ~= nil and not issecretvalue(n) then name = n end
+        end
+        if not maxApi then return end
+        local okM, m = pcall(maxApi, id)
+        if okM and m ~= nil and not issecretvalue(m) and type(m) == "number" and m >= 0 then
+            if not best or m > best then best = m end
+        end
+    end
+    try(info.spellID)
+    try(info.overrideSpellID)
+    try(info.overrideTooltipSpellID)
+    if type(info.linkedSpellIDs) == "table" then
+        for _, id in ipairs(info.linkedSpellIDs) do try(id) end
+    end
+    return best, name
+end
+
+-- Across every buff a pairing slot names: the largest max and the first name.
+local function SlotStackInfo(mapData)
+    local best, name
+    for _, id in ipairs(type(mapData.buffCooldownIDs) == "table" and mapData.buffCooldownIDs or {}) do
+        local m, n = BuffStackInfo(id)
+        if m and (not best or m > best) then best = m end
+        name = name or n
+    end
+    return best, name
+end
+
+local function DisabledLine(menu, text)
+    local b = menu:CreateButton(text)
+    if b and b.SetEnabled then b:SetEnabled(false) end
+end
+
+-- Potions, custom timers and glow slots have no stack count to read.
+local function StackGateRefused(cooldownID, mapData)
+    if mapData.customDuration or mapData.glowSource then return true end
+    local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
+    return ok and info and ns.IsCombatPotionEntry(info.spellID, info.equipSlot, info.spellCategoryID) or false
+end
+ns.StackGateRefused = StackGateRefused
+
+-- Replacing the buff in a slot keeps that slot's stack options, unless the new buff
+-- cannot use them: it does not stack, or the row is refused.
+function ns.CarryStackGate(prev, mapping, cooldownID)
+    if type(prev) ~= "table" or prev.customDuration or prev.glowSource then return end
+    if cooldownID and StackGateRefused(cooldownID, mapping) then return end
+    local max = SlotStackInfo(mapping)
+    if max and max <= 1 then return end
+    mapping.stackGate = prev.stackGate
+    mapping.stackGateBelow = prev.stackGateBelow
+    mapping.stackGateDim = prev.stackGateDim
+end
+
+-- One line for a swatch tooltip, or nil when the slot is ungated.
+function ns.StackGateSummary(mapData)
+    local x = mapData and ns.StackGate_LaneConfig and ns.StackGate_LaneConfig(mapData)
+    if not x then return nil end
+    if mapData.stackGateBelow == "dim" then
+        return "Shows at " .. x .. " stacks, dimmed to "
+            .. ns.StackGate_DimPercent(mapData.stackGateDim) .. "% below"
+    end
+    return "Shows at " .. x .. " stacks, hidden below"
+end
+
+local function RangeText(max)
+    return "2 to " .. math.min(max or 99, 99)
+end
+
+local function AddBelowChoices(menu, mapData, onChanged)
+    local function dimIs(p)
+        return mapData.stackGateBelow == "dim" and ns.StackGate_DimPercent(mapData.stackGateDim) == p
+    end
+    local function setDim(p)
+        mapData.stackGateBelow, mapData.stackGateDim = "dim", p
+        StackOptionsChanged(onChanged)
+    end
+    menu:CreateRadio("Hide", function() return mapData.stackGateBelow ~= "dim" end, function()
+        mapData.stackGateBelow, mapData.stackGateDim = nil, nil
+        StackOptionsChanged(onChanged)
+    end)
+    for _, p in ipairs(STACK_DIM_CHOICES) do
+        menu:CreateRadio("Dim to " .. p .. "%", dimIs, setDim, p)
+    end
+end
+
+-- Right click on a pairing slot's colour swatch. Proc only keeps its old place at the top.
+function ns.OpenBuffSlotMenu(anchor, cooldownID, slotIndex, procDot, onChanged)
+    local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+    local mapData = m and m[slotIndex]
+    if not mapData then return end
+    local function toggleProc()
+        if mapData.glowSource then return end
+        mapData.requireGlow = not mapData.requireGlow
+        if procDot then procDot:SetShown(mapData.requireGlow == true) end
+        ns.SaveCurrentProfile()
+    end
+    if not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+    local function liveSlot()
+        local lm = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
+        return lm and lm[slotIndex] or nil
+    end
+    local function showAlways(menu)
+        if mapData.stackGate == nil then return end
+        menu:CreateButton("Show always", function()
+            local live = liveSlot()
+            if not live then return end
+            live.stackGate = nil
+            StackOptionsChanged(onChanged)
+        end)
+    end
+    MenuUtil.CreateContextMenu(anchor, function(_, root)
+        root:CreateTitle("Buff " .. slotIndex)
+        if not mapData.glowSource then
+            root:CreateCheckbox("Proc only", function() return mapData.requireGlow == true end, toggleProc)
+        end
+        if StackGateRefused(cooldownID, mapData) then
+            DisabledLine(root, "No stack options for timers, glows or potions")
+            showAlways(root)
+            return
+        end
+        local max, name = SlotStackInfo(mapData)
+        if max and max <= 1 then
+            DisabledLine(root, "This buff does not stack")
+            showAlways(root)
+            return
+        end
+        local x = ns.StackGate_Threshold and ns.StackGate_Threshold(mapData.stackGate)
+        root:CreateButton("Show at stacks: " .. (x and (x .. " or more") or "Always") .. "...", function()
+            PromptStackNumber("Show the " .. (name or "buff") .. " bar at how many stacks? "
+                .. RangeText(max) .. ". Leave empty for always.", {
+                prefill = x, max = math.min(max or 99, 99), allowAlways = true,
+                apply = function(n)
+                    local live = liveSlot()
+                    if not live or StackGateRefused(cooldownID, live) then return end
+                    live.stackGate = n
+                    StackOptionsChanged(onChanged)
+                end,
+            })
+        end)
+        if x then
+            AddBelowChoices(root:CreateButton("Below " .. x .. " stacks"), mapData, onChanged)
+        end
+    end)
+end
+
+-- Saved sorted and clean, so the list on disk matches what draws. A colour edit
+-- only saves; it needs no bar reload.
+local function WriteBands(sm, list, onChanged, colourOnly)
+    local clean = ns.StackGate_Bands and ns.StackGate_Bands(list)
+    if clean then
+        for i = 1, #clean do
+            clean[i] = { threshold = clean[i].threshold, color = DeepCopy(clean[i].color) }
+        end
+    end
+    sm.colorBands = clean
+    if colourOnly then
+        ns.SaveCurrentProfile()
+        if ns.StackGate_Bump then ns.StackGate_Bump() end
+    else
+        StackOptionsChanged(onChanged)
+    end
+end
+
+-- A copy of the cleaned list with band idx at n (idx past the end adds one). A band
+-- already at n keeps its place and colour; the moved or new one merges into it.
+local function BandsWithThreshold(list, idx, n)
+    local copy, taken = {}, false
+    for i = 1, #list do
+        if i ~= idx and list[i].threshold == n then taken = true end
+    end
+    for i = 1, #list do
+        if i ~= idx or not taken then
+            copy[#copy + 1] = { threshold = (i == idx) and n or list[i].threshold,
+                                color = DeepCopy(list[i].color) }
+        end
+    end
+    if idx > #list and not taken then
+        copy[#copy + 1] = { threshold = n, color = DeepCopy(BAND_DEFAULT_COLOURS[math.min(#copy + 1, 3)]) }
+    end
+    return copy
+end
+
+-- The live band list at the moment of a change, and the index of the band that held
+-- threshold t (nil t means a new band). Nil when the mapping or that band is gone.
+local function LiveBands(cooldownID, t)
+    local sm = CONFIG.stackMappings and CONFIG.stackMappings[cooldownID]
+    if not sm then return nil end
+    local list = (ns.StackGate_Bands and ns.StackGate_Bands(sm.colorBands)) or {}
+    if t == nil then
+        if #list >= 3 then return nil end
+        return sm, list, #list + 1
+    end
+    for i = 1, #list do
+        if list[i].threshold == t then return sm, list, i end
+    end
+    return nil
+end
+
+local function BandPrompt(cooldownID, band, max, name, onChanged)
+    local was = band and band.threshold
+    PromptStackNumber("Colour the " .. (name or "stack") .. " count from how many stacks? "
+        .. RangeText(max) .. ".", {
+        prefill = was, max = math.min(max or 99, 99), allowAlways = false,
+        apply = function(n)
+            if not n then return end
+            local sm, list, idx = LiveBands(cooldownID, was)
+            if sm then WriteBands(sm, BandsWithThreshold(list, idx, n), onChanged) end
+        end,
+    })
+end
+
+-- list is the sanitised band list the menu was built from, never the raw saved one.
+local function BandSubmenu(sub, cooldownID, band, max, name, onChanged)
+    local was = band.threshold
+    sub:CreateButton("Change number...", function() BandPrompt(cooldownID, band, max, name, onChanged) end)
+    sub:CreateButton("Colour...", function()
+        OpenInlineColorPicker(DeepCopy(band.color), function(c)
+            local sm, list, idx = LiveBands(cooldownID, was)
+            if not sm then return end
+            local copy = {}
+            for i = 1, #list do
+                copy[i] = { threshold = list[i].threshold,
+                            color = DeepCopy(i == idx and c or list[i].color) }
+            end
+            WriteBands(sm, copy, nil, true)
+        end)
+    end)
+    sub:CreateButton("Remove", function()
+        local sm, list, idx = LiveBands(cooldownID, was)
+        if not sm then return end
+        local copy = {}
+        for i = 1, #list do
+            if i ~= idx then copy[#copy + 1] = { threshold = list[i].threshold, color = DeepCopy(list[i].color) } end
+        end
+        WriteBands(sm, copy, onChanged)
+    end)
+end
+
+-- Right click on the stack slot's colour swatch: up to three colour bands.
+function ns.OpenStackBandMenu(anchor, cooldownID, onChanged)
+    local sm = CONFIG.stackMappings and CONFIG.stackMappings[cooldownID]
+    if not sm or not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+    MenuUtil.CreateContextMenu(anchor, function(_, root)
+        root:CreateTitle("Colour by stack count")
+        local max, name = BuffStackInfo(sm.buffCooldownID)
+        if max and max <= 1 then
+            DisabledLine(root, "This buff does not stack")
+            return
+        end
+        local list = (ns.StackGate_Bands and ns.StackGate_Bands(sm.colorBands)) or {}
+        for i = 1, #list do
+            BandSubmenu(root:CreateButton("At " .. list[i].threshold .. " or more"), cooldownID, list[i], max, name, onChanged)
+        end
+        if #list < 3 then
+            root:CreateButton("Add a colour...", function()
+                BandPrompt(cooldownID, nil, max, name, onChanged)
+            end)
+        end
+    end)
+end
+
+-- One line for the stack swatch tooltip, or nil with no bands.
+function ns.StackBandSummary(sm)
+    local list = sm and ns.StackGate_Bands and ns.StackGate_Bands(sm.colorBands)
+    if not list then return nil end
+    local parts = {}
+    for i = 1, #list do parts[i] = tostring(list[i].threshold) end
+    return "Colour changes at " .. table.concat(parts, ", ") .. " stacks"
 end
 
 -- SHARED SPELL PICKER. Searchable popup of the player's learned spells, passives
@@ -2631,6 +3086,7 @@ local function BuildStacksTab(contentArea, tabFrames)
         ns.SaveCurrentProfile()
     end)
     AddStacksWidget(stackOffYSlider)
+    AddStacksDescription("Colour the number by count: right click a row's stack swatch on the Bars tab. Show a buff bar only at a set count: right click its buff swatch.")
 
     -- Section 1: Enable Toggle
     AddStacksHeader("Stack Indicators")
@@ -3716,13 +4172,14 @@ local function BuildSettings()
 
     local versionText = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     versionText:SetPoint("LEFT", titleText, "RIGHT", 8, 0)
-    versionText:SetText("v1.4.3")
+    versionText:SetText("v" .. (C_AddOns.GetAddOnMetadata(ns.ADDON_NAME, "Version") or "?"))
 
     -- Reset to Default button (upper right)
     local resetDefaultBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
     resetDefaultBtn:SetSize(130, 24)
     resetDefaultBtn:SetPoint("TOPRIGHT", -16, -16)
     resetDefaultBtn:SetText("Reset to Default")
+    if ns.AddReportButton then ns.AddReportButton(settingsFrame, versionText) end
 
     StaticPopupDialogs["INFALL_RESET_DEFAULTS"] = {
         text = "This will remove all your customisations (bar pairings, display settings, colours, toggles) and revert to class config defaults including buff assignments.\n\nAre you sure?",
@@ -3770,6 +4227,14 @@ local function BuildSettings()
     headerBorder:SetPoint("TOPRIGHT", -16, -42)
     headerBorder:SetHeight(1)
 
+    -- Tabs overlap their neighbours, and each later tab draws over the one before,
+    -- so a hovered tab is lifted above both for as long as the pointer is on it.
+    ns.LiftTabOnHover = function(btn)
+        local base = btn:GetFrameLevel()
+        btn:HookScript("OnEnter", function(self) self:SetFrameLevel(base + 4) end)
+        btn:HookScript("OnLeave", function(self) self:SetFrameLevel(base) end)
+    end
+
     -- Tab bar
     for i, name in ipairs(TAB_NAMES) do
         local btn = CreateFrame("Button", "InfallSettingsTab" .. i, settingsFrame, "PanelTabButtonTemplate")
@@ -3781,6 +4246,7 @@ local function BuildSettings()
             btn:SetPoint("LEFT", tabButtons[i - 1], "RIGHT", -8, 0)
         end
         btn:SetScript("OnClick", function() SelectTab(i) end)
+        ns.LiftTabOnHover(btn)
         tabButtons[i] = btn
     end
 
@@ -3836,25 +4302,17 @@ local function BuildSettings()
     end
 
     local function HighlightAvailableSlots()
+        -- Only where a click would fill an empty slot: a filled slot, or one whose earlier
+        -- slot is still empty, would replace or refuse, so it does not invite.
+        local function Free(slot)
+            if slot.icon:IsShown() then return false end
+            return not slot.prevSlot or slot.prevSlot.icon:IsShown()
+        end
         for _, slot in ipairs(allSlotFrames) do
             if slot.selectionGlow then
-                if selectedType == "buff" then
-                    -- Buffs can pair to buff slots and stack slots
-                    if slot.slotType == "buff" or slot.slotType == "stack" then
-                        slot.selectionGlow:Show()
-                    else
-                        slot.selectionGlow:Hide()
-                    end
-                elseif selectedType == "cast" then
-                    -- Casts can pair to cast slots only
-                    if slot.slotType == "cast" then
-                        slot.selectionGlow:Show()
-                    else
-                        slot.selectionGlow:Hide()
-                    end
-                else
-                    slot.selectionGlow:Hide()
-                end
+                local fits = (selectedType == "buff" and (slot.slotType == "buff" or slot.slotType == "stack"))
+                    or (selectedType == "cast" and slot.slotType == "cast")
+                slot.selectionGlow:SetShown(fits and Free(slot) or false)
             end
         end
     end
@@ -3996,6 +4454,7 @@ local function BuildSettings()
         else
             tab:SetPoint("LEFT", poolTabButtons[i - 1], "RIGHT", -8, 0)
         end
+        ns.LiftTabOnHover(tab)
         poolTabButtons[i] = tab
     end
 
@@ -4064,43 +4523,33 @@ local function BuildSettings()
     statusText:SetPoint("BOTTOMRIGHT", -8, 6)
     statusText:SetText("")
 
-    -- Slot frame (buff 1 or buff 2)
+    local SLOT_SIZE = 24
+
+    -- Chained slots drift off the pixel grid at UI scales other than 1, smearing an
+    -- edge; whole device pixels keep every column aligned. Redone on show for scale changes.
+    local function PlaceOnPixels(frame, size, anchorFrame, anchorPoint, xOff)
+        local function place(self)
+            local onePx = ns.OnePxForFrame(self)
+            local s = ns.SnapPx(size, onePx)
+            self:SetSize(s, s)
+            self:ClearAllPoints()
+            self:SetPoint("LEFT", anchorFrame, anchorPoint, ns.SnapPx(xOff, onePx), 0)
+        end
+        place(frame)
+        frame:HookScript("OnShow", place)
+    end
+
     local function CreateSlotFrame(parentRow, anchorFrame, anchorPoint, xOff)
-        local slot = CreateFrame("Button", nil, parentRow, "BackdropTemplate")
-        slot:SetSize(24, 24)
-        slot:SetPoint("LEFT", anchorFrame, anchorPoint, xOff, 0)
-        slot:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8x8",
-            edgeFile = "Interface\\Buttons\\WHITE8x8",
-            edgeSize = 1,
-        })
-        slot:SetBackdropColor(0.15, 0.15, 0.2, 0.8)
-        slot:SetBackdropBorderColor(0.4, 0.4, 0.5, 0.8)
+        local slot = ns.NewPairingSlot(parentRow, SLOT_SIZE)
+        PlaceOnPixels(slot, SLOT_SIZE, anchorFrame, anchorPoint, xOff)
         slot:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-
-        local icon = slot:CreateTexture(nil, "ARTWORK")
-        icon:SetPoint("TOPLEFT", 1, -1)
-        icon:SetPoint("BOTTOMRIGHT", -1, 1)
-        icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        icon:Hide()
-        slot.icon = icon
-
-        -- Selection glow (shown when a buff is selected and this slot is available)
-        local glow = slot:CreateTexture(nil, "OVERLAY")
-        glow:SetPoint("TOPLEFT", -2, 2)
-        glow:SetPoint("BOTTOMRIGHT", 2, -2)
-        glow:SetColorTexture(0.2, 1, 0.2, 0.35)
-        glow:Hide()
-        slot.selectionGlow = glow
-
         return slot
     end
 
     -- Inline colour swatch
     local function CreateSlotColorBtn(parentRow, anchorFrame)
         local btn = CreateFrame("Button", nil, parentRow)
-        btn:SetSize(16, 16)
-        btn:SetPoint("LEFT", anchorFrame, "RIGHT", 4, 0)
+        PlaceOnPixels(btn, 16, anchorFrame, "RIGHT", 4)
 
         local bg = btn:CreateTexture(nil, "BACKGROUND")
         bg:SetAllPoints()
@@ -4147,6 +4596,7 @@ local function BuildSettings()
         buff1Slot.slotType = "buff"; buff2Slot.slotType = "buff"; buff3Slot.slotType = "buff"
         cast1Slot.slotType = "cast"; cast2Slot.slotType = "cast"
         stackSlot.slotType = "stack"
+        buff2Slot.prevSlot, buff3Slot.prevSlot, cast2Slot.prevSlot = buff1Slot, buff2Slot, cast1Slot
         allSlotFrames[#allSlotFrames + 1] = buff1Slot
         allSlotFrames[#allSlotFrames + 1] = buff2Slot
         allSlotFrames[#allSlotFrames + 1] = buff3Slot
@@ -4334,6 +4784,7 @@ local function BuildSettings()
                 CONFIG.buffMappings[cooldownID] = CONFIG.buffMappings[cooldownID] or {}
                 local mapping = { buffCooldownIDs = {buffCdID}, color = defaultColor }
                 if pairUnit then mapping.unit = pairUnit end
+                ns.CarryStackGate(CONFIG.buffMappings[cooldownID][slotIndex], mapping, cooldownID)
                 CONFIG.buffMappings[cooldownID][slotIndex] = mapping
                 SetPairingCleared(cooldownID, false)
                 ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
@@ -4354,20 +4805,16 @@ local function BuildSettings()
                 if m and m[slotIndex] and m[slotIndex].requireGlow then
                     GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                 end
-                if not (m and m[slotIndex] and m[slotIndex].glowSource) then
-                    GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                end
+                local gateLine = ns.StackGateSummary(m and m[slotIndex])
+                if gateLine then GameTooltip:AddLine(gateLine, 1, 0.8, 0, true) end
+                GameTooltip:AddLine("Right click: proc only and stack options.", 0.5, 0.8, 0.5, true)
                 GameTooltip:Show()
             end)
             colorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
             colorBtn:SetScript("OnClick", function(self, button)
                 local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                 if button == "RightButton" then
-                    if m and m[slotIndex] and not m[slotIndex].glowSource then
-                        m[slotIndex].requireGlow = not m[slotIndex].requireGlow
-                        self.procDot:SetShown(m[slotIndex].requireGlow == true)
-                        ns.SaveCurrentProfile()
-                    end
+                    ns.OpenBuffSlotMenu(self, cooldownID, slotIndex, self.procDot, LoadEssentialCooldowns)
                     return
                 end
                 local mapData = m and m[slotIndex]
@@ -4546,7 +4993,9 @@ local function BuildSettings()
             stackColorBtn.tex:SetColorTexture(defaultColor[1], defaultColor[2], defaultColor[3], defaultColor[4] or 1)
             stackColorBtn:Show()
             CONFIG.stackMappings = CONFIG.stackMappings or {}
-            CONFIG.stackMappings[cooldownID] = { buffCooldownID = buffCdID, color = defaultColor }
+            local prevStack = CONFIG.stackMappings[cooldownID]
+            CONFIG.stackMappings[cooldownID] = { buffCooldownID = buffCdID, color = defaultColor,
+                colorBands = prevStack and prevStack.colorBands or nil }
             ns.SaveCurrentProfile(); LoadEssentialCooldowns(); CancelSelection()
             statusText:SetText("")
         end)
@@ -4555,10 +5004,18 @@ local function BuildSettings()
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetText("Stack Text Colour")
             GameTooltip:AddLine("Click to change the stack count text colour for this row.", 0.7, 0.7, 0.7, true)
+            local bandLine = ns.StackBandSummary(CONFIG.stackMappings and CONFIG.stackMappings[cooldownID])
+            if bandLine then GameTooltip:AddLine(bandLine, 1, 0.8, 0, true) end
+            GameTooltip:AddLine("Right click: colour by stack count.", 0.5, 0.8, 0.5, true)
             GameTooltip:Show()
         end)
         stackColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        stackColorBtn:SetScript("OnClick", function()
+        stackColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        stackColorBtn:SetScript("OnClick", function(self, button)
+            if button == "RightButton" then
+                ns.OpenStackBandMenu(self, cooldownID, LoadEssentialCooldowns)
+                return
+            end
             local currentColor = stackSlot.pairedColor or DeepCopy(CONFIG.stackTextColor)
             OpenInlineColorPicker(currentColor, function(c)
                 stackColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
@@ -4596,6 +5053,15 @@ local function BuildSettings()
             if displayed then
                 cooldownIDs = displayed
                 foundSource = true
+            end
+            -- Log the list given beside what the Essential viewer shows.
+            if ns.Report and ns.Report.Log then
+                local live = 0
+                local v = _G.EssentialCooldownViewer
+                local okP, pool = pcall(function() return v and v.itemFramePool end)
+                if okP and pool and pool.GetNumActive then live = pool:GetNumActive() or 0 end
+                ns.Report.Log(string.format("settings rows given=%s n=%d viewer=%d",
+                    displayed == nil and "nil" or "list", displayed and #displayed or -1, live))
             end
         end
         if not foundSource then
@@ -4816,6 +5282,7 @@ local function BuildSettings()
                 cast1Slot.slotType = "cast"
                 cast2Slot.slotType = "cast"
                 stackSlot.slotType = "stack"
+                buff2Slot.prevSlot, buff3Slot.prevSlot, cast2Slot.prevSlot = buff1Slot, buff2Slot, cast1Slot
                 allSlotFrames[#allSlotFrames + 1] = buff1Slot
                 allSlotFrames[#allSlotFrames + 1] = buff2Slot
                 allSlotFrames[#allSlotFrames + 1] = buff3Slot
@@ -5142,6 +5609,7 @@ local function BuildSettings()
                                 color = defaultColor,
                             }
                             if pairUnit then mapping.unit = pairUnit end
+                            ns.CarryStackGate(CONFIG.buffMappings[cooldownID][slotIndex], mapping, cooldownID)
                             CONFIG.buffMappings[cooldownID][slotIndex] = mapping
                             SetPairingCleared(cooldownID, false)
                             ns.SaveCurrentProfile()
@@ -5166,20 +5634,16 @@ local function BuildSettings()
                     if m and m[1] and m[1].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    if not (m and m[1] and m[1].glowSource) then
-                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                    end
+                    local gateLine = ns.StackGateSummary(m and m[1])
+                    if gateLine then GameTooltip:AddLine(gateLine, 1, 0.8, 0, true) end
+                    GameTooltip:AddLine("Right click: proc only and stack options.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 buff1ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff1ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[1] and not m[1].glowSource then
-                            m[1].requireGlow = not m[1].requireGlow
-                            self.procDot:SetShown(m[1].requireGlow == true)
-                            ns.SaveCurrentProfile()
-                        end
+                        ns.OpenBuffSlotMenu(self, cooldownID, 1, self.procDot, LoadEssentialCooldowns)
                         return
                     end
                     local mapData = m and m[1]
@@ -5203,20 +5667,16 @@ local function BuildSettings()
                     if m and m[2] and m[2].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    if not (m and m[2] and m[2].glowSource) then
-                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                    end
+                    local gateLine = ns.StackGateSummary(m and m[2])
+                    if gateLine then GameTooltip:AddLine(gateLine, 1, 0.8, 0, true) end
+                    GameTooltip:AddLine("Right click: proc only and stack options.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 buff2ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff2ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[2] and not m[2].glowSource then
-                            m[2].requireGlow = not m[2].requireGlow
-                            self.procDot:SetShown(m[2].requireGlow == true)
-                            ns.SaveCurrentProfile()
-                        end
+                        ns.OpenBuffSlotMenu(self, cooldownID, 2, self.procDot, LoadEssentialCooldowns)
                         return
                     end
                     local mapData = m and m[2]
@@ -5241,20 +5701,16 @@ local function BuildSettings()
                     if m and m[3] and m[3].requireGlow then
                         GameTooltip:AddLine("Proc only: ON (bar shows only when glowing)", 1, 0.8, 0, true)
                     end
-                    if not (m and m[3] and m[3].glowSource) then
-                        GameTooltip:AddLine("Right click to toggle proc only mode.", 0.5, 0.8, 0.5, true)
-                    end
+                    local gateLine = ns.StackGateSummary(m and m[3])
+                    if gateLine then GameTooltip:AddLine(gateLine, 1, 0.8, 0, true) end
+                    GameTooltip:AddLine("Right click: proc only and stack options.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 buff3ColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
                 buff3ColorBtn:SetScript("OnClick", function(self, button)
                     local m = CONFIG.buffMappings and CONFIG.buffMappings[cooldownID]
                     if button == "RightButton" then
-                        if m and m[3] and not m[3].glowSource then
-                            m[3].requireGlow = not m[3].requireGlow
-                            self.procDot:SetShown(m[3].requireGlow == true)
-                            ns.SaveCurrentProfile()
-                        end
+                        ns.OpenBuffSlotMenu(self, cooldownID, 3, self.procDot, LoadEssentialCooldowns)
                         return
                     end
                     local mapData = m and m[3]
@@ -5499,9 +5955,11 @@ local function BuildSettings()
                     stackColorBtn:Show()
 
                     CONFIG.stackMappings = CONFIG.stackMappings or {}
+                    local prevStack = CONFIG.stackMappings[cooldownID]
                     CONFIG.stackMappings[cooldownID] = {
                         buffCooldownID = buffCdID,
                         color = defaultColor,
+                        colorBands = prevStack and prevStack.colorBands or nil,
                     }
                     ns.SaveCurrentProfile()
                     LoadEssentialCooldowns()
@@ -5556,10 +6014,18 @@ local function BuildSettings()
                     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                     GameTooltip:SetText("Stack Text Colour")
                     GameTooltip:AddLine("Click to change the stack count text colour for this row.", 0.7, 0.7, 0.7, true)
+                    local bandLine = ns.StackBandSummary(CONFIG.stackMappings and CONFIG.stackMappings[cooldownID])
+                    if bandLine then GameTooltip:AddLine(bandLine, 1, 0.8, 0, true) end
+                    GameTooltip:AddLine("Right click: colour by stack count.", 0.5, 0.8, 0.5, true)
                     GameTooltip:Show()
                 end)
                 stackColorBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-                stackColorBtn:SetScript("OnClick", function()
+                stackColorBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                stackColorBtn:SetScript("OnClick", function(self, button)
+                    if button == "RightButton" then
+                        ns.OpenStackBandMenu(self, cooldownID, LoadEssentialCooldowns)
+                        return
+                    end
                     local currentColor = stackSlot.pairedColor or DeepCopy(CONFIG.stackTextColor)
                     OpenInlineColorPicker(currentColor, function(c)
                         stackColorBtn.tex:SetColorTexture(c[1], c[2], c[3], c[4] or 1)
@@ -6042,6 +6508,9 @@ local function BuildSettings()
                             end
                         end
                         if estimatable then
+                            if ns.AuraCompat.EstimateViewer(buffCdID) == "BuffIconCooldownViewer" then
+                                GameTooltip:AddLine("Shown as an icon in the Cooldown Manager. Move it to Tracked Bars for exact timing.", 1, 0.82, 0, true)
+                            end
                             if ns.AuraCompat.IsEstimateAllowed(learnKey) then
                                 GameTooltip:AddLine("Estimated bar: ON. Right click to switch it off for this buff.", 0.5, 0.9, 0.5, true)
                             else
@@ -6298,7 +6767,7 @@ local function BuildSettings()
 
     -- Timeline
     AddDispHeader("Timeline")
-    AddDispDescription("How far into the future and past the bars display. Future is how many seconds ahead you can see cooldowns and buffs. Past shows recently expired effects sliding off the left edge.")
+    AddDispDescription("How far into the future and past the bars display. Future is how many seconds ahead you can see cooldowns and buffs. Past shows recently expired effects sliding off the left edge. Past Charge Smoothness affects spells with two or more charges: 4 is the smoothest, 1 the lightest on performance.")
 
     local futureSlider = CreateSlider(dispContent, "Future (seconds)", 1, 60, 1, CONFIG.future, nil)
     AddDispWidget(futureSlider)
@@ -6337,6 +6806,14 @@ local function BuildSettings()
         ns.SaveCurrentProfile()
     end)
     AddDispWidget(pastSlider)
+
+    pastSlider.chargePast = CreateSlider(dispContent, "Past Charge Smoothness", 1, 4, 1, CONFIG.chargePastSmoothness or 3, function(v)
+        if dispRefreshing then return end
+        CONFIG.chargePastSmoothness = v
+        ApplyLayoutToAllBars()
+        ns.SaveCurrentProfile()
+    end)
+    AddDispWidget(pastSlider.chargePast)
 
     -- Bar Layout
     AddDispHeader("Bar Layout")
@@ -6734,6 +7211,7 @@ local function BuildSettings()
     local function RefreshDisplayTab()
         futureSlider:SetValue(CONFIG.future or 16)
         pastSlider:SetValue(CONFIG.past or 2.5)
+        pastSlider.chargePast:SetValue(CONFIG.chargePastSmoothness or 3)
         widthSlider:SetValue(CONFIG.width or 352)
         heightSlider:SetValue(CONFIG.height or 20)
         extrasHeightSlider:SetValue(CONFIG.extrasHeight or CONFIG.height or 20)
@@ -6827,7 +7305,7 @@ local function BuildSettings()
     end)
     AddTogWidget(redshiftCheck)
 
-    local pandemicCheck = CreateCheckbox(togContent, "Pandemic Pulse", "Pulse target debuff bars when in the refresh window", CONFIG.pandemicPulse, function(v)
+    local pandemicCheck = CreateCheckbox(togContent, "Pandemic Pulse", "Pulse buff and debuff bars while they can be refreshed without losing time", CONFIG.pandemicPulse, function(v)
         CONFIG.pandemicPulse = v
         ns.SaveCurrentProfile()
     end)
@@ -7576,12 +8054,11 @@ local function BuildSettings()
         end
         ns.SaveCurrentProfile()
         local name = UnitName("player")
-        local realm = GetRealmName()
-        if not name or not realm then
+        if not name or (not ns.IS_FOREVER and not GetRealmName()) then
             print("|cff00ff00[Infall]|r Could not determine character.")
             return
         end
-        local prefix = name .. "-" .. realm .. "-"
+        local prefix = ns.CharPrefix()
         local specs = {}
         local count = 0
         for key, profile in pairs(InfallDB.profiles) do
@@ -7630,35 +8107,52 @@ local function BuildSettings()
             print("|cff00ff00[Infall]|r Paste a profile string into the box first.")
             return
         end
-        local data, err = ns.ImportProfile(text)
+        local data, err, note = ns.ImportProfile(text)
         if not data then
             print("|cff00ff00[Infall]|r Import failed: " .. (err or "unknown error"))
             return
         end
+        if note then print("|cff00ff00[Infall]|r " .. note) end
         if data._multi and data.specs then
             local name = UnitName("player")
-            local realm = GetRealmName()
-            if not name or not realm then
+            if not name or (not ns.IS_FOREVER and not GetRealmName()) then
                 print("|cff00ff00[Infall]|r Could not determine character.")
                 return
             end
+            -- Every spec is applied before anything is saved: one that throws never
+            -- reaches disk. The previous profile is restored afterwards.
+            local previous = ns.currentSpecKey and InfallDB.profiles[ns.currentSpecKey]
             local currentSpecID = ns.SpecIDFor(ns.SpecIndex())
+            local mine
+            for specID, profile in pairs(data.specs) do
+                local ok = pcall(ns.ApplyProfile, profile)
+                if not ok then
+                    if previous then pcall(ns.ApplyProfile, previous) end
+                    print("|cff00ff00[Infall]|r Import failed: this profile does not load. Nothing was changed.")
+                    return
+                end
+                if currentSpecID and tonumber(specID) == currentSpecID then mine = profile end
+            end
+            if previous then pcall(ns.ApplyProfile, previous) end
             local count = 0
             for specID, profile in pairs(data.specs) do
-                local numID = tonumber(specID) or specID
-                local specKey = name .. "-" .. realm .. "-" .. numID
+                local specKey = ns.CharPrefix() .. tonumber(specID)
                 InfallDB.profiles[specKey] = DeepCopy(profile)
-                if currentSpecID and numID == currentSpecID then
-                    ns.ApplyProfile(profile)
-                end
                 count = count + 1
             end
+            if mine then pcall(ns.ApplyProfile, InfallDB.profiles[ns.CharPrefix() .. currentSpecID]) end
             ns.SaveCurrentProfile()
             ieEditBox:SetText("")
             ieEditBox:ClearFocus()
             print("|cff00ff00[Infall]|r Imported " .. count .. " spec(s). /reload to see all changes.")
         else
-            ns.ApplyProfile(data)
+            local previous = ns.currentSpecKey and InfallDB.profiles[ns.currentSpecKey]
+            local ok = pcall(ns.ApplyProfile, data)
+            if not ok then
+                if previous then pcall(ns.ApplyProfile, previous) end
+                print("|cff00ff00[Infall]|r Import failed: this profile does not load. Nothing was changed.")
+                return
+            end
             ns.SaveCurrentProfile()
             ieEditBox:SetText("")
             ieEditBox:ClearFocus()
@@ -7759,5 +8253,6 @@ ns.InitSettings = BuildSettings
 
 function ns.OpenSettings()
     BuildSettings()
+    if ns.GamepadBlocks and ns.GamepadBlocks() then return end
     Settings.OpenToCategory(ns.settingsCategoryID)
 end

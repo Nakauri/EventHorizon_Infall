@@ -334,7 +334,7 @@ ICON.MigrateContainers = MigrateContainers
 -- Any target, matching what redshift keys on.
 local function ContextAlpha(cfg)
     if InCombatLockdown() then return cfg.alphaCombat or 1 end
-    if UnitExists("target") then return cfg.alphaTarget or 1 end
+    if ns.HasTarget() then return cfg.alphaTarget or 1 end
     return cfg.alphaIdle or 0
 end
 
@@ -353,7 +353,8 @@ local function ResolveEntry(cooldownID)
     if not ok or not info then return nil, nil, nil end
 
     local base = info.spellID
-    local live = info.overrideTooltipSpellID or info.overrideSpellID or base
+    local live = (ns.IS_FOREVER and ns.RankID(info, nil)) or info.overrideTooltipSpellID
+        or info.overrideSpellID or base
     -- A bag item has no spellID; the category reports whichever item last
     -- started a cooldown there. That id is secret in any combat. It still drives
     -- a sweep, but can never key a table or be compared.
@@ -365,7 +366,7 @@ local function ResolveEntry(cooldownID)
     return info, live, base, live
 end
 
--- Presence is a nil check on auraInstanceID, never a comparison. Keyed on the
+-- Presence is FrameLive for a bar frame, a nil check otherwise. Keyed on the
 -- BASE spell: the live one can be secret and a secret table key throws.
 -- Prefers a mapped buff that can be timed; a frame with no .Bar carries no duration.
 local function ActiveBuffFrame(cooldownID, baseSpellID)
@@ -379,12 +380,14 @@ local function ActiveBuffFrame(cooldownID, baseSpellID)
     for _, mapData in ipairs(maps) do
         for _, bcd in ipairs(mapData.buffCooldownIDs or {}) do
             local f = ns.GetPersistentBuffFrame(bcd)
-            if f then
-                local ok, aid = pcall(function() return f.auraInstanceID end)
-                if ok and aid ~= nil then
-                    if f.Bar then return f, bcd end
-                    if not fallback then fallback, fallbackID = f, bcd end
-                end
+            local okB, bar = false, nil
+            if f then okB, bar = pcall(ns.AuraCompat.Field, f, "Bar") end
+            if okB and bar then
+                if ns.AuraCompat.FrameLive(f) then return f, bcd end
+            elseif f and not fallback then
+                -- A stand-in tile has no .Bar: an aura instance is its only sign of life.
+                local ok, aid = pcall(ns.AuraCompat.Field, f, "auraInstanceID")
+                if ok and aid ~= nil then fallback, fallbackID = f, bcd end
             end
         end
     end
@@ -556,12 +559,13 @@ local function CountValue(spellID, buffFrame)
             return info.currentCharges
         end
     end
-    -- A non-stacking aura reports 0 and would print a 0 on every icon. Under
-    -- restriction the count is secret; charges still work, maxCharges is NeverSecret.
+    -- One rule for both: shown from 1, blank at 0. A secret count goes through
+    -- TruncateZero, which renders 0 as empty text.
     local AC = ns.AuraCompat
     if buffFrame and AC and AC.ReadApplications then
         local n = AC.ReadApplications(buffFrame)
-        if n ~= nil and not issecretvalue(n) and n > 1 then return n end
+        if n ~= nil and issecretvalue(n) then return ns.TruncateZero(n) end
+        if n ~= nil and n >= 1 then return n end
     end
     return nil
 end
@@ -584,9 +588,10 @@ local refeedCooldowns = true
 -- Cheap to lower if CDR ever looks laggy on the strip.
 local REFEED_THROTTLE = 0.4
 
--- How long IsSpellUsable must keep saying "no" before the icon is dimmed. The
--- artefact it filters lasts 0.02 to 0.07s measured, so this has room either way.
-local UNUSABLE_HOLD = 0.15
+-- Usability is sampled when SPELL_UPDATE_USABLE fires and held until the next one, the
+-- same rule Blizzard's Cooldown Manager follows (CooldownViewer.lua RefreshIconColor).
+-- Polling it every paint caught states the game never announces, which read as flashes.
+local usableState = {}     -- [spellID] = true while the game reports the spell unusable
 
 -- isOnGCD is only trustworthy inside SPELL_UPDATE_COOLDOWN, so it is sampled there and cached.
 --
@@ -597,9 +602,20 @@ local trackedSpells = {}   -- [spellID] = true, every spell the strip is drawing
 local cdState = {}         -- [spellID] = true when a real, non-GCD cooldown runs
 local chargeState = {}     -- [spellID] = isActive, or nil when not a charge spell
 
-local function SampleSpell(sid)
-    local ok, cd = pcall(C_Spell.GetSpellCooldown, sid)
-    cdState[sid] = (ok and cd and cd.isActive and not cd.isOnGCD) and true or nil
+-- Only events where isOnGCD can be trusted may change the verdict; it reads stale under
+-- SPELL_UPDATE_CHARGES mid GCD.
+local CD_TRUSTED = { SPELL_UPDATE_COOLDOWN = true, PLAYER_ENTERING_WORLD = true,
+    COOLDOWN_VIEWER_DATA_LOADED = true, TRAIT_CONFIG_UPDATED = true }
+
+local function SampleSpell(sid, event)
+    if event == nil or CD_TRUSTED[event] then
+        local ok, cd = pcall(C_Spell.GetSpellCooldown, sid)
+        local now = (ok and cd and cd.isActive and not cd.isOnGCD) and true or nil
+        if now ~= cdState[sid] and ns.Report and ns.Report.Log then
+            ns.Report.Log(string.format("cdsample %d %s on=%s", sid, tostring(event), now and "1" or "0"))
+        end
+        cdState[sid] = now
+    end
 
     chargeState[sid] = nil
     if C_Spell.GetSpellCharges then
@@ -611,9 +627,18 @@ local function SampleSpell(sid)
     end
 end
 
+local function SampleUsable(sid)
+    local ok, u = pcall(C_Spell.IsSpellUsable, sid)
+    usableState[sid] = (ok and u ~= nil and not issecretvalue(u) and u == false) and true or nil
+end
+
 -- Called from the event handler, before the paint is deferred.
-local function SampleTrackedSpells()
-    for sid in pairs(trackedSpells) do SampleSpell(sid) end
+local function SampleTrackedSpells(event)
+    for sid in pairs(trackedSpells) do SampleSpell(sid, event) SampleUsable(sid) end
+end
+
+local function SampleTrackedUsable()
+    for sid in pairs(trackedSpells) do SampleUsable(sid) end
 end
 
 -- Returns shown, live. `live` means something moves with no event behind it.
@@ -631,6 +656,7 @@ local function PaintIcon(ic, entry, cfg)
     if spellID and not trackedSpells[spellID] then
         trackedSpells[spellID] = true
         SampleSpell(spellID)
+        SampleUsable(spellID)
     end
 
     -- chargeActive answers "is a recharge in flight", which is NOT the same question
@@ -710,28 +736,10 @@ local function PaintIcon(ic, entry, cfg)
     -- several strips as separate entries, and previewing one must not force the others.
     local pv = ICON.preview
     local forced = pv and pv.entry == entry and pv.state or nil
-    -- Resolved before the chain: a running sweep means two different things.
-    -- Whole test inside the pcall, the comparison throws and not the call.
-    -- Never a charge count test; currentCharges is secret.
-    local unusable = false
-    pcall(function()
-        local u = C_Spell.IsSpellUsable(feedID)
-        if u ~= nil and not issecretvalue(u) and u == false then unusable = true end
-    end)
-
-    -- IsSpellUsable reports whole rows of utility spells unusable for two frames at a time.
-    --
-    -- A spell must stay unusable for the hold before it is drawn that way.
-    local unusablePending = false
-    if unusable then
-        ic._unusableSince = ic._unusableSince or now
-        if now - ic._unusableSince < UNUSABLE_HOLD then
-            unusable = false
-            unusablePending = true
-        end
-    else
-        ic._unusableSince = nil
-    end
+    -- Resolved before the chain: a running sweep means two different things. Read from
+    -- the event sample, never polled. An item entry has no spellID and draws usable,
+    -- as Blizzard's own items do.
+    local unusable = spellID ~= nil and usableState[spellID] == true
 
     -- Exclude the global cooldown EXPLICITLY, never by asking the API to do it.
     -- An item entry has neither id, so both tests above miss it and the icon drew
@@ -764,6 +772,7 @@ local function PaintIcon(ic, entry, cfg)
         -- Tuning the proc state with nothing procced would show no art at all.
         if forced == "proc" then glowing = true end
     end
+    if ns.RecIcon and not forced then ns.RecIcon(ic, entry, spellID, state) end
 
     local rules = RulesFor(entry, state)
     if forced then
@@ -828,9 +837,7 @@ local function PaintIcon(ic, entry, cfg)
     -- font so an unset profile still draws.
     ApplyTextStyle(ic.durText, tcfg, ic)
 
-    -- A held unusable counts as live: without it the strip could sit on the
-    -- suppressed value until some unrelated event happened to repaint.
-    local live = unusablePending
+    local live = false
     local bar = buffSweep and buffFrame and buffFrame.Bar or nil
 
     if forced and buffSweep and not bar then
@@ -1157,7 +1164,9 @@ function ICON.Refresh()
                 -- Sampled HERE, synchronously inside the event, because isOnGCD is
                 -- only trustworthy while responding to it. The paint is a frame
                 -- later and must never read it itself.
-                SampleTrackedSpells()
+                SampleTrackedSpells(event)
+            elseif event == "SPELL_UPDATE_USABLE" then
+                SampleTrackedUsable()
             end
             -- Sizes are multiples of a physical pixel, so a resolution or scale
             -- change invalidates geometry that no other event would touch.
@@ -1178,6 +1187,8 @@ function ICON.Refresh()
     -- Filtered to the player: unfiltered, this fires for every unit in a raid.
     eventFrame:RegisterUnitEvent("UNIT_AURA", "player")
     eventFrame:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")
+    -- Forever: a newly learned rank is the spell the strip reads.
+    if ns.IS_FOREVER then eventFrame:RegisterEvent("SPELLS_CHANGED") end
     -- A talent swap adds and removes Cooldown Manager entries, so the strip has
     -- to re-resolve. Bars get this through the same two events.
     eventFrame:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")

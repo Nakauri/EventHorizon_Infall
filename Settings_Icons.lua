@@ -874,6 +874,7 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
         if slotIndex >= 2 then defaultColor[4] = 0.3 end
         local mapping = { buffCooldownIDs = { selectedBuff }, color = defaultColor }
         if pairUnit then mapping.unit = pairUnit end
+        if ns.CarryStackGate then ns.CarryStackGate(m[slotIndex], mapping, cooldownID) end
         m[slotIndex] = mapping
         statusText:SetText("")
         refreshAll()
@@ -881,26 +882,8 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
     end
 
     local function NewSlot(row, index)
-        local slot = CreateFrame("Button", nil, row, "BackdropTemplate")
-        slot:SetSize(24, 24)
-        slot:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8x8",
-            edgeFile = "Interface\\Buttons\\WHITE8x8",
-            edgeSize = 1,
-        })
-        slot:SetBackdropColor(0.15, 0.15, 0.2, 0.8)
-        slot:SetBackdropBorderColor(0.4, 0.4, 0.5, 0.8)
+        local slot = ns.NewPairingSlot(row, 24)
         slot:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        slot.icon = slot:CreateTexture(nil, "ARTWORK")
-        slot.icon:SetPoint("TOPLEFT", 1, -1)
-        slot.icon:SetPoint("BOTTOMRIGHT", -1, 1)
-        slot.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        slot.icon:Hide()
-        slot.glow = slot:CreateTexture(nil, "OVERLAY")
-        slot.glow:SetPoint("TOPLEFT", -2, 2)
-        slot.glow:SetPoint("BOTTOMRIGHT", 2, -2)
-        slot.glow:SetColorTexture(0.2, 1, 0.2, 0.35)
-        slot.glow:Hide()
         slot:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetText(self.pairName or ("Buff " .. index))
@@ -1224,7 +1207,7 @@ function ns.BuildIconsTab(contentArea, tabFrames, helpers)
                     slot.icon:Hide()
                     slot.pairName = nil
                 end
-                slot.glow:SetShown(selectedBuff ~= nil and not bcd)
+                slot.selectionGlow:SetShown(selectedBuff ~= nil and not bcd)
                 slot:SetScript("OnClick", function(_, button)
                     if button == "RightButton" then ClearSlot(cdID, k) else AssignSlot(cdID, k) end
                 end)

@@ -141,16 +141,15 @@ CONFIG.spellGeneration = {
     --
     -- The in-game tooltip shows the TALENTED shot count, so reading "10 shots"
     -- off it and then adding Quick Draw counts that talent twice. Untalented
-    -- base is 7. Measured from a combat log 2026-08-11: 7 + 3 = 10 primary hits,
-    -- 5 cleave hits, 15 energizes of 3 = 45 focus.
+    -- base is 7. Measured from a combat log 2026-10-13 (12.1.5): 7 + 3 = 10 primary
+    -- hits, 10 cleave hits; 19 energizes of 3 measured with two targets.
     [257044] = {  -- Rapid Fire, 7 shots of 3 before talents
         base = 21,
         talents = {
             {spellID = 459794, bonus = 9},   -- Quick Draw, 3 extra shots
-            -- Hydra's extra target is hit on every OTHER shot, not every shot,
-            -- so it is worth half the shot count. It also needs a second target
-            -- in range; solo this overstates by the whole 15.
-            {spellID = 470945, bonus = 15},  -- Aspect of the Hydra
+            -- Hydra's extra target is hit on every shot, and each hit energizes.
+            -- It needs a second target in range; solo this overstates by the whole 30.
+            {spellID = 470945, bonus = 30},  -- Aspect of the Hydra
         },
     },
 }
